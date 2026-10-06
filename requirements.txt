@@ -1,0 +1,4 @@
+paho-mqtt>=2.0
+pigpio>=1.78
+pyserial>=3.5
+smbus2>=0.5

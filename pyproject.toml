@@ -1,0 +1,34 @@
+[project]
+name = "loggerhead"
+version = "0.1.0"
+description = "Raspberry Pi aquarium controller with telemetry, automation, and safety interlocks"
+requires-python = ">=3.13"
+dependencies = [
+  "paho-mqtt>=2.0",
+  "pigpio>=1.78",
+  "pyserial>=3.5",
+  "smbus2>=0.5",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest",
+  "pytest-cov",
+  "ruff",
+]
+
+[project.scripts]
+loggerhead = "loggerhead.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
