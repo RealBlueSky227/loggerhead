@@ -1,0 +1,18 @@
+[Unit]
+Description=Loggerhead aquarium controller
+Documentation=https://github.com/RealBlueSky227/loggerhead
+After=network-online.target pigpiod.service
+Wants=network-online.target pigpiod.service
+
+[Service]
+Type=simple
+User=reef
+Group=reef
+WorkingDirectory=/home/reef/controller/loggerhead
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/reef/controller/loggerhead/.venv/bin/python -m loggerhead --config /home/reef/controller/loggerhead/config/loggerhead.json --data-dir /home/reef/controller/loggerhead/data --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
