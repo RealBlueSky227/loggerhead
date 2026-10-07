@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, get_args, get_origin, get_type_hints
 
@@ -18,6 +19,19 @@ from .hardware import (
     require_sense_port,
     require_stepper,
 )
+
+
+class SensePortDevice(StrEnum):
+    EMPTY = "empty"
+    HYDROS_TRIPLE = "hydros_triple"
+    BINARY = "binary"
+    DS18B20 = "ds18b20"
+    ANALOG = "analog"
+
+
+class OneWireMode(StrEnum):
+    BIT_BANG = "bit_bang"
+    KERNEL = "kernel"
 
 
 @dataclass
@@ -85,6 +99,41 @@ class AnalogSensorProfile:
     unit: str = "V"
     scale: float = 1.0
     offset: float = 0.0
+
+
+@dataclass
+class SensePortProfile:
+    number: int
+    device: SensePortDevice = SensePortDevice.EMPTY
+    name: str = ""
+    check_frequency: float = 10.0
+    one_wire_mode: OneWireMode = OneWireMode.BIT_BANG
+    sensor_id: str = ""
+    desired_state: LevelState = LevelState.NORMAL
+    alert_wait: float = 60.0
+    alert_frequency: float = 300.0
+    activity_timeout: float = 2.0
+    debounce_samples: int = 3
+    invert_binary: bool = False
+    target_temp: float = 78.0
+    hysteresis: float = 0.5
+    alert_above: float = 82.0
+    alert_below: float = 74.0
+    emergency_above: float = 84.0
+    emergency_below: float = 72.0
+    assigned_equipment: str = ""
+    equipment_type: EquipmentKind = EquipmentKind.HEATER
+    analog_unit: str = "V"
+    analog_scale: float = 1.0
+    analog_offset: float = 0.0
+
+    @property
+    def sensor_id_or_default(self) -> str:
+        return self.sensor_id or f"sense_port_{self.number}"
+
+    @property
+    def display_name(self) -> str:
+        return self.name or f"Sense Port {self.number}"
 
 
 @dataclass
@@ -172,6 +221,7 @@ class AppConfig:
     mqtt: MQTTConfig = field(default_factory=MQTTConfig)
     buzzer: BuzzerConfig = field(default_factory=BuzzerConfig)
     equipment: list[EquipmentProfile] = field(default_factory=list)
+    sense_ports: list[SensePortProfile] = field(default_factory=list)
     ph_sensors: list[PHSensorProfile] = field(default_factory=list)
     analog_sensors: list[AnalogSensorProfile] = field(default_factory=list)
     temperature_sensors: list[TemperatureSensorProfile] = field(default_factory=list)
@@ -184,58 +234,36 @@ class AppConfig:
 
 
 def default_config() -> AppConfig:
-    water_level_sensors = [
-        WaterLevelSensorProfile(f"level_sensor_{port}", f"Sensor {port} Triple Optical", WaterLevelDriver.HYDROS_TRIPLE, port)
-        for port in (1, 4, 7, 10)
-    ]
-    temperature_sensors = [
-        TemperatureSensorProfile(
-            f"ds18b20_sensor_{port}",
-            f"Sensor {port} DS18B20",
-            TemperatureDriver.BIT_BANGED_ONE_WIRE,
-            assigned_equipment="heater" if port == 2 else "",
-            equipment_type=EquipmentKind.HEATER,
-            sensor_id=f"sensor-{port}",
-            sense_port=port,
-        )
-        for port in (2, 5, 8)
-    ]
-    temperature_sensors.append(
-        TemperatureSensorProfile(
-            "cpu_temp",
-            "Raspberry Pi CPU",
-            TemperatureDriver.HOST_CPU,
-            target_temp=140.0,
-            hysteresis=10.0,
-            alert_above=176.0,
-            alert_below=-40.0,
-            emergency_above=185.0,
-            emergency_below=-40.0,
-            equipment_type=EquipmentKind.GENERIC,
-        )
-    )
     return AppConfig(
         equipment=[
-            EquipmentProfile("heater", "Main Heater", EquipmentDriver.MCP23017_RELAY, "AC1"),
-            EquipmentProfile("fan", "Cooling Fan", EquipmentDriver.MCP23017_RELAY, "AC2"),
-            EquipmentProfile("ato_pump", "ATO Pump", EquipmentDriver.MCP23017_RELAY, "AC3"),
+            EquipmentProfile(f"ac{index}", f"AC{index}", EquipmentDriver.MCP23017_RELAY, f"AC{index}")
+            for index in range(1, 9)
         ],
-        ph_sensors=[PHSensorProfile("ph", "EZO pH")],
-        analog_sensors=[
-            AnalogSensorProfile(f"analog_sensor_{port}", f"Sensor {port} Analog", port)
-            for port in (3, 6, 9)
+        sense_ports=[SensePortProfile(index) for index in range(1, 11)],
+        ph_sensors=[],
+        analog_sensors=[],
+        temperature_sensors=[
+            TemperatureSensorProfile(
+                "cpu_temp",
+                "Raspberry Pi CPU",
+                TemperatureDriver.HOST_CPU,
+                target_temp=140.0,
+                hysteresis=10.0,
+                alert_above=176.0,
+                alert_below=-40.0,
+                emergency_above=185.0,
+                emergency_below=-40.0,
+                equipment_type=EquipmentKind.GENERIC,
+            )
         ],
-        temperature_sensors=temperature_sensors,
-        water_level_sensors=water_level_sensors,
+        water_level_sensors=[],
         steppers=[
             StepperProfile("dose1", "Stepper Dose 1", "dose1"),
             StepperProfile("dose2", "Stepper Dose 2", "dose2"),
             StepperProfile("dose3", "Stepper Dose 3", "dose3"),
             StepperProfile("dose4", "Stepper Dose 4", "dose4"),
         ],
-        ato=[
-            ATOProfile("main_ato", "Main ATO", "level_sensor_1", "level_sensor_4", "mcp_relay", "ato_pump"),
-        ],
+        ato=[],
     )
 
 
@@ -291,6 +319,8 @@ def save_config(path: Path, config: AppConfig) -> None:
 
 
 def apply_config_migrations(config: AppConfig) -> None:
+    if not config.sense_ports:
+        config.sense_ports = [SensePortProfile(index) for index in range(1, 11)]
     for sensor in config.temperature_sensors:
         if sensor.driver == TemperatureDriver.HOST_CPU and sensor.alert_above <= 100:
             sensor.target_temp = 140.0
@@ -308,7 +338,10 @@ def validate_config(config: AppConfig) -> None:
     if config.buzzer.bcm_pin != BUZZER_PWM_BCM:
         raise DiagnosticHalt("The buzzer must use BCM GPIO 12.")
     equipment_ids = {item.id for item in config.equipment}
-    water_ids = {item.id for item in config.water_level_sensors}
+    materialized_water = materialized_water_level_sensors(config)
+    materialized_temperature = materialized_temperature_sensors(config)
+    materialized_analog = materialized_analog_sensors(config)
+    water_ids = {item.id for item in materialized_water}
     stepper_ids = {item.id for item in config.steppers}
     if len(equipment_ids) != len(config.equipment):
         raise DiagnosticHalt("Equipment profile IDs must be unique.")
@@ -324,14 +357,19 @@ def validate_config(config: AppConfig) -> None:
     for item in config.ph_sensors:
         if item.i2c_address != PH_EZO_I2C_ADDRESS:
             raise DiagnosticHalt("The pH interface is fixed to EZO address 0x63.")
-    for item in config.analog_sensors:
+    port_numbers = {item.number for item in config.sense_ports}
+    if len(port_numbers) != len(config.sense_ports):
+        raise DiagnosticHalt("Sense port entries must be unique.")
+    for item in config.sense_ports:
+        require_sense_port(item.number)
+    for item in materialized_analog:
         require_sense_port(item.sense_port)
-    for item in config.temperature_sensors:
+    for item in materialized_temperature:
         if item.sense_port is not None:
             require_sense_port(item.sense_port)
         if item.assigned_equipment and item.assigned_equipment not in equipment_ids:
             raise DiagnosticHalt(f"Temperature sensor {item.id} references unknown equipment {item.assigned_equipment}.")
-    for item in config.water_level_sensors:
+    for item in materialized_water:
         require_sense_port(item.sense_port)
     for item in config.steppers:
         require_stepper(item.assignment)
@@ -349,3 +387,76 @@ def validate_config(config: AppConfig) -> None:
             raise DiagnosticHalt(f"ATO {item.id} references unknown backup sensor {item.backup_failsafe_sensor}.")
         if item.assigned_actuator not in equipment_ids and item.assigned_actuator not in stepper_ids:
             raise DiagnosticHalt(f"ATO {item.id} references unknown actuator {item.assigned_actuator}.")
+
+
+def materialized_temperature_sensors(config: AppConfig) -> list[TemperatureSensorProfile]:
+    sensors = list(config.temperature_sensors)
+    for port in config.sense_ports:
+        if port.device != SensePortDevice.DS18B20:
+            continue
+        driver = (
+            TemperatureDriver.ONE_WIRE_BUS
+            if port.one_wire_mode == OneWireMode.KERNEL
+            else TemperatureDriver.BIT_BANGED_ONE_WIRE
+        )
+        sensors.append(
+            TemperatureSensorProfile(
+                f"sense_port_{port.number}_temperature",
+                port.display_name,
+                driver,
+                target_temp=port.target_temp,
+                hysteresis=port.hysteresis,
+                check_frequency=port.check_frequency,
+                alert_above=port.alert_above,
+                alert_below=port.alert_below,
+                emergency_above=port.emergency_above,
+                emergency_below=port.emergency_below,
+                assigned_equipment=port.assigned_equipment,
+                equipment_type=port.equipment_type,
+                sensor_id=port.sensor_id,
+                sense_port=port.number,
+            )
+        )
+    return sensors
+
+
+def materialized_water_level_sensors(config: AppConfig) -> list[WaterLevelSensorProfile]:
+    sensors = list(config.water_level_sensors)
+    for port in config.sense_ports:
+        if port.device not in {SensePortDevice.HYDROS_TRIPLE, SensePortDevice.BINARY}:
+            continue
+        sensors.append(
+            WaterLevelSensorProfile(
+                f"sense_port_{port.number}_water",
+                port.display_name,
+                WaterLevelDriver.HYDROS_TRIPLE if port.device == SensePortDevice.HYDROS_TRIPLE else WaterLevelDriver.BINARY,
+                port.number,
+                desired_state=port.desired_state,
+                alert_wait=port.alert_wait,
+                alert_frequency=port.alert_frequency,
+                check_frequency=port.check_frequency,
+                activity_timeout=port.activity_timeout,
+                debounce_samples=port.debounce_samples,
+                invert_binary=port.invert_binary,
+            )
+        )
+    return sensors
+
+
+def materialized_analog_sensors(config: AppConfig) -> list[AnalogSensorProfile]:
+    sensors = list(config.analog_sensors)
+    for port in config.sense_ports:
+        if port.device != SensePortDevice.ANALOG:
+            continue
+        sensors.append(
+            AnalogSensorProfile(
+                f"sense_port_{port.number}_analog",
+                port.display_name,
+                port.number,
+                check_frequency=port.check_frequency,
+                unit=port.analog_unit,
+                scale=port.analog_scale,
+                offset=port.analog_offset,
+            )
+        )
+    return sensors

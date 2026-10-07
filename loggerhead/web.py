@@ -47,6 +47,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/config":
             config = self.server.service.update_config(payload)
             self._send_json({"ok": True, "config": config})
+        elif parsed.path == "/api/sense-port":
+            self.server.service.set_sense_port(int(payload["number"]), payload)
+            self._send_json({"ok": True})
         elif parsed.path == "/api/ato/reset":
             self.server.service.reset_ato(payload["id"])
             self._send_json({"ok": True})
@@ -189,6 +192,9 @@ INDEX_HTML = r"""<!doctype html>
       <div id="events" class="grid"></div>
     </section>
     <section id="config" hidden>
+      <h2>Sense Ports</h2>
+      <div id="sensePorts" class="grid"></div>
+      <h2>Raw Config</h2>
       <textarea id="configText"></textarea>
       <div class="toolbar"><button id="saveConfig">Save Config</button></div>
     </section>
@@ -243,6 +249,18 @@ INDEX_HTML = r"""<!doctype html>
       }
       $("clock").textContent = new Date(status.time * 1000).toLocaleString();
       $("configText").value = JSON.stringify(status.config, null, 2);
+      $("sensePorts").innerHTML = status.sense_ports.map(port => `
+        <div class="card">
+          <div class="label">Sense Port ${port.number}</div>
+          <input value="${port.name || ""}" placeholder="Name" onchange="updateSensePort(${port.number}, {name:this.value})">
+          <select onchange="updateSensePort(${port.number}, {device:this.value})">
+            ${["empty","hydros_triple","binary","ds18b20","analog"].map(v => `<option value="${v}" ${port.device === v ? "selected" : ""}>${v.replaceAll("_", " ")}</option>`).join("")}
+          </select>
+          <select onchange="updateSensePort(${port.number}, {one_wire_mode:this.value})">
+            ${["bit_bang","kernel"].map(v => `<option value="${v}" ${port.one_wire_mode === v ? "selected" : ""}>${v.replaceAll("_", " ")}</option>`).join("")}
+          </select>
+        </div>
+      `).join("");
       $("alarmToggle").textContent = status.config.buzzer.alarm_enabled ? "Alarm Enabled" : "Alarm Disabled";
       $("alarmToggle").className = status.config.buzzer.alarm_enabled ? "filled" : "danger";
       $("readings").innerHTML = status.sensor_catalog.filter(s => s.main).map(readingFor).join("");
@@ -267,6 +285,10 @@ INDEX_HTML = r"""<!doctype html>
     }
     async function togglePrime(id, on) {
       await fetch("/api/prime", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id, on})});
+      await refresh();
+    }
+    async function updateSensePort(number, patch) {
+      await fetch("/api/sense-port", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({number, ...patch})});
       await refresh();
     }
     async function loadPlot() {

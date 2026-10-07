@@ -9,7 +9,17 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from .config import AppConfig, EquipmentProfile, load_config, save_config
+from .config import (
+    AppConfig,
+    EquipmentProfile,
+    OneWireMode,
+    SensePortDevice,
+    load_config,
+    materialized_analog_sensors,
+    materialized_temperature_sensors,
+    materialized_water_level_sensors,
+    save_config,
+)
 from .controllers import AlertEvaluator, ATOController, ThermalController
 from .database import TelemetryStore
 from .drivers import (
@@ -71,7 +81,7 @@ class LoggerheadService:
                 debounce_samples=sensor.debounce_samples,
                 activity_timeout=sensor.activity_timeout,
             )
-            for sensor in self.config.water_level_sensors
+            for sensor in materialized_water_level_sensors(self.config)
             if sensor.driver == WaterLevelDriver.HYDROS_TRIPLE
         }
         self._last_polled_log = 0.0
@@ -101,6 +111,7 @@ class LoggerheadService:
     def status(self) -> dict[str, Any]:
         return {
             "config": asdict(self.config),
+            "sense_ports": [asdict(item) for item in self.config.sense_ports],
             "sensor_catalog": self._sensor_catalog(),
             "steppers": [asdict(item) for item in self.config.steppers],
             "equipment": {key: asdict(value) for key, value in self.state.equipment.items()},
@@ -131,11 +142,31 @@ class LoggerheadService:
                 debounce_samples=sensor.debounce_samples,
                 activity_timeout=sensor.activity_timeout,
             )
-            for sensor in self.config.water_level_sensors
+            for sensor in materialized_water_level_sensors(self.config)
             if sensor.driver == WaterLevelDriver.HYDROS_TRIPLE
         }
         self.store.log_event("config", "Configuration reloaded from UI.")
         return self.config
+
+    def set_sense_port(self, number: int, payload: dict[str, Any]) -> None:
+        port = next(item for item in self.config.sense_ports if item.number == number)
+        if "device" in payload:
+            port.device = SensePortDevice(payload["device"])
+        if "name" in payload:
+            port.name = str(payload["name"])
+        if "one_wire_mode" in payload:
+            port.one_wire_mode = OneWireMode(payload["one_wire_mode"])
+        save_config(self.config_path, self.config)
+        self.config = load_config(self.config_path)
+        self._hydros = {
+            sensor.id: HydrosTripleClassifier(
+                debounce_samples=sensor.debounce_samples,
+                activity_timeout=sensor.activity_timeout,
+            )
+            for sensor in materialized_water_level_sensors(self.config)
+            if sensor.driver == WaterLevelDriver.HYDROS_TRIPLE
+        }
+        self.store.log_event("config", f"Sense Port {number} set to {port.device.value}.")
 
     def set_equipment(self, equipment_id: str, on: bool, *, source: str = "manual") -> None:
         profile = self._equipment_profile(equipment_id)
@@ -243,7 +274,7 @@ class LoggerheadService:
             self._stop.wait(1.0)
 
     def _poll_temperature(self, now: float) -> None:
-        for sensor in self.config.temperature_sensors:
+        for sensor in materialized_temperature_sensors(self.config):
             value = self._read_temperature(sensor)
             self.state.readings[sensor.id] = SensorReading(sensor.id, round(value, 3), "F", ts=now)
             self.store.log_value(f"temperature.{sensor.id}", value, unit="F", ts=now)
@@ -260,6 +291,9 @@ class LoggerheadService:
 
     def _read_temperature(self, sensor) -> float:
         if sensor.driver == TemperatureDriver.ONE_WIRE_BUS:
+            if sensor.sense_port is not None:
+                port = SENSE_PORTS[sensor.sense_port]
+                self.temperature_reader.configure_kernel_one_wire(port.digital_bcm)
             return self.temperature_reader.read_one_wire_bus(sensor.sensor_id)
         if sensor.driver == TemperatureDriver.BIT_BANGED_ONE_WIRE:
             port = SENSE_PORTS[sensor.sense_port or 1]
@@ -273,7 +307,7 @@ class LoggerheadService:
             self.store.log_value(f"ph.{sensor.id}", value, unit="pH", ts=now)
 
     def _poll_water_levels(self, now: float) -> None:
-        for sensor in self.config.water_level_sensors:
+        for sensor in materialized_water_level_sensors(self.config):
             if sensor.driver == WaterLevelDriver.BINARY:
                 port = SENSE_PORTS[sensor.sense_port]
                 level = BinaryLevelSensor(port.digital_bcm, invert=sensor.invert_binary, simulation=self.simulation).read_state()
@@ -338,7 +372,7 @@ class LoggerheadService:
         self.buzzer.sound(max((alarm.priority for alarm in active), key=lambda p: ["info", "warning", "high", "critical"].index(p.value)))
 
     def _poll_analog(self, now: float) -> None:
-        for sensor in self.config.analog_sensors:
+        for sensor in materialized_analog_sensors(self.config):
             port = SENSE_PORTS[sensor.sense_port]
             raw = self.analog_reader.read_voltage(port.ads1115_address, port.analog_channel)
             value = raw * sensor.scale + sensor.offset
@@ -369,13 +403,13 @@ class LoggerheadService:
 
     def _sensor_catalog(self) -> list[dict[str, Any]]:
         catalog = []
-        for item in self.config.water_level_sensors:
+        for item in materialized_water_level_sensors(self.config):
             catalog.append({"id": item.id, "name": item.name, "kind": "water", "main": True, "desired": item.desired_state.value})
-        for item in self.config.temperature_sensors:
+        for item in materialized_temperature_sensors(self.config):
             catalog.append({"id": item.id, "name": item.name, "kind": "temperature", "main": item.driver != TemperatureDriver.HOST_CPU})
         for item in self.config.ph_sensors:
             catalog.append({"id": item.id, "name": item.name, "kind": "ph", "main": True})
-        for item in self.config.analog_sensors:
+        for item in materialized_analog_sensors(self.config):
             catalog.append({"id": item.id, "name": item.name, "kind": "analog", "main": True})
         return catalog
 

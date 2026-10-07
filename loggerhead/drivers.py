@@ -5,6 +5,7 @@ import logging
 import os
 import socket
 import struct
+import subprocess
 import threading
 import time
 from collections import deque
@@ -283,16 +284,39 @@ class TemperatureReader:
 
     def __init__(self, *, simulation: bool = False) -> None:
         self.simulation = simulation
+        self._configured_kernel_pins: set[int] = set()
 
-    def read_one_wire_bus(self, sensor_id: str) -> float:
-        path = Path("/sys/bus/w1/devices") / sensor_id / "w1_slave"
+    def configure_kernel_one_wire(self, bcm_pin: int) -> None:
+        if self.simulation or bcm_pin in self._configured_kernel_pins:
+            return
+        result = subprocess.run(
+            ["dtoverlay", "w1-gpio", f"gpiopin={bcm_pin}"],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise HardwareUnavailable(f"Could not enable kernel 1-Wire on BCM {bcm_pin}: {result.stderr.strip()}")
+        self._configured_kernel_pins.add(bcm_pin)
+        time.sleep(1.0)
+
+    def read_one_wire_bus(self, sensor_id: str = "") -> float:
+        resolved_id = sensor_id or self._first_one_wire_sensor_id()
+        path = Path("/sys/bus/w1/devices") / resolved_id / "w1_slave"
         if self.simulation or not path.exists():
             return 78.0
         text = path.read_text(encoding="utf-8")
         marker = "t="
         if marker not in text:
-            raise ValueError(f"1-Wire sensor {sensor_id} returned no temperature marker.")
+            raise ValueError(f"1-Wire sensor {resolved_id} returned no temperature marker.")
         return int(text.split(marker, 1)[1].strip()) / 1000 * 9 / 5 + 32
+
+    @staticmethod
+    def _first_one_wire_sensor_id() -> str:
+        devices = sorted(Path("/sys/bus/w1/devices").glob("28-*"))
+        if not devices:
+            raise HardwareUnavailable("No DS18B20 sensors were found on the kernel 1-Wire bus.")
+        return devices[0].name
 
     def read_bit_banged(self, bcm_pin: int) -> float:
         # The exact DS18B20 timing is delegated to pigpio wave captures on hardware.
