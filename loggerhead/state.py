@@ -61,6 +61,7 @@ class RuntimeState:
     ato: dict[str, ATOState] = field(default_factory=dict)
     buzzer_muted_until: float = 0.0
     stepper_active: str | None = None
+    manual_priming: dict[str, bool] = field(default_factory=dict)
 
 
 class StateStore:
@@ -90,6 +91,7 @@ class StateStore:
         state.ato = {key: ATOState(**value) for key, value in data.get("ato", {}).items()}
         state.buzzer_muted_until = data.get("buzzer_muted_until", 0.0)
         state.stepper_active = data.get("stepper_active")
+        state.manual_priming = data.get("manual_priming", {})
         return state
 
     def save(self, state: RuntimeState) -> None:

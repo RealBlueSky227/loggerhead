@@ -53,6 +53,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/buzzer/silence":
             self.server.service.silence_buzzer()
             self._send_json({"ok": True})
+        elif parsed.path == "/api/alarm/enabled":
+            self.server.service.set_alarm_enabled(bool(payload["enabled"]))
+            self._send_json({"ok": True})
+        elif parsed.path == "/api/prime":
+            self.server.service.set_manual_priming(payload["id"], bool(payload["on"]))
+            self._send_json({"ok": True})
         else:
             self.send_error(404)
 
@@ -98,6 +104,7 @@ INDEX_HTML = r"""<!doctype html>
       --hot: #ff4b5f;
       --cold: #39a7ff;
       --warn: #ffc857;
+      --off: #4b5d63;
     }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); }
@@ -107,16 +114,22 @@ INDEX_HTML = r"""<!doctype html>
     button, select, input { background: #0d1419; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 9px 11px; font: inherit; }
     button { cursor: pointer; min-width: 40px; }
     button.active, .filled { background: var(--ok); color: #031008; border-color: var(--ok); font-weight: 700; }
+    button.danger { background: var(--hot); color: #fff; border-color: var(--hot); font-weight: 700; }
     button.hollow { background: transparent; color: var(--muted); }
     main { padding: 20px; display: grid; gap: 18px; }
     .toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
     .clock { font-size: 30px; font-weight: 800; color: var(--ok); font-variant-numeric: tabular-nums; }
+    .heartbeat { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); }
+    .dot { width: 11px; height: 11px; border-radius: 50%; background: var(--off); display: inline-block; }
+    .dot.ok { background: var(--ok); box-shadow: 0 0 14px rgba(53, 208, 127, .45); }
+    .dot.bad { background: var(--hot); box-shadow: 0 0 14px rgba(255, 75, 95, .45); }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(var(--widget-width, 230px), 1fr)); gap: 12px; }
     .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-height: 112px; }
     .label { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
     .value { font-size: 28px; font-weight: 800; color: var(--ok); overflow-wrap: anywhere; }
     .value.hot { color: var(--hot); }
     .value.cold { color: var(--cold); }
+    .value.off { color: var(--muted); }
     .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid var(--line); padding: 10px 0; }
     .row:last-child { border-bottom: 0; }
     .tabs { display: flex; gap: 8px; }
@@ -124,6 +137,7 @@ INDEX_HTML = r"""<!doctype html>
     canvas { width: 100%; height: 320px; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; }
     textarea { width: 100%; min-height: 360px; background: #080d11; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
     .alarm { border-color: var(--warn); }
+    .diag { border-color: #31505a; }
     @media (max-width: 640px) { header { align-items: flex-start; flex-direction: column; gap: 12px; } .clock { font-size: 24px; } main { padding: 12px; } }
   </style>
 </head>
@@ -133,7 +147,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="tabs">
       <button data-tab="dash" class="active">Dashboard</button>
       <button data-tab="plots">Plots</button>
-      <button data-tab="health">System Health</button>
+      <button data-tab="diagnostics">Diagnostics</button>
       <button data-tab="config">Config</button>
     </div>
   </header>
@@ -141,13 +155,17 @@ INDEX_HTML = r"""<!doctype html>
     <section id="dash">
       <div class="toolbar">
         <div class="clock" id="clock"></div>
+        <div class="heartbeat"><span class="dot bad" id="heartbeatDot"></span><span id="heartbeatText">Connecting</span></div>
         <label>Widget width <input id="scale" type="range" min="180" max="420" value="230"></label>
         <button id="silence">Silence</button>
+        <button id="alarmToggle">Alarm Enabled</button>
       </div>
-      <h2>Readouts</h2>
+      <h2>Life Support</h2>
       <div id="readings" class="grid"></div>
       <h2>Equipment</h2>
       <div id="equipment" class="grid"></div>
+      <h2>Dosing Pumps</h2>
+      <div id="pumps" class="grid"></div>
       <h2>Alarms</h2>
       <div id="alarms" class="grid"></div>
     </section>
@@ -163,8 +181,12 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <canvas id="plot" width="1200" height="360"></canvas>
     </section>
-    <section id="health" hidden>
+    <section id="diagnostics" hidden>
       <div id="healthGrid" class="grid"></div>
+      <h2>Hardware</h2>
+      <div id="diagnosticGrid" class="grid"></div>
+      <h2>Events</h2>
+      <div id="events" class="grid"></div>
     </section>
     <section id="config" hidden>
       <textarea id="configText"></textarea>
@@ -173,42 +195,78 @@ INDEX_HTML = r"""<!doctype html>
   </main>
   <script>
     let status = {};
+    let lastStatusAt = 0;
     const $ = (id) => document.getElementById(id);
     document.querySelectorAll("[data-tab]").forEach(btn => btn.onclick = () => {
       document.querySelectorAll("[data-tab]").forEach(b => b.classList.toggle("active", b === btn));
-      ["dash","plots","health","config"].forEach(id => $(id).hidden = id !== btn.dataset.tab);
+      ["dash","plots","diagnostics","config"].forEach(id => $(id).hidden = id !== btn.dataset.tab);
     });
     $("scale").oninput = e => document.documentElement.style.setProperty("--widget-width", `${e.target.value}px`);
     $("silence").onclick = () => fetch("/api/buzzer/silence", {method:"POST", body:"{}"});
+    $("alarmToggle").onclick = async () => {
+      await fetch("/api/alarm/enabled", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({enabled: !status.config.buzzer.alarm_enabled})});
+      await refresh();
+    };
     $("saveConfig").onclick = async () => {
       await fetch("/api/config", {method:"POST", headers:{"Content-Type":"application/json"}, body:$("configText").value});
       await refresh();
     };
     $("loadPlot").onclick = loadPlot;
     function card(label, value, cls="") { return `<div class="card ${cls}"><div class="label">${label}</div><div class="value ${cls}">${value}</div></div>`; }
+    function readingFor(sensor) {
+      if (sensor.kind === "water") {
+        const value = status.water_levels[sensor.id] || "waiting";
+        const cls = value === sensor.desired ? "" : "hot";
+        return card(sensor.name, value.replaceAll("_", " "), cls);
+      }
+      const reading = status.readings[sensor.id];
+      if (!reading) return card(sensor.name, "waiting", "off");
+      let cls = "";
+      if (sensor.kind === "temperature" && typeof reading.value === "number") {
+        if (reading.value > 82 && sensor.main) cls = "hot";
+        if (reading.value < 74 && sensor.main) cls = "cold";
+      }
+      return card(sensor.name, `${reading.value} ${reading.unit || ""}`, cls);
+    }
+    function setHeartbeat(ok, text) {
+      $("heartbeatDot").className = `dot ${ok ? "ok" : "bad"}`;
+      $("heartbeatText").textContent = text;
+    }
     async function refresh() {
-      status = await fetch("/api/status").then(r => r.json());
+      try {
+        status = await fetch("/api/status").then(r => r.json());
+        lastStatusAt = Date.now();
+        setHeartbeat(true, "Backend online");
+      } catch {
+        setHeartbeat(false, lastStatusAt ? "Backend stale" : "Backend offline");
+        return;
+      }
       $("clock").textContent = new Date(status.time * 1000).toLocaleString();
       $("configText").value = JSON.stringify(status.config, null, 2);
-      $("readings").innerHTML = Object.values(status.readings).map(r => {
-        let cls = "";
-        if (r.id.includes("temp") && typeof r.value === "number") {
-          if (r.value > 82) cls = "hot";
-          if (r.value < 74) cls = "cold";
-        }
-        return card(r.id.replaceAll("_", " "), `${r.value} ${r.unit || ""}`, cls);
-      }).join("");
+      $("alarmToggle").textContent = status.config.buzzer.alarm_enabled ? "Alarm Enabled" : "Alarm Disabled";
+      $("alarmToggle").className = status.config.buzzer.alarm_enabled ? "filled" : "danger";
+      $("readings").innerHTML = status.sensor_catalog.filter(s => s.main).map(readingFor).join("");
       $("equipment").innerHTML = Object.values(status.equipment).map(e => {
         const klass = e.on ? "filled" : "hollow";
         return `<div class="card"><div class="label">${e.id}</div><button class="${klass}" onclick="toggleEquipment('${e.id}', ${!e.on})">${e.on ? "ON" : "OFF"}</button></div>`;
       }).join("");
+      $("pumps").innerHTML = status.steppers.map(p => {
+        const on = !!status.manual_priming[p.id];
+        return `<div class="card"><div class="label">${p.name}</div><button class="${on ? "filled" : "hollow"}" onclick="togglePrime('${p.id}', ${!on})">${on ? "PRIMING" : "PRIME"}</button></div>`;
+      }).join("");
       $("alarms").innerHTML = Object.values(status.alarms).filter(a => a.active).map(a => card(a.priority, a.message, "alarm")).join("") || card("ok", "No active alarms");
       $("healthGrid").innerHTML = Object.values(status.readings).filter(r => r.id.startsWith("health_")).map(r => card(r.id.replace("health_", "").replaceAll("_", " "), r.value)).join("");
-      const streams = Object.keys(status.readings).map(id => id.startsWith("health_") ? `health.${id.replace("health_", "")}` : id.startsWith("ph") ? `ph.${id}` : id.includes("temp") ? `temperature.${id}` : `snapshot.${id}`);
+      $("diagnosticGrid").innerHTML = Object.entries(status.diagnostics).map(([k, v]) => card(k.replaceAll("_", " "), typeof v === "object" ? JSON.stringify(v) : v, "diag")).join("");
+      $("events").innerHTML = status.events.map(e => card(e.category, e.message, "diag")).join("");
+      const streams = Object.keys(status.readings).map(id => id.startsWith("health_") ? `health.${id.replace("health_", "")}` : id.startsWith("ph") ? `ph.${id}` : id.includes("temp") ? `temperature.${id}` : id.startsWith("analog") ? `analog.${id}` : `snapshot.${id}`);
       $("plotStream").innerHTML = [...new Set(streams)].sort().map(s => `<option value="${s}">${s}</option>`).join("");
     }
     async function toggleEquipment(id, on) {
       await fetch("/api/equipment", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id, on})});
+      await refresh();
+    }
+    async function togglePrime(id, on) {
+      await fetch("/api/prime", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id, on})});
       await refresh();
     }
     async function loadPlot() {

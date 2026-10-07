@@ -14,6 +14,7 @@ from .controllers import AlertEvaluator, ATOController, ThermalController
 from .database import TelemetryStore
 from .drivers import (
     TMC2209UART,
+    ADS1115AnalogReader,
     BinaryLevelSensor,
     Buzzer,
     EzoPHSensor,
@@ -25,7 +26,7 @@ from .drivers import (
     TemperatureReader,
 )
 from .hardware import RELAYS, SENSE_PORTS, EquipmentDriver, TemperatureDriver, WaterLevelDriver
-from .notifications import MQTTHomeAssistantBridge, NotificationLimiter, TelegramNotifier
+from .notifications import HomeAssistantNotifier, MQTTHomeAssistantBridge, NotificationLimiter, TelegramNotifier
 from .state import EquipmentState, SensorReading, StateStore
 from .web import DashboardServer
 
@@ -48,6 +49,7 @@ class LoggerheadService:
         self.state_store = StateStore(data_dir / "state.json")
         self.state = self.state_store.load()
         self.relay_board = MCP23017RelayBoard(simulation=simulation)
+        self.analog_reader = ADS1115AnalogReader(simulation=simulation)
         self.temperature_reader = TemperatureReader(simulation=simulation)
         self.ph_sensor = EzoPHSensor(simulation=simulation)
         self.buzzer = Buzzer(frequency_hz=self.config.buzzer.frequency_hz, simulation=simulation)
@@ -55,11 +57,14 @@ class LoggerheadService:
         self.stepper_engine = StepperPulseEngine(self.uart, self.relay_board, simulation=simulation)
         self.health = HostHealthMonitor()
         self.telegram = TelegramNotifier(self.config.telegram)
+        self.ha_notifier = HomeAssistantNotifier(self.config.home_assistant_notify)
         self.mqtt = MQTTHomeAssistantBridge(self.config.mqtt)
         self.mqtt.set_command_handler(self.handle_mqtt_command)
         self.notifications = NotificationLimiter()
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._prime_stop: dict[str, threading.Event] = {}
+        self._prime_threads: dict[str, threading.Thread] = {}
         self._level_since: dict[str, float] = {}
         self._hydros: dict[str, HydrosTripleClassifier] = {
             sensor.id: HydrosTripleClassifier(
@@ -74,7 +79,7 @@ class LoggerheadService:
 
     def run(self, *, host: str = "0.0.0.0", port: int = 8080) -> None:
         LOGGER.info("Starting Loggerhead on %s:%s", host, port)
-        self.telegram.send("Loggerhead aquarium controller started.")
+        self._notify("Loggerhead", "Loggerhead aquarium controller started.")
         server = DashboardServer(self, host=host, port=port)
         self._threads = [
             threading.Thread(target=self._poll_loop, name="loggerhead-poll", daemon=True),
@@ -96,11 +101,16 @@ class LoggerheadService:
     def status(self) -> dict[str, Any]:
         return {
             "config": asdict(self.config),
+            "sensor_catalog": self._sensor_catalog(),
+            "steppers": [asdict(item) for item in self.config.steppers],
             "equipment": {key: asdict(value) for key, value in self.state.equipment.items()},
             "readings": {key: asdict(value) for key, value in self.state.readings.items()},
             "water_levels": {key: value.value for key, value in self.state.water_levels.items()},
             "alarms": {key: asdict(value) for key, value in self.state.alarms.items()},
             "ato": {key: asdict(value) for key, value in self.state.ato.items()},
+            "manual_priming": self.state.manual_priming,
+            "diagnostics": self._diagnostics(),
+            "heartbeat": {"ok": True, "ts": time.time()},
             "events": self.store.recent_events(30),
             "time": time.time(),
             "simulation": self.simulation,
@@ -152,6 +162,54 @@ class LoggerheadService:
         self.store.log_event("alarm", "Buzzer temporarily silenced.")
         self.state_store.save(self.state)
 
+    def set_alarm_enabled(self, enabled: bool) -> None:
+        self.config.buzzer.alarm_enabled = enabled
+        save_config(self.config_path, self.config)
+        if not enabled:
+            self.buzzer.stop()
+        self.store.log_event("alarm", f"Global alarm {'enabled' if enabled else 'disabled'}.")
+        self.state_store.save(self.state)
+
+    def set_manual_priming(self, stepper_id: str, enabled: bool) -> None:
+        profile = next(item for item in self.config.steppers if item.id == stepper_id)
+        if not enabled:
+            stop = self._prime_stop.get(stepper_id)
+            if stop:
+                stop.set()
+            self.state.manual_priming[stepper_id] = False
+            self.store.log_event("dosing", f"{profile.name} manual priming stopped.")
+            self.state_store.save(self.state)
+            return
+        if any(self.state.manual_priming.values()):
+            raise RuntimeError("Only one pump may be manually primed at a time.")
+        stop = threading.Event()
+        self._prime_stop[stepper_id] = stop
+        self.state.manual_priming[stepper_id] = True
+        thread = threading.Thread(target=self._prime_loop, args=(profile, stop), name=f"prime-{stepper_id}", daemon=True)
+        self._prime_threads[stepper_id] = thread
+        self.store.log_event("dosing", f"{profile.name} manual priming started.")
+        thread.start()
+        self.state_store.save(self.state)
+
+    def _prime_loop(self, profile, stop: threading.Event) -> None:
+        from .hardware import require_stepper
+
+        assignment = require_stepper(profile.assignment)
+        while not stop.is_set():
+            try:
+                self.stepper_engine.move(
+                    assignment,
+                    steps=max(1, profile.manual_speed_steps_per_second),
+                    steps_per_second=max(1, profile.manual_speed_steps_per_second),
+                    run_current_ma=profile.run_current_ma,
+                    hold_current_ma=profile.hold_current_ma,
+                )
+            except Exception as exc:
+                self._activate_alarm(f"stepper:{profile.id}", f"{profile.name} manual priming fault: {exc}", priority="high")
+                break
+        self.state.manual_priming[profile.id] = False
+        self.state_store.save(self.state)
+
     def handle_mqtt_command(self, topic: str, payload: Any) -> None:
         # Implements SRS 4.8.2 Command Subscription.
         if topic.startswith("equipment/"):
@@ -170,6 +228,7 @@ class LoggerheadService:
             now = time.time()
             self._poll_temperature(now)
             self._poll_ph(now)
+            self._poll_analog(now)
             self._poll_water_levels(now)
             self._poll_health(now)
             self._evaluate_ato(now)
@@ -247,7 +306,7 @@ class LoggerheadService:
                 self.set_equipment(profile.assigned_actuator, should_run, source="ato")
             if alarm:
                 self._register_alarm(alarm)
-                self.telegram.send(alarm.message)
+                self._notify("Loggerhead ATO", alarm.message)
                 self.store.log_event("ato", alarm.message)
             self.state.ato[profile.id] = ato_state
 
@@ -257,8 +316,11 @@ class LoggerheadService:
             alarm.first_seen = existing.first_seen
             alarm.last_notified = existing.last_notified
         self.state.alarms[alarm.id] = alarm
+        self.mqtt.publish(f"alerts/{alarm.id}", {"active": True, "message": alarm.message, "priority": alarm.priority.value})
+        if not self.config.buzzer.alarm_enabled:
+            return
         if self.notifications.should_send(alarm.id, 300):
-            self.telegram.send(alarm.message)
+            self._notify("Loggerhead alarm", alarm.message)
             alarm.last_notified = time.time()
             self.store.log_event("alarm", alarm.message, {"priority": alarm.priority.value})
 
@@ -270,10 +332,18 @@ class LoggerheadService:
 
     def _sound_buzzer_if_needed(self, now: float) -> None:
         active = [alarm for alarm in self.state.alarms.values() if alarm.active and alarm.priority.value in {"high", "critical"}]
-        if not active or now < self.state.buzzer_muted_until:
+        if not self.config.buzzer.enabled or not self.config.buzzer.alarm_enabled or not active or now < self.state.buzzer_muted_until:
             self.buzzer.stop()
             return
         self.buzzer.sound(max((alarm.priority for alarm in active), key=lambda p: ["info", "warning", "high", "critical"].index(p.value)))
+
+    def _poll_analog(self, now: float) -> None:
+        for sensor in self.config.analog_sensors:
+            port = SENSE_PORTS[sensor.sense_port]
+            raw = self.analog_reader.read_voltage(port.ads1115_address, port.analog_channel)
+            value = raw * sensor.scale + sensor.offset
+            self.state.readings[sensor.id] = SensorReading(sensor.id, round(value, 3), sensor.unit, ts=now)
+            self.store.log_value(f"analog.{sensor.id}", value, unit=sensor.unit, ts=now)
 
     def _publish_telemetry(self) -> None:
         self.mqtt.publish("state", self.status(), retain=False)
@@ -289,3 +359,40 @@ class LoggerheadService:
             if item.id == equipment_id:
                 return item
         raise KeyError(equipment_id)
+
+    def _notify(self, title: str, message: str) -> None:
+        if not self.config.buzzer.alarm_enabled:
+            return
+        self.telegram.send(message)
+        self.ha_notifier.send(title, message)
+        self.mqtt.publish("alerts/latest", {"title": title, "message": message, "ts": time.time()}, retain=False)
+
+    def _sensor_catalog(self) -> list[dict[str, Any]]:
+        catalog = []
+        for item in self.config.water_level_sensors:
+            catalog.append({"id": item.id, "name": item.name, "kind": "water", "main": True, "desired": item.desired_state.value})
+        for item in self.config.temperature_sensors:
+            catalog.append({"id": item.id, "name": item.name, "kind": "temperature", "main": item.driver != TemperatureDriver.HOST_CPU})
+        for item in self.config.ph_sensors:
+            catalog.append({"id": item.id, "name": item.name, "kind": "ph", "main": True})
+        for item in self.config.analog_sensors:
+            catalog.append({"id": item.id, "name": item.name, "kind": "analog", "main": True})
+        return catalog
+
+    def _diagnostics(self) -> dict[str, Any]:
+        stepper_diagnostics = {}
+        for item in self.config.steppers:
+            try:
+                from .hardware import require_stepper
+
+                assignment = require_stepper(item.assignment)
+                stepper_diagnostics[item.id] = self.uart.diagnostics(assignment.uart_address)
+            except Exception as exc:
+                stepper_diagnostics[item.id] = {"error": str(exc)}
+        return {
+            "steppers": stepper_diagnostics,
+            "buzzer_alarm_enabled": self.config.buzzer.alarm_enabled,
+            "mqtt_enabled": self.config.mqtt.enabled,
+            "telegram_enabled": self.config.telegram.enabled,
+            "home_assistant_notify_enabled": self.config.home_assistant_notify.enabled,
+        }

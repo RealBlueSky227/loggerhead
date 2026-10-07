@@ -238,6 +238,43 @@ class EzoPHSensor:
         return float(text[1:] if text and not text[0].isdigit() else text)
 
 
+class ADS1115AnalogReader:
+    """ADS1115 analog channel reader for physical sense ports.
+
+    Implements SRS 8.2 analog channels routed through the fixed ADS1115 map.
+    """
+
+    CONFIG_REGISTER = 0x01
+    CONVERSION_REGISTER = 0x00
+
+    def __init__(self, *, bus_id: int = 1, simulation: bool = False) -> None:
+        self.simulation = simulation
+        self.bus = None
+        if not simulation:
+            try:
+                from smbus2 import SMBus  # type: ignore
+
+                self.bus = SMBus(bus_id)
+            except Exception as exc:
+                LOGGER.warning("ADS1115 I2C unavailable, falling back to simulation: %s", exc)
+                self.simulation = True
+
+    def read_voltage(self, address: int, channel: int) -> float:
+        if channel < 0 or channel > 3:
+            raise DiagnosticHalt(f"ADS1115 channel {channel} is outside AIN0-AIN3.")
+        if self.simulation or not self.bus:
+            return round(1.0 + channel * 0.25, 3)
+        mux = 0x04 + channel
+        config = 0x8000 | (mux << 12) | 0x0200 | 0x0100 | 0x0080 | 0x0003
+        self.bus.write_i2c_block_data(address, self.CONFIG_REGISTER, [(config >> 8) & 0xFF, config & 0xFF])
+        time.sleep(0.01)
+        raw = self.bus.read_i2c_block_data(address, self.CONVERSION_REGISTER, 2)
+        value = (raw[0] << 8) | raw[1]
+        if value & 0x8000:
+            value -= 0x10000
+        return round(value * 4.096 / 32768, 5)
+
+
 class TemperatureReader:
     """Temperature sensor readers for 1-Wire bus, bit-banged GPIO, and host CPU.
 

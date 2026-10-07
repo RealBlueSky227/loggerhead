@@ -28,6 +28,14 @@ class TelegramConfig:
 
 
 @dataclass
+class HomeAssistantNotifyConfig:
+    enabled: bool = False
+    base_url: str = "http://homeassistant.local:8123"
+    token: str = ""
+    notify_service: str = "persistent_notification.create"
+
+
+@dataclass
 class MQTTConfig:
     enabled: bool = False
     host: str = "homeassistant.local"
@@ -40,6 +48,7 @@ class MQTTConfig:
 @dataclass
 class BuzzerConfig:
     enabled: bool = True
+    alarm_enabled: bool = True
     bcm_pin: int = BUZZER_PWM_BCM
     frequency_hz: int = 2500
     rearm_seconds: int = 900
@@ -65,6 +74,17 @@ class PHSensorProfile:
     name: str
     check_frequency: float = 30.0
     i2c_address: int = PH_EZO_I2C_ADDRESS
+
+
+@dataclass
+class AnalogSensorProfile:
+    id: str
+    name: str
+    sense_port: int
+    check_frequency: float = 10.0
+    unit: str = "V"
+    scale: float = 1.0
+    offset: float = 0.0
 
 
 @dataclass
@@ -148,10 +168,12 @@ class ATOProfile:
 class AppConfig:
     # Implements SRS 5.4 Configuration Management and SRS 5.4.7 default safe config.
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    home_assistant_notify: HomeAssistantNotifyConfig = field(default_factory=HomeAssistantNotifyConfig)
     mqtt: MQTTConfig = field(default_factory=MQTTConfig)
     buzzer: BuzzerConfig = field(default_factory=BuzzerConfig)
     equipment: list[EquipmentProfile] = field(default_factory=list)
     ph_sensors: list[PHSensorProfile] = field(default_factory=list)
+    analog_sensors: list[AnalogSensorProfile] = field(default_factory=list)
     temperature_sensors: list[TemperatureSensorProfile] = field(default_factory=list)
     water_level_sensors: list[WaterLevelSensorProfile] = field(default_factory=list)
     dosing: list[DosingProfile] = field(default_factory=list)
@@ -162,6 +184,36 @@ class AppConfig:
 
 
 def default_config() -> AppConfig:
+    water_level_sensors = [
+        WaterLevelSensorProfile(f"level_sensor_{port}", f"Sensor {port} Triple Optical", WaterLevelDriver.HYDROS_TRIPLE, port)
+        for port in (1, 4, 7, 10)
+    ]
+    temperature_sensors = [
+        TemperatureSensorProfile(
+            f"ds18b20_sensor_{port}",
+            f"Sensor {port} DS18B20",
+            TemperatureDriver.BIT_BANGED_ONE_WIRE,
+            assigned_equipment="heater" if port == 2 else "",
+            equipment_type=EquipmentKind.HEATER,
+            sensor_id=f"sensor-{port}",
+            sense_port=port,
+        )
+        for port in (2, 5, 8)
+    ]
+    temperature_sensors.append(
+        TemperatureSensorProfile(
+            "cpu_temp",
+            "Raspberry Pi CPU",
+            TemperatureDriver.HOST_CPU,
+            target_temp=140.0,
+            hysteresis=10.0,
+            alert_above=176.0,
+            alert_below=-40.0,
+            emergency_above=185.0,
+            emergency_below=-40.0,
+            equipment_type=EquipmentKind.GENERIC,
+        )
+    )
     return AppConfig(
         equipment=[
             EquipmentProfile("heater", "Main Heater", EquipmentDriver.MCP23017_RELAY, "AC1"),
@@ -169,27 +221,12 @@ def default_config() -> AppConfig:
             EquipmentProfile("ato_pump", "ATO Pump", EquipmentDriver.MCP23017_RELAY, "AC3"),
         ],
         ph_sensors=[PHSensorProfile("ph", "EZO pH")],
-        temperature_sensors=[
-            TemperatureSensorProfile(
-                "water_temp",
-                "Water Temperature",
-                TemperatureDriver.ONE_WIRE_BUS,
-                assigned_equipment="heater",
-                equipment_type=EquipmentKind.HEATER,
-                sensor_id="28-000000000000",
-            ),
-            TemperatureSensorProfile("cpu_temp", "Raspberry Pi CPU", TemperatureDriver.HOST_CPU),
+        analog_sensors=[
+            AnalogSensorProfile(f"analog_sensor_{port}", f"Sensor {port} Analog", port)
+            for port in (3, 6, 9)
         ],
-        water_level_sensors=[
-            WaterLevelSensorProfile("sump_level", "Sump Level", WaterLevelDriver.HYDROS_TRIPLE, 1),
-            WaterLevelSensorProfile(
-                "ato_failsafe",
-                "ATO High Failsafe",
-                WaterLevelDriver.BINARY,
-                2,
-                desired_state=LevelState.DRY,
-            ),
-        ],
+        temperature_sensors=temperature_sensors,
+        water_level_sensors=water_level_sensors,
         steppers=[
             StepperProfile("dose1", "Stepper Dose 1", "dose1"),
             StepperProfile("dose2", "Stepper Dose 2", "dose2"),
@@ -197,7 +234,7 @@ def default_config() -> AppConfig:
             StepperProfile("dose4", "Stepper Dose 4", "dose4"),
         ],
         ato=[
-            ATOProfile("main_ato", "Main ATO", "sump_level", "ato_failsafe", "mcp_relay", "ato_pump"),
+            ATOProfile("main_ato", "Main ATO", "level_sensor_1", "level_sensor_4", "mcp_relay", "ato_pump"),
         ],
     )
 
@@ -239,16 +276,31 @@ def load_config(path: Path) -> AppConfig:
     with path.open("r", encoding="utf-8") as handle:
         raw = json.load(handle)
     config = from_dict(AppConfig, raw)
+    apply_config_migrations(config)
     validate_config(config)
     return config
 
 
 def save_config(path: Path, config: AppConfig) -> None:
+    apply_config_migrations(config)
     validate_config(config)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(asdict(config), handle, indent=2, sort_keys=True)
         handle.write("\n")
+
+
+def apply_config_migrations(config: AppConfig) -> None:
+    for sensor in config.temperature_sensors:
+        if sensor.driver == TemperatureDriver.HOST_CPU and sensor.alert_above <= 100:
+            sensor.target_temp = 140.0
+            sensor.hysteresis = 10.0
+            sensor.alert_above = 176.0
+            sensor.alert_below = -40.0
+            sensor.emergency_above = 185.0
+            sensor.emergency_below = -40.0
+            sensor.assigned_equipment = ""
+            sensor.equipment_type = EquipmentKind.GENERIC
 
 
 def validate_config(config: AppConfig) -> None:
@@ -272,6 +324,8 @@ def validate_config(config: AppConfig) -> None:
     for item in config.ph_sensors:
         if item.i2c_address != PH_EZO_I2C_ADDRESS:
             raise DiagnosticHalt("The pH interface is fixed to EZO address 0x63.")
+    for item in config.analog_sensors:
+        require_sense_port(item.sense_port)
     for item in config.temperature_sensors:
         if item.sense_port is not None:
             require_sense_port(item.sense_port)

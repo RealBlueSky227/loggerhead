@@ -7,7 +7,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-from .config import MQTTConfig, TelegramConfig
+from .config import HomeAssistantNotifyConfig, MQTTConfig, TelegramConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,6 +32,44 @@ class TelegramNotifier:
                 return response.status < 300
         except Exception as exc:
             LOGGER.warning("Telegram notification failed: %s", exc)
+            return False
+
+
+class HomeAssistantNotifier:
+    """Home Assistant REST notification service caller.
+
+    This keeps Telegram optional while allowing HA to send through any configured
+    notify target, including mobile app push services.
+    """
+
+    def __init__(self, config: HomeAssistantNotifyConfig) -> None:
+        self.config = config
+
+    def send(self, title: str, message: str) -> bool:
+        if not self.config.enabled or not self.config.token:
+            LOGGER.info("Home Assistant notifications disabled: %s", message)
+            return False
+        service = self.config.notify_service.strip("/")
+        if "." in service:
+            domain, name = service.split(".", 1)
+        else:
+            domain, name = "notify", service
+        url = f"{self.config.base_url.rstrip('/')}/api/services/{domain}/{name}"
+        body = json.dumps({"title": title, "message": message}).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.config.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status < 300
+        except Exception as exc:
+            LOGGER.warning("Home Assistant notification failed: %s", exc)
             return False
 
 
