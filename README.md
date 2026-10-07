@@ -22,6 +22,8 @@ The runtime is intentionally safe to import and test on non-Pi systems. Hardware
 
 ## Install on Raspberry Pi OS
 
+For a full `systemd` deployment on the reef Pi, see [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ```bash
 git clone https://github.com/RealBlueSky227/loggerhead.git
 cd loggerhead
