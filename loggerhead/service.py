@@ -42,6 +42,7 @@ from .drivers import (
 from .hardware import (
     RELAYS,
     SENSE_PORTS,
+    AlarmPriority,
     DiagnosticHalt,
     EquipmentDriver,
     TemperatureDriver,
@@ -61,6 +62,9 @@ class LoggerheadService:
     Implements SRS 1.1, 1.2, 2.4, 5.1, 5.4.1, 6.1, 6.2, 6.3, and the orchestration
     path for all hardware/control subsystems.
     """
+
+    MANUAL_PRIME_LIMIT_REASONS = {"max_seconds", "max_steps"}
+    MANUAL_PRIME_LIMIT_CHIRP_SECONDS = 0.15
 
     def __init__(self, config_path: Path, data_dir: Path, *, simulation: bool = False) -> None:
         self.config_path = config_path
@@ -110,6 +114,8 @@ class LoggerheadService:
         }
         self._last_polled_log = 0.0
         self._clear_transient_stepper_state()
+        self._retire_manual_prime_limit_alarms()
+        self._save_state()
         self.buzzer.stop()
         self._restore_equipment_defaults()
 
@@ -353,12 +359,8 @@ class LoggerheadService:
                 max_seconds=profile.manual_max_seconds,
                 max_steps=profile.manual_max_steps,
             )
-            if result.reason in {"max_seconds", "max_steps"}:
-                self._activate_alarm(
-                    f"stepper:{profile.id}:prime-limit",
-                    f"{profile.name} manual priming stopped at {result.steps_sent} steps due to {result.reason}.",
-                    priority="high",
-                )
+            if result.reason in self.MANUAL_PRIME_LIMIT_REASONS:
+                self._handle_manual_prime_limit(profile, result)
         except Exception as exc:
             LOGGER.exception("%s manual priming fault.", profile.name)
             self._activate_alarm(f"stepper:{profile.id}", f"{profile.name} manual priming fault: {exc}", priority="high")
@@ -393,6 +395,12 @@ class LoggerheadService:
         with self._state_lock:
             self.state.stepper_active = None
             self.state.manual_priming = {item.id: False for item in self.config.steppers}
+
+    def _retire_manual_prime_limit_alarms(self) -> None:
+        with self._state_lock:
+            for alarm in self.state.alarms.values():
+                if alarm.id.startswith("stepper:") and alarm.id.endswith(":prime-limit"):
+                    alarm.active = False
 
     def _stepper_profile(self, stepper_id: str) -> StepperProfile:
         for item in self.config.steppers:
@@ -536,6 +544,57 @@ class LoggerheadService:
         from .state import AlarmState
 
         self._register_alarm(AlarmState(alarm_id, message, AlarmPriority(priority), first_seen=time.time()))
+
+    def _handle_manual_prime_limit(self, profile: StepperProfile, result) -> None:
+        reason_text = "time limit" if result.reason == "max_seconds" else "step limit"
+        message = f"{profile.name} manual priming stopped at {result.steps_sent} steps after reaching the {reason_text}."
+        LOGGER.info(message)
+        with self._state_lock:
+            existing = self.state.alarms.get(f"stepper:{profile.id}:prime-limit")
+            if existing:
+                existing.active = False
+        self.store.log_event(
+            "dosing",
+            message,
+            {
+                "id": profile.id,
+                "steps": result.steps_sent,
+                "reason": result.reason,
+                "event": "manual_prime_limit",
+            },
+        )
+        self.mqtt.publish(
+            f"dosing/{profile.id}/prime-limit",
+            {
+                "id": profile.id,
+                "steps": result.steps_sent,
+                "reason": result.reason,
+                "message": message,
+                "ts": time.time(),
+            },
+            retain=False,
+        )
+        self._quick_buzzer_chirp()
+
+    def _quick_buzzer_chirp(self) -> None:
+        if (
+            self._stop.is_set()
+            or not self.config.buzzer.enabled
+            or not self.config.buzzer.alarm_enabled
+            or time.time() < self.state.buzzer_muted_until
+        ):
+            return
+        if self._active_audible_alarm_ids():
+            return
+
+        def chirp() -> None:
+            try:
+                self.buzzer.sound(AlarmPriority.INFO)
+                self._stop.wait(self.MANUAL_PRIME_LIMIT_CHIRP_SECONDS)
+            finally:
+                self._sound_buzzer_if_needed(time.time())
+
+        threading.Thread(target=chirp, name="prime-limit-chirp", daemon=True).start()
 
     def _sound_buzzer_if_needed(self, now: float) -> None:
         active_ids = self._active_audible_alarm_ids()

@@ -126,20 +126,60 @@ def test_manual_priming_worker_error_clears_state(tmp_path, monkeypatch: pytest.
     assert "manual priming fault" in alarm.message
 
 
-def test_manual_priming_limit_alarm_clears_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_manual_priming_limit_chirps_without_latching_alarm(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = make_service(tmp_path)
+    service.MANUAL_PRIME_LIMIT_CHIRP_SECONDS = 0.001
+    sound_calls: list[AlarmPriority] = []
+    stop_calls = 0
+    run_count = 0
 
     def limit_run_continuous(_assignment, **_kwargs) -> StepperRunResult:
-        return StepperRunResult(12, "max_steps")
+        nonlocal run_count
+        run_count += 1
+        return StepperRunResult(12, "max_seconds")
 
     monkeypatch.setattr(service.stepper_engine, "run_continuous", limit_run_continuous)
+    monkeypatch.setattr(service.buzzer, "sound", lambda priority=AlarmPriority.HIGH: sound_calls.append(priority))
+
+    def stop_buzzer() -> None:
+        nonlocal stop_calls
+        stop_calls += 1
+
+    monkeypatch.setattr(service.buzzer, "stop", stop_buzzer)
     service.set_manual_priming("dose1", True)
 
-    wait_for(lambda: service.state.manual_priming["dose1"] is False)
-    alarm = service.state.alarms["stepper:dose1:prime-limit"]
-    assert alarm.active is True
-    assert alarm.priority == AlarmPriority.HIGH
-    assert "12 steps" in alarm.message
+    wait_for(lambda: service.state.manual_priming["dose1"] is False and "dose1" not in service._prime_threads)
+    wait_for(lambda: sound_calls == [AlarmPriority.INFO])
+    wait_for(lambda: stop_calls >= 1)
+    assert "stepper:dose1:prime-limit" not in service.state.alarms
+    assert service._active_audible_alarm_ids() == set()
+    assert any("time limit" in event["message"] and "12 steps" in event["message"] for event in service.store.recent_events())
+
+    service.set_manual_priming("dose1", True)
+    wait_for(lambda: service.state.manual_priming["dose1"] is False and run_count == 2)
+
+
+def test_startup_retires_persisted_manual_prime_limit_alarm(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = tmp_path / "config" / "loggerhead.json"
+    data_dir = tmp_path / "data"
+    service = LoggerheadService(config_path, data_dir, simulation=True)
+    service.state.alarms["stepper:dose1:prime-limit"] = AlarmState(
+        "stepper:dose1:prime-limit",
+        "Dose 1 manual priming stopped at 12 steps due to max_seconds.",
+        AlarmPriority.HIGH,
+        active=True,
+    )
+    service.state_store.save(service.state)
+
+    restarted = LoggerheadService(config_path, data_dir, simulation=True)
+    sound_calls: list[AlarmPriority] = []
+    monkeypatch.setattr(restarted.buzzer, "sound", lambda priority=AlarmPriority.HIGH: sound_calls.append(priority))
+
+    restarted._sound_buzzer_if_needed(time.time())
+
+    assert restarted.state.alarms["stepper:dose1:prime-limit"].active is False
+    assert restarted._active_audible_alarm_ids() == set()
+    assert sound_calls == []
 
 
 def test_shutdown_blocks_new_priming_and_clears_active_worker(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
