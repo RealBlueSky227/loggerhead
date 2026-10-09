@@ -483,6 +483,7 @@ class Buzzer:
                 self.pi = pigpio.pi()
                 if not self.pi.connected:
                     raise HardwareUnavailable("pigpiod is not connected.")
+                self.stop()
             except Exception as exc:
                 LOGGER.warning("Buzzer pigpio unavailable, falling back to simulation: %s", exc)
                 self.simulation = True

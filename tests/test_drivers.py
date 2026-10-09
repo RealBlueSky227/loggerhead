@@ -7,6 +7,7 @@ import pytest
 
 from loggerhead.drivers import (
     TMC2209UART,
+    Buzzer,
     HardwareFault,
     HydrosTripleClassifier,
     KasaHS300Client,
@@ -89,6 +90,16 @@ class FakeSerial:
         return chunk
 
 
+class FakePigpioPi:
+    connected = True
+
+    def __init__(self) -> None:
+        self.hardware_pwm_calls: list[tuple[int, int, int]] = []
+
+    def hardware_PWM(self, bcm_pin: int, frequency_hz: int, duty: int) -> None:
+        self.hardware_pwm_calls.append((bcm_pin, frequency_hz, duty))
+
+
 @pytest.mark.parametrize(
     ("period", "state"),
     [
@@ -113,6 +124,15 @@ def test_hs300_xor_round_trip() -> None:
     payload = '{"system":{"get_sysinfo":{}}}'
     encrypted = KasaHS300Client.encrypt(payload)
     assert KasaHS300Client.decrypt(encrypted) == payload
+
+
+def test_buzzer_init_flushes_stale_hardware_pwm(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_pi = FakePigpioPi()
+    monkeypatch.setitem(sys.modules, "pigpio", types.SimpleNamespace(pi=lambda: fake_pi))
+
+    Buzzer(simulation=False)
+
+    assert fake_pi.hardware_pwm_calls == [(12, 0, 0)]
 
 
 def test_relay_polarity_handles_nc_and_normally_on() -> None:
