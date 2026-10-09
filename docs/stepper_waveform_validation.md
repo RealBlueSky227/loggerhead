@@ -29,8 +29,8 @@ Run Loggerhead in real hardware mode from the Pi virtualenv:
 
 ```bash
 cd ~/controller/loggerhead
-source ~/controller/venv/bin/activate
-python -m loggerhead --config ~/controller/loggerhead.json --data-dir ~/controller/data
+source .venv/bin/activate
+python -m loggerhead --config config/loggerhead.json --data-dir data
 ```
 
 Use the dashboard manual prime controls with the dosing line disconnected. Start with Dose 1 at 100 step/s, then repeat at 400 and 1000 step/s.

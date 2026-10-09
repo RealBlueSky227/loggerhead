@@ -131,6 +131,7 @@ class FakePigpioPi:
         self.wave_add_generic_calls: list[list[FakePigpioPulse]] = []
         self.wave_create_calls = 0
         self.wave_send_once_calls: list[int] = []
+        self.wave_chain_calls: list[list[int]] = []
         self.wave_delete_calls: list[int] = []
         self.wave_tx_stop_calls = 0
         self.created_waves: dict[int, list[FakePigpioPulse]] = {}
@@ -139,9 +140,13 @@ class FakePigpioPi:
         self.wave_add_result = 0
         self.wave_create_result: int | None = None
         self.wave_send_result: int | None = None
+        self.wave_chain_result: int | None = None
         self.busy_cycles = 0
         self.busy_checks = 0
         self.on_busy = None
+        self.fail_write = False
+        self.fail_wave_tx_stop = False
+        self.fail_wave_tx_busy = False
 
     def hardware_PWM(self, bcm_pin: int, frequency_hz: int, duty: int) -> None:
         self.hardware_pwm_calls.append((bcm_pin, frequency_hz, duty))
@@ -150,6 +155,8 @@ class FakePigpioPi:
         self.mode_calls.append((bcm_pin, mode))
 
     def write(self, bcm_pin: int, value: int) -> None:
+        if self.fail_write:
+            raise RuntimeError("gpio write failed")
         self.write_calls.append((bcm_pin, value))
 
     def wave_add_generic(self, pulses: list[FakePigpioPulse]) -> int:
@@ -171,7 +178,15 @@ class FakePigpioPi:
             return self.wave_send_result
         return wave_id
 
+    def wave_chain(self, chain: list[int]) -> int:
+        self.wave_chain_calls.append(list(chain))
+        if self.wave_chain_result is not None:
+            return self.wave_chain_result
+        return 0
+
     def wave_tx_busy(self) -> bool:
+        if self.fail_wave_tx_busy:
+            raise RuntimeError("wave busy failed")
         self.busy_checks += 1
         if self.on_busy:
             self.on_busy(self)
@@ -181,6 +196,8 @@ class FakePigpioPi:
         return False
 
     def wave_tx_stop(self) -> None:
+        if self.fail_wave_tx_stop:
+            raise RuntimeError("wave stop failed")
         self.wave_tx_stop_calls += 1
         self.busy_cycles = 0
 
@@ -396,6 +413,14 @@ def test_tmc_configure_driver_rejects_startup_charge_pump_fault() -> None:
         uart.configure_driver(0, microsteps=16)
 
 
+def test_tmc_configure_driver_rejects_disabled_chopper() -> None:
+    uart = TMC2209UART(simulation=True)
+    uart._sim_registers[(0, uart.REG_CHOPCONF)] = 0
+
+    with pytest.raises(HardwareFault, match="TOFF"):
+        uart.configure_driver(0, microsteps=16)
+
+
 def test_stepper_interlock_releases_after_move() -> None:
     relay = MCP23017RelayBoard(simulation=True)
     relay.set_stepper_enabled(STEPPERS["dose3"], True)
@@ -427,7 +452,7 @@ def test_stepper_real_gpio_path_initializes_step_and_direction(monkeypatch: pyte
         (STEPPERS["dose1"].direction_bcm, 0),
     ]
     assert fake_pi.write_calls[-1] == (STEPPERS["dose1"].step_bcm, 0)
-    assert fake_pi.wave_send_once_calls == [1]
+    assert fake_pi.wave_chain_calls == [[1]]
     assert fake_pi.wave_delete_calls == [1]
     assert uart.read_register(0, uart.REG_SGTHRS) == 17
     assert uart.read_register(0, uart.REG_CHOPCONF) & uart.CHOPCONF_MRES_MASK == (
@@ -479,7 +504,7 @@ def test_stepper_continuous_real_wave_batches_are_accounted(monkeypatch: pytest.
     assert result.interrupted_batch is False
     assert result.reason == "max_steps"
     assert [len(pulses) // 2 for pulses in fake_pi.wave_add_generic_calls] == [500, 200]
-    assert fake_pi.wave_send_once_calls == [1, 1, 2]
+    assert fake_pi.wave_chain_calls == [[255, 0, 1, 255, 1, 2, 0, 2]]
     assert fake_pi.wave_delete_calls == [1, 2]
     assert relay.shadow_a == 0xF0
 
@@ -498,11 +523,41 @@ def test_stepper_stop_cancels_active_waveform(monkeypatch: pytest.MonkeyPatch) -
 
     fake_pi.on_busy = stop_during_busy
 
-    engine.move(STEPPERS["dose1"], steps=500, steps_per_second=1000, run_current_ma=500)
+    engine.move(STEPPERS["dose1"], steps=10, steps_per_second=1000, run_current_ma=500)
 
     assert fake_pi.wave_tx_stop_calls >= 1
     assert fake_pi.wave_delete_calls == [1]
     assert fake_pi.write_calls[-1] == (STEPPERS["dose1"].step_bcm, 0)
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_external_waveform_cancel_is_not_counted_successful(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_pi = FakePigpioPi()
+    fake_pi.busy_cycles = 1
+    engine, relay, _uart, _fake_pi = make_real_stepper_engine(monkeypatch, fake_pi)
+
+    with pytest.raises(HardwareFault, match="ended early"):
+        engine.move(STEPPERS["dose1"], steps=500, steps_per_second=1000, run_current_ma=500)
+
+    assert fake_pi.wave_tx_stop_calls == 0
+    assert fake_pi.wave_delete_calls == [1]
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_stop_before_send_prevents_waveform_transmission(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine, relay, _uart, fake_pi = make_real_stepper_engine(monkeypatch)
+    original_begin = engine._begin_wave_operation
+
+    def stop_before_wave(owner: str) -> None:
+        original_begin(owner)
+        engine.request_stop()
+
+    monkeypatch.setattr(engine, "_begin_wave_operation", stop_before_wave)
+
+    with pytest.raises(HardwareFault, match="stopped before waveform"):
+        engine.move(STEPPERS["dose1"], steps=20, steps_per_second=1000, run_current_ma=500)
+
+    assert fake_pi.wave_chain_calls == []
     assert relay.shadow_a == 0xF0
 
 
@@ -525,16 +580,16 @@ def test_stepper_wave_add_failure_disables_motor(monkeypatch: pytest.MonkeyPatch
     with pytest.raises(HardwareFault, match="wave_add_generic"):
         engine.move(STEPPERS["dose1"], steps=10, steps_per_second=1000, run_current_ma=500)
 
-    assert fake_pi.wave_send_once_calls == []
+    assert fake_pi.wave_chain_calls == []
     assert relay.shadow_a == 0xF0
 
 
-def test_stepper_wave_send_failure_deletes_wave_and_disables_motor(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stepper_wave_chain_failure_deletes_wave_and_disables_motor(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_pi = FakePigpioPi()
-    fake_pi.wave_send_result = -1
+    fake_pi.wave_chain_result = -1
     engine, relay, _uart, _fake_pi = make_real_stepper_engine(monkeypatch, fake_pi)
 
-    with pytest.raises(HardwareFault, match="wave_send_once"):
+    with pytest.raises(HardwareFault, match="wave_chain"):
         engine.move(STEPPERS["dose1"], steps=10, steps_per_second=1000, run_current_ma=500)
 
     assert fake_pi.wave_delete_calls == [1]
@@ -565,6 +620,51 @@ def test_stepper_uart_error_during_wave_stops_wave_and_disables_motor(monkeypatc
     assert relay.shadow_a == 0xF0
 
 
+def test_stepper_cleanup_attempts_disable_and_current_after_step_low_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine, relay, uart, fake_pi = make_real_stepper_engine(monkeypatch)
+    writes_before_cleanup = 0
+
+    def fail_step_low(_assignment) -> None:
+        raise RuntimeError("step low failed")
+
+    def start_failing_after_motion(_chain: list[int]) -> int:
+        nonlocal writes_before_cleanup
+        writes_before_cleanup = len(fake_pi.write_calls)
+        monkeypatch.setattr(engine, "_set_step_low", fail_step_low)
+        return 0
+
+    monkeypatch.setattr(fake_pi, "wave_chain", start_failing_after_motion)
+
+    with pytest.raises(RuntimeError, match="step low failed"):
+        engine.move(STEPPERS["dose1"], steps=5, steps_per_second=1000, run_current_ma=500)
+
+    assert relay.shadow_a == 0xF0
+    assert uart.read_register(0, uart.REG_IHOLD_IRUN) == 5 << 16
+    assert len(fake_pi.write_calls) == writes_before_cleanup
+    with pytest.raises(HardwareFault, match="faulted"):
+        engine.move(STEPPERS["dose2"], steps=1, steps_per_second=1000, run_current_ma=500)
+
+
+def test_stepper_cleanup_attempts_disable_after_current_shutdown_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine, relay, uart, fake_pi = make_real_stepper_engine(monkeypatch)
+    original_set_current = uart.set_current
+
+    def fail_zero_current(node: int, run_current_ma: int, hold_current_ma: int) -> None:
+        if run_current_ma == 0 and hold_current_ma == 0:
+            raise HardwareFault("current shutdown failed")
+        original_set_current(node, run_current_ma, hold_current_ma)
+
+    monkeypatch.setattr(uart, "set_current", fail_zero_current)
+
+    with pytest.raises(HardwareFault, match="current shutdown"):
+        engine.move(STEPPERS["dose1"], steps=5, steps_per_second=1000, run_current_ma=500)
+
+    assert relay.shadow_a == 0xF0
+    assert fake_pi.write_calls[-1] == (STEPPERS["dose1"].step_bcm, 0)
+    with pytest.raises(HardwareFault, match="faulted"):
+        engine.move(STEPPERS["dose2"], steps=1, steps_per_second=1000, run_current_ma=500)
+
+
 def test_stepper_real_mode_rejects_disconnected_pigpiod(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_pi = FakePigpioPi()
     fake_pi.connected = False
@@ -593,13 +693,37 @@ def test_buzzer_defers_hardware_pwm_while_stepper_wave_active(monkeypatch: pytes
     assert fake_pi.hardware_pwm_calls == []
 
 
+def test_buzzer_defers_during_full_stepper_operation(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_pi = FakePigpioPi()
+    fake_pi.busy_cycles = 2
+    monkeypatch.setitem(
+        sys.modules,
+        "pigpio",
+        types.SimpleNamespace(OUTPUT=1, pulse=FakePigpioPulse, pi=lambda: fake_pi),
+    )
+    buzzer = Buzzer(simulation=False)
+    relay = MCP23017RelayBoard(simulation=True)
+    uart = TMC2209UART(simulation=True)
+    engine = StepperPulseEngine(uart, relay, simulation=False)
+    fake_pi.hardware_pwm_calls.clear()
+
+    def sound_alarm_while_wave_active(_pi: FakePigpioPi) -> None:
+        buzzer.sound(AlarmPriority.HIGH)
+
+    fake_pi.on_busy = sound_alarm_while_wave_active
+    engine.move(STEPPERS["dose1"], steps=10, steps_per_second=1000, run_current_ma=500)
+
+    assert fake_pi.hardware_pwm_calls == []
+    assert relay.shadow_a == 0xF0
+
+
 def test_stepper_repeated_wave_cycles_do_not_leak_wave_ids(monkeypatch: pytest.MonkeyPatch) -> None:
     engine, relay, _uart, fake_pi = make_real_stepper_engine(monkeypatch)
 
     for _ in range(3):
         engine.move(STEPPERS["dose1"], steps=25, steps_per_second=1000, run_current_ma=500)
 
-    assert fake_pi.wave_send_once_calls == [1, 2, 3]
+    assert fake_pi.wave_chain_calls == [[1], [2], [3]]
     assert fake_pi.wave_delete_calls == [1, 2, 3]
     assert engine._wave_ids == set()
     assert relay.shadow_a == 0xF0

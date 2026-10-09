@@ -17,6 +17,7 @@ from .hardware import (
     BUZZER_PWM_BCM,
     MCP23017_ADDRESS,
     PH_EZO_I2C_ADDRESS,
+    STEPPERS,
     AlarmPriority,
     DiagnosticHalt,
     LevelState,
@@ -573,6 +574,7 @@ class TMC2209UART:
     GSTAT_RESET = 1 << 0
     GSTAT_DRV_ERR = 1 << 1
     GSTAT_UV_CP = 1 << 2
+    CHOPCONF_TOFF_MASK = 0x0F
     CHOPCONF_MRES_SHIFT = 24
     CHOPCONF_MRES_MASK = 0x0F << CHOPCONF_MRES_SHIFT
     MICROSTEP_TO_MRES = {
@@ -591,8 +593,11 @@ class TMC2209UART:
         self.simulation = simulation
         self.serial = None
         self._lock = threading.RLock()
-        self._sim_registers: dict[tuple[int, int], int] = {}
+        self._sim_registers: dict[tuple[int, int], int] = {
+            (node, self.REG_CHOPCONF): 0x00000003 for node in range(4)
+        }
         self._sim_ifcnt: dict[int, int] = {}
+        self._current_calibration_warning_logged = False
         if not simulation:
             try:
                 import serial  # type: ignore
@@ -685,6 +690,12 @@ class TMC2209UART:
         raise TimeoutError(f"TMC2209 UART read timed out for register {register:#04x}.")
 
     def set_current(self, node: int, run_current_ma: int, hold_current_ma: int) -> None:
+        if not self._current_calibration_warning_logged:
+            LOGGER.warning(
+                "TMC2209 current scaling uses Loggerhead's configured mA values without board-specific sense "
+                "resistor/VREF calibration; verify motor current on the assembled driver board."
+            )
+            self._current_calibration_warning_logged = True
         ihold = min(31, max(0, round(hold_current_ma / max(run_current_ma, 1) * 31)))
         irun = min(31, max(0, round(run_current_ma / 1000 * 31)))
         value = ihold | (irun << 8) | (5 << 16)
@@ -710,6 +721,11 @@ class TMC2209UART:
             self.write_register(node, self.REG_GCONF, wanted_gconf)
 
             chopconf = self._read_register_unlocked(node, self.REG_CHOPCONF)
+            if chopconf & self.CHOPCONF_TOFF_MASK == 0:
+                raise HardwareFault(
+                    f"TMC2209 node {node} CHOPCONF.TOFF is zero; chopper is disabled and motor current "
+                    "configuration cannot be trusted."
+                )
             mres = self.MICROSTEP_TO_MRES[microsteps]
             wanted_chopconf = (chopconf & ~self.CHOPCONF_MRES_MASK) | (mres << self.CHOPCONF_MRES_SHIFT)
             self.write_register(node, self.REG_CHOPCONF, wanted_chopconf)
@@ -724,6 +740,8 @@ class TMC2209UART:
                 raise HardwareFault(f"TMC2209 node {node} did not retain UART configuration bits.")
             if readback_chopconf & self.CHOPCONF_MRES_MASK != (mres << self.CHOPCONF_MRES_SHIFT):
                 raise HardwareFault(f"TMC2209 node {node} did not retain microstep configuration.")
+            if readback_chopconf & self.CHOPCONF_TOFF_MASK == 0:
+                raise HardwareFault(f"TMC2209 node {node} readback has CHOPCONF.TOFF=0.")
 
     def diagnostics(self, node: int) -> dict[str, Any]:
         drv = self.read_register(node, self.REG_DRV_STATUS)
@@ -766,6 +784,7 @@ class StepperRunResult:
     interrupted_batch: bool = False
     elapsed_seconds: float = 0.0
     effective_steps_per_second: float | None = None
+    max_inter_batch_gap_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -774,6 +793,8 @@ class PulseWindowResult:
     possible_steps: int
     completed_batches: int
     interrupted_batch: bool = False
+    reason: str = ""
+    max_inter_batch_gap_seconds: float = 0.0
 
 
 class StepperPulseEngine:
@@ -788,6 +809,8 @@ class StepperPulseEngine:
     WAVE_BATCH_SECONDS = 0.5
     WAVE_POLL_SECONDS = 0.01
     WAVE_DIAGNOSTIC_SECONDS = 0.25
+    WAVE_CHAIN_MAX_REPEATS = 65_535
+    WAVE_EXTERNAL_CANCEL_TOLERANCE_SECONDS = 0.05
 
     def __init__(self, uart: TMC2209UART, relay_board: MCP23017RelayBoard, *, simulation: bool = False) -> None:
         self.uart = uart
@@ -845,6 +868,9 @@ class StepperPulseEngine:
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("A stepper motor is already active.")
         primary_error: BaseException | None = None
+        owner = f"stepper:{assignment.name}"
+        started = time.monotonic()
+        pulse_result = PulseWindowResult(0, 0, 0)
         try:
             self._raise_if_unavailable()
             self.active_stepper = assignment.name
@@ -858,8 +884,10 @@ class StepperPulseEngine:
             self._raise_if_unavailable()
             self.uart.set_current(assignment.uart_address, run_current_ma, hold_current_ma)
             self._raise_if_unavailable()
+            self._begin_wave_operation(owner)
+            self._raise_if_stop_requested()
             self.relay_board.set_stepper_enabled(assignment, True)
-            self._pulse_windowed(
+            pulse_result = self._pulse_windowed(
                 assignment,
                 steps=steps,
                 steps_per_second=steps_per_second,
@@ -867,6 +895,25 @@ class StepperPulseEngine:
                 hold_current_ma=hold_current_ma,
                 microsteps=microsteps,
                 stallguard_threshold=stallguard_threshold,
+            )
+            elapsed = time.monotonic() - started
+            self._log_motion_result(
+                assignment,
+                requested_steps=abs(steps),
+                result=StepperRunResult(
+                    pulse_result.confirmed_steps,
+                    pulse_result.reason or "completed",
+                    requested_steps=abs(steps),
+                    possible_steps=pulse_result.possible_steps,
+                    completed_batches=pulse_result.completed_batches,
+                    interrupted_batch=pulse_result.interrupted_batch,
+                    elapsed_seconds=elapsed,
+                    effective_steps_per_second=pulse_result.confirmed_steps / elapsed
+                    if elapsed > 0 and pulse_result.confirmed_steps
+                    else None,
+                    max_inter_batch_gap_seconds=pulse_result.max_inter_batch_gap_seconds,
+                ),
+                requested_speed=steps_per_second,
             )
         except BaseException as exc:
             primary_error = exc
@@ -880,6 +927,7 @@ class StepperPulseEngine:
                 if primary_error is None:
                     raise
             finally:
+                PigpioResourceCoordinator.end_stepper_wave(owner)
                 self.active_stepper = None
                 self._lock.release()
 
@@ -904,10 +952,12 @@ class StepperPulseEngine:
         possible_steps = 0
         completed_batches = 0
         interrupted_batch = False
+        max_inter_batch_gap_seconds = 0.0
         requested_steps = 0
         reason = "stopped"
         started = time.monotonic()
         wave_cache: dict[tuple[int, int, int], int] = {}
+        owner = f"stepper:{assignment.name}"
         try:
             self._raise_if_unavailable()
             if stop_event.is_set():
@@ -923,8 +973,10 @@ class StepperPulseEngine:
             self._raise_if_unavailable()
             self.uart.set_current(assignment.uart_address, run_current_ma, hold_current_ma)
             self._raise_if_unavailable()
+            self._begin_wave_operation(owner)
+            if stop_event.is_set() or self._stop_event.is_set():
+                return StepperRunResult(0, reason)
             self.relay_board.set_stepper_enabled(assignment, True)
-            chunk_limit = self._wave_batch_steps(steps_per_second)
             while not stop_event.is_set() and not self._stop_event.is_set():
                 self._raise_if_unavailable()
                 elapsed = time.monotonic() - started
@@ -936,7 +988,7 @@ class StepperPulseEngine:
                     reason = "max_steps"
                     break
                 remaining_time_steps = max(1, int((max_seconds - elapsed) * max(1, steps_per_second)))
-                chunk = min(chunk_limit, remaining_steps, remaining_time_steps)
+                chunk = min(remaining_steps, remaining_time_steps)
                 requested_steps += chunk
                 result = self._pulse_windowed(
                     assignment,
@@ -952,14 +1004,18 @@ class StepperPulseEngine:
                 possible_steps += result.possible_steps
                 completed_batches += result.completed_batches
                 interrupted_batch = interrupted_batch or result.interrupted_batch
+                max_inter_batch_gap_seconds = max(max_inter_batch_gap_seconds, result.max_inter_batch_gap_seconds)
+                if result.reason:
+                    reason = result.reason
                 if result.confirmed_steps < chunk:
-                    reason = "stopped"
+                    if not result.reason:
+                        reason = "stopped"
                     break
             if self._shutdown.is_set():
                 reason = "shutdown"
             elapsed = time.monotonic() - started
             effective_rate = steps_sent / elapsed if elapsed > 0 and steps_sent else None
-            return StepperRunResult(
+            run_result = StepperRunResult(
                 steps_sent,
                 reason,
                 requested_steps=requested_steps,
@@ -968,7 +1024,15 @@ class StepperPulseEngine:
                 interrupted_batch=interrupted_batch,
                 elapsed_seconds=elapsed,
                 effective_steps_per_second=effective_rate,
+                max_inter_batch_gap_seconds=max_inter_batch_gap_seconds,
             )
+            self._log_motion_result(
+                assignment,
+                requested_steps=requested_steps,
+                result=run_result,
+                requested_speed=steps_per_second,
+            )
+            return run_result
         except BaseException as exc:
             primary_error = exc
             raise
@@ -982,49 +1046,105 @@ class StepperPulseEngine:
                     raise
             finally:
                 self._delete_cached_waves(wave_cache)
+                PigpioResourceCoordinator.end_stepper_wave(owner)
                 self.active_stepper = None
                 self._lock.release()
 
     def stop(self, assignment: StepperAssignment) -> None:
         self._stop_event.set()
-        self._cancel_wave_tx()
-        self._set_step_low(assignment)
-        self.relay_board.set_stepper_enabled(assignment, False)
-        self.uart.set_current(assignment.uart_address, 0, 0)
-        self._set_step_low(assignment)
+        errors = self._attempt_motor_safe_state(assignment)
+        if errors:
+            fault = HardwareFault(
+                "Stepper safety shutdown incomplete: "
+                + "; ".join(f"{name}: {error}" for name, error in errors)
+            )
+            self._fault = fault
+            raise fault
 
     def request_stop(self) -> None:
         self._stop_event.set()
-        self._cancel_wave_tx()
+        try:
+            self._cancel_wave_tx()
+        except Exception as exc:
+            self._fault = HardwareFault(f"Stepper waveform cancellation failed during stop request: {exc}")
+            LOGGER.critical("%s", self._fault)
 
     def shutdown(self) -> None:
         self._shutdown.set()
         self._stop_event.set()
-        self._cancel_wave_tx()
+        errors: list[tuple[str, Exception]] = []
+        try:
+            self._cancel_wave_tx()
+        except Exception as exc:
+            errors.append(("wave cancellation", exc))
         acquired = self._lock.acquire(timeout=2.0)
         try:
-            self.relay_board.disable_all_steppers()
+            try:
+                self.relay_board.disable_all_steppers()
+            except Exception as exc:
+                errors.append(("disable all stepper ENN lines", exc))
+            for assignment in STEPPERS.values():
+                try:
+                    self._set_step_low(assignment)
+                except Exception as exc:
+                    errors.append((f"{assignment.name} STEP low", exc))
+            for assignment in STEPPERS.values():
+                try:
+                    self.uart.set_current(assignment.uart_address, 0, 0)
+                except Exception as exc:
+                    errors.append((f"{assignment.name} current shutdown", exc))
         finally:
             if acquired:
                 self._lock.release()
         if not acquired:
-            self._fault = HardwareFault("Stepper engine did not quiesce during shutdown.")
+            errors.append(("stepper quiesce", HardwareFault("Stepper engine did not quiesce during shutdown.")))
+        if errors:
+            self._fault = HardwareFault(
+                "Stepper shutdown could not verify safe state: "
+                + "; ".join(f"{name}: {error}" for name, error in errors)
+            )
             raise self._fault
 
     def _cancel_wave_tx(self) -> None:
         if self.simulation or not self.pi:
             return
-        try:
-            if self.pi.wave_tx_busy():
-                self.pi.wave_tx_stop()
-        except Exception as exc:
-            LOGGER.warning("pigpio waveform cancellation failed: %s", exc)
+        if self.pi.wave_tx_busy():
+            self.pi.wave_tx_stop()
+
+    def _attempt_motor_safe_state(self, assignment: StepperAssignment) -> list[tuple[str, Exception]]:
+        errors: list[tuple[str, Exception]] = []
+        actions: tuple[tuple[str, Callable[[], None]], ...] = (
+            ("wave cancellation", self._cancel_wave_tx),
+            ("STEP low before disable", lambda: self._set_step_low(assignment)),
+            ("disable stepper ENN", lambda: self.relay_board.set_stepper_enabled(assignment, False)),
+            ("TMC current shutdown", lambda: self.uart.set_current(assignment.uart_address, 0, 0)),
+            ("STEP low after disable", lambda: self._set_step_low(assignment)),
+        )
+        for name, action in actions:
+            try:
+                action()
+            except Exception as exc:
+                errors.append((name, exc))
+                LOGGER.critical("Stepper %s safety action failed during %s: %s", assignment.name, name, exc)
+        return errors
 
     def _raise_if_unavailable(self) -> None:
         if self._shutdown.is_set():
             raise HardwareFault("Stepper engine is shut down.")
         if self._fault is not None:
             raise HardwareFault(f"Stepper engine is faulted; moves are blocked: {self._fault}") from self._fault
+
+    def _raise_if_stop_requested(self) -> None:
+        if self._stop_event.is_set():
+            raise HardwareFault("Stepper motion was stopped before waveform transmission.")
+
+    def _begin_wave_operation(self, owner: str) -> None:
+        if self.simulation or not self.pi:
+            return
+        PigpioResourceCoordinator.begin_stepper_wave(
+            owner,
+            stop_hardware_pwm=lambda: self.pi.hardware_PWM(BUZZER_PWM_BCM, 0, 0),
+        )
 
     def _prepare_gpio(self, assignment: StepperAssignment, *, direction_high: bool) -> None:
         if self.simulation or not self.pi:
@@ -1057,13 +1177,19 @@ class StepperPulseEngine:
         possible = 0
         completed_batches = 0
         interrupted = False
+        max_inter_batch_gap_seconds = 0.0
         max_chunk = self._wave_batch_steps(steps_per_second)
         owns_wave_cache = wave_cache is None
         if wave_cache is None:
             wave_cache = {}
         try:
+            last_batch_finished: float | None = None
+            reason = ""
             while remaining > 0 and not self._stop_event.is_set():
-                chunk = min(remaining, max_chunk)
+                batch_started = time.monotonic()
+                if last_batch_finished is not None:
+                    max_inter_batch_gap_seconds = max(max_inter_batch_gap_seconds, batch_started - last_batch_finished)
+                chunk = remaining if not self.simulation and self.pi else min(remaining, max_chunk)
                 diagnostics = self.uart.diagnostics(assignment.uart_address)
                 self._check_stepper_diagnostics(
                     assignment,
@@ -1092,7 +1218,12 @@ class StepperPulseEngine:
                 possible += result.possible_steps
                 completed_batches += result.completed_batches
                 interrupted = interrupted or result.interrupted_batch
+                if result.reason:
+                    reason = result.reason
+                last_batch_finished = time.monotonic()
                 if result.interrupted_batch or self._stop_event.is_set() or self._shutdown.is_set():
+                    if not reason:
+                        reason = "shutdown" if self._shutdown.is_set() else "stopped"
                     break
                 diagnostics = self.uart.diagnostics(assignment.uart_address)
                 self._check_stepper_diagnostics(
@@ -1107,8 +1238,17 @@ class StepperPulseEngine:
                     stallguard_threshold=stallguard_threshold,
                 )
                 if result.confirmed_steps < chunk:
+                    if not reason:
+                        reason = "stopped"
                     break
-            return PulseWindowResult(moved, possible, completed_batches, interrupted)
+            return PulseWindowResult(
+                moved,
+                possible,
+                completed_batches,
+                interrupted,
+                reason=reason,
+                max_inter_batch_gap_seconds=max_inter_batch_gap_seconds,
+            )
         finally:
             if owns_wave_cache:
                 self._delete_cached_waves(wave_cache)
@@ -1191,64 +1331,117 @@ class StepperPulseEngine:
     ) -> PulseWindowResult:
         if not self.pi:
             raise HardwareFault("pigpio is unavailable for waveform transmission.")
-        cache_key = (assignment.step_bcm, steps, steps_per_second)
-        wave_id = wave_cache.get(cache_key)
-        if wave_id is None:
-            pulses = self._build_step_wave_pulses(assignment, steps=steps, steps_per_second=steps_per_second)
-            add_result = self.pi.wave_add_generic(pulses)
-            if isinstance(add_result, int) and add_result < 0:
-                raise HardwareFault(f"pigpio wave_add_generic failed with code {add_result}.")
-            wave_id = self.pi.wave_create()
-            if not isinstance(wave_id, int) or wave_id < 0:
-                raise HardwareFault(f"pigpio wave_create failed with code {wave_id}.")
-            wave_cache[cache_key] = wave_id
-            self._wave_ids.add(wave_id)
-        owner = f"stepper:{assignment.name}:wave:{wave_id}"
-        interrupted = False
-        try:
-            PigpioResourceCoordinator.begin_stepper_wave(
-                owner,
-                stop_hardware_pwm=lambda: self.pi.hardware_PWM(BUZZER_PWM_BCM, 0, 0),
+        batch_steps = self._wave_batch_steps(steps_per_second)
+        full_repeats, tail_steps = divmod(steps, batch_steps)
+        chain: list[int] = []
+        if full_repeats:
+            batch_wave_id = self._wave_id_for_steps(
+                assignment,
+                steps=batch_steps,
+                steps_per_second=steps_per_second,
+                wave_cache=wave_cache,
             )
+            self._append_wave_repeats(chain, batch_wave_id, full_repeats)
+        if tail_steps:
+            tail_wave_id = self._wave_id_for_steps(
+                assignment,
+                steps=tail_steps,
+                steps_per_second=steps_per_second,
+                wave_cache=wave_cache,
+            )
+            chain.append(tail_wave_id)
+        if not chain:
+            return PulseWindowResult(0, 0, 0)
+
+        interrupted = False
+        busy_seen = False
+        expected_seconds = steps / max(1, steps_per_second)
+        if self._stop_event.is_set() or self._shutdown.is_set():
+            return PulseWindowResult(0, steps, 0, interrupted_batch=True, reason="stopped")
+        try:
+            start = time.monotonic()
+            send_result = self.pi.wave_chain(chain)
+            if isinstance(send_result, int) and send_result < 0:
+                raise HardwareFault(f"pigpio wave_chain failed with code {send_result}.")
+            next_diag = time.monotonic() + self.WAVE_DIAGNOSTIC_SECONDS
+            while self.pi.wave_tx_busy():
+                busy_seen = True
+                if self._stop_event.is_set() or self._shutdown.is_set():
+                    interrupted = True
+                    self.pi.wave_tx_stop()
+                    break
+                now = time.monotonic()
+                if now >= next_diag:
+                    diagnostics = self.uart.diagnostics(assignment.uart_address)
+                    self._check_stepper_diagnostics(
+                        assignment,
+                        diagnostics,
+                        phase="during-wave",
+                        moved_steps=moved_steps,
+                        steps_per_second=steps_per_second,
+                        run_current_ma=run_current_ma,
+                        hold_current_ma=hold_current_ma,
+                        microsteps=microsteps,
+                        stallguard_threshold=stallguard_threshold,
+                    )
+                    next_diag = now + self.WAVE_DIAGNOSTIC_SECONDS
+                self._stop_event.wait(self.WAVE_POLL_SECONDS)
+            elapsed = time.monotonic() - start
+            if (
+                busy_seen
+                and not interrupted
+                and not self._stop_event.is_set()
+                and not self._shutdown.is_set()
+                and elapsed + self.WAVE_EXTERNAL_CANCEL_TOLERANCE_SECONDS < expected_seconds
+            ):
+                raise HardwareFault(
+                    f"pigpio waveform ended early after {elapsed:.3f}s; expected about {expected_seconds:.3f}s."
+                )
+        except BaseException:
             try:
-                send_result = self.pi.wave_send_once(wave_id)
-                if isinstance(send_result, int) and send_result < 0:
-                    raise HardwareFault(f"pigpio wave_send_once failed with code {send_result}.")
-                next_diag = time.monotonic() + self.WAVE_DIAGNOSTIC_SECONDS
-                while self.pi.wave_tx_busy():
-                    if self._stop_event.is_set() or self._shutdown.is_set():
-                        interrupted = True
-                        self.pi.wave_tx_stop()
-                        break
-                    now = time.monotonic()
-                    if now >= next_diag:
-                        diagnostics = self.uart.diagnostics(assignment.uart_address)
-                        self._check_stepper_diagnostics(
-                            assignment,
-                            diagnostics,
-                            phase="during-wave",
-                            moved_steps=moved_steps,
-                            steps_per_second=steps_per_second,
-                            run_current_ma=run_current_ma,
-                            hold_current_ma=hold_current_ma,
-                            microsteps=microsteps,
-                            stallguard_threshold=stallguard_threshold,
-                        )
-                        next_diag = now + self.WAVE_DIAGNOSTIC_SECONDS
-                    self._stop_event.wait(self.WAVE_POLL_SECONDS)
-            except BaseException:
-                try:
-                    if self.pi.wave_tx_busy():
-                        self.pi.wave_tx_stop()
-                finally:
-                    raise
+                if self.pi.wave_tx_busy():
+                    self.pi.wave_tx_stop()
             finally:
-                PigpioResourceCoordinator.end_stepper_wave(owner)
+                raise
         finally:
             self._set_step_low(assignment)
         if interrupted:
-            return PulseWindowResult(0, steps, 0, interrupted_batch=True)
-        return PulseWindowResult(steps, steps, 1)
+            return PulseWindowResult(0, steps, 0, interrupted_batch=True, reason="shutdown" if self._shutdown.is_set() else "stopped")
+        return PulseWindowResult(steps, steps, full_repeats + (1 if tail_steps else 0))
+
+    def _wave_id_for_steps(
+        self,
+        assignment: StepperAssignment,
+        *,
+        steps: int,
+        steps_per_second: int,
+        wave_cache: dict[tuple[int, int, int], int],
+    ) -> int:
+        if not self.pi:
+            raise HardwareFault("pigpio is unavailable for waveform creation.")
+        cache_key = (assignment.step_bcm, steps, steps_per_second)
+        wave_id = wave_cache.get(cache_key)
+        if wave_id is not None:
+            return wave_id
+        pulses = self._build_step_wave_pulses(assignment, steps=steps, steps_per_second=steps_per_second)
+        add_result = self.pi.wave_add_generic(pulses)
+        if isinstance(add_result, int) and add_result < 0:
+            raise HardwareFault(f"pigpio wave_add_generic failed with code {add_result}.")
+        wave_id = self.pi.wave_create()
+        if not isinstance(wave_id, int) or wave_id < 0:
+            raise HardwareFault(f"pigpio wave_create failed with code {wave_id}.")
+        wave_cache[cache_key] = wave_id
+        self._wave_ids.add(wave_id)
+        return wave_id
+
+    def _append_wave_repeats(self, chain: list[int], wave_id: int, repeats: int) -> None:
+        while repeats > 0:
+            repeat_count = min(repeats, self.WAVE_CHAIN_MAX_REPEATS)
+            if repeat_count == 1:
+                chain.append(wave_id)
+            else:
+                chain.extend([255, 0, wave_id, 255, 1, repeat_count & 0xFF, (repeat_count >> 8) & 0xFF])
+            repeats -= repeat_count
 
     def _delete_cached_waves(self, wave_cache: dict[tuple[int, int, int], int]) -> None:
         if self.simulation or not self.pi:
@@ -1321,6 +1514,31 @@ class StepperPulseEngine:
                 stallguard_threshold,
                 *context_args,
             )
+
+    def _log_motion_result(
+        self,
+        assignment: StepperAssignment,
+        *,
+        requested_steps: int,
+        result: StepperRunResult,
+        requested_speed: int,
+    ) -> None:
+        LOGGER.info(
+            "Stepper motion finished: stepper=%s requested_speed=%s requested_steps=%s confirmed_steps=%s "
+            "possible_steps=%s completed_batches=%s interrupted=%s elapsed=%.3fs effective_speed=%s "
+            "max_inter_batch_gap=%.6fs reason=%s",
+            assignment.name,
+            requested_speed,
+            requested_steps,
+            result.steps_sent,
+            result.possible_steps,
+            result.completed_batches,
+            result.interrupted_batch,
+            result.elapsed_seconds,
+            f"{result.effective_steps_per_second:.3f}" if result.effective_steps_per_second is not None else "unknown",
+            result.max_inter_batch_gap_seconds,
+            result.reason,
+        )
 
     @staticmethod
     def estimate_current_ma(run_current_ma: int, duty_cycle: float) -> float:
