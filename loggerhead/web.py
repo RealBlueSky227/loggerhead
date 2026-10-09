@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+from .drivers import HardwareFault
+from .hardware import DiagnosticHalt
+
+LOGGER = logging.getLogger(__name__)
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -40,30 +46,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        payload = self._read_json()
-        if parsed.path == "/api/equipment":
-            self.server.service.set_equipment(payload["id"], bool(payload["on"]))
-            self._send_json({"ok": True})
-        elif parsed.path == "/api/config":
-            config = self.server.service.update_config(payload)
-            self._send_json({"ok": True, "config": config})
-        elif parsed.path == "/api/sense-port":
-            self.server.service.set_sense_port(int(payload["number"]), payload)
-            self._send_json({"ok": True})
-        elif parsed.path == "/api/ato/reset":
-            self.server.service.reset_ato(payload["id"])
-            self._send_json({"ok": True})
-        elif parsed.path == "/api/buzzer/silence":
-            self.server.service.silence_buzzer()
-            self._send_json({"ok": True})
-        elif parsed.path == "/api/alarm/enabled":
-            self.server.service.set_alarm_enabled(bool(payload["enabled"]))
-            self._send_json({"ok": True})
-        elif parsed.path == "/api/prime":
-            self.server.service.set_manual_priming(payload["id"], bool(payload["on"]))
-            self._send_json({"ok": True})
-        else:
-            self.send_error(404)
+        try:
+            payload = self._read_json()
+            if parsed.path == "/api/equipment":
+                self.server.service.set_equipment(payload["id"], bool(payload["on"]))
+                self._send_json({"ok": True})
+            elif parsed.path == "/api/config":
+                config = self.server.service.update_config(payload)
+                self._send_json({"ok": True, "config": config})
+            elif parsed.path == "/api/sense-port":
+                self.server.service.set_sense_port(int(payload["number"]), payload)
+                self._send_json({"ok": True})
+            elif parsed.path == "/api/ato/reset":
+                self.server.service.reset_ato(payload["id"])
+                self._send_json({"ok": True})
+            elif parsed.path == "/api/buzzer/silence":
+                self.server.service.silence_buzzer()
+                self._send_json({"ok": True})
+            elif parsed.path == "/api/alarm/enabled":
+                self.server.service.set_alarm_enabled(bool(payload["enabled"]))
+                self._send_json({"ok": True})
+            elif parsed.path == "/api/prime":
+                result = self.server.service.set_manual_priming(payload["id"], bool(payload["on"]))
+                self._send_json({"ok": True, **result}, status=202)
+            else:
+                self.send_error(404)
+        except (KeyError, ValueError, json.JSONDecodeError) as exc:
+            self._send_json({"ok": False, "error": "bad_request", "message": str(exc)}, status=400)
+        except DiagnosticHalt as exc:
+            self._send_json({"ok": False, "error": "configuration", "message": str(exc)}, status=422)
+        except HardwareFault as exc:
+            LOGGER.exception("Hardware fault while handling %s.", parsed.path)
+            self._send_json({"ok": False, "error": "hardware_fault", "message": str(exc)}, status=503)
+        except RuntimeError as exc:
+            self._send_json({"ok": False, "error": "conflict", "message": str(exc)}, status=409)
+        except Exception as exc:
+            LOGGER.exception("Unexpected dashboard API error while handling %s.", parsed.path)
+            self._send_json({"ok": False, "error": "internal_error", "message": str(exc)}, status=500)
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -71,9 +90,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
-    def _send_json(self, payload: Any) -> None:
+    def _send_json(self, payload: Any, *, status: int = 200) -> None:
         body = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()

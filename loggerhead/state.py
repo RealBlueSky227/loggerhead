@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import tempfile
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .hardware import AlarmPriority, LevelState
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -65,8 +71,10 @@ class RuntimeState:
 
 
 class StateStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, state_lock: threading.RLock | None = None) -> None:
         self.path = path
+        self._state_lock = state_lock or threading.RLock()
+        self._write_lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> RuntimeState:
@@ -95,11 +103,45 @@ class StateStore:
         return state
 
     def save(self, state: RuntimeState) -> None:
-        tmp = self.path.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as handle:
-            json.dump(_state_dict(state), handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        tmp.replace(self.path)
+        # Lock order is state snapshot first, then file write. Callers may already
+        # hold _state_lock; _write_lock is private to StateStore to avoid deadlocks.
+        with self._state_lock:
+            payload = _state_dict(state)
+        with self._write_lock:
+            self._cleanup_abandoned_temps()
+            tmp_name = ""
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "w",
+                    encoding="utf-8",
+                    dir=self.path.parent,
+                    prefix=f"{self.path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    tmp_name = handle.name
+                    json.dump(payload, handle, indent=2, sort_keys=True)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp_name, self.path)
+                tmp_name = ""
+                _fsync_directory(self.path.parent)
+            except Exception:
+                LOGGER.exception("Failed to persist Loggerhead runtime state to %s.", self.path)
+                if tmp_name:
+                    try:
+                        Path(tmp_name).unlink(missing_ok=True)
+                    except Exception:
+                        LOGGER.warning("Could not remove abandoned state temp file %s.", tmp_name, exc_info=True)
+                raise
+
+    def _cleanup_abandoned_temps(self) -> None:
+        for path in self.path.parent.glob(f"{self.path.name}.*.tmp"):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                LOGGER.warning("Could not remove abandoned state temp file %s.", path, exc_info=True)
 
 
 def _state_dict(state: RuntimeState) -> dict[str, Any]:
@@ -109,3 +151,13 @@ def _state_dict(state: RuntimeState) -> dict[str, Any]:
         key: {**asdict(value), "priority": value.priority.value} for key, value in state.alarms.items()
     }
     return data
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)

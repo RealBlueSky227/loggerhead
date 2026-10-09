@@ -676,6 +676,9 @@ class StepperPulseEngine:
         self.relay_board.set_stepper_enabled(assignment, False)
         self.uart.set_current(assignment.uart_address, 0, 0)
 
+    def request_stop(self) -> None:
+        self._stop_event.set()
+
     def shutdown(self) -> None:
         self._shutdown.set()
         self._stop_event.set()
@@ -694,15 +697,19 @@ class StepperPulseEngine:
             if diagnostics["sg_result"] < 10:
                 raise HardwareUnavailable(f"Stepper {assignment.name} reported stall/load fault.")
             if self.simulation or not self.pi:
-                time.sleep(chunk * delay)
+                self._stop_event.wait(chunk * delay)
             else:
                 # A production Pi uses pigpio wave chains here. The chunking and sleep fallback
                 # preserve deterministic queue behavior in simulation and tests.
                 for _ in range(chunk):
+                    if self._stop_event.is_set():
+                        break
                     self.pi.write(assignment.step_bcm, 1)
-                    time.sleep(delay / 2)
+                    if self._stop_event.wait(delay / 2):
+                        break
                     self.pi.write(assignment.step_bcm, 0)
-                    time.sleep(delay / 2)
+                    if self._stop_event.wait(delay / 2):
+                        break
             remaining -= chunk
             if remaining:
                 window.append(min(remaining, 256))

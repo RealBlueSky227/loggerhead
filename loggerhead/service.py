@@ -10,10 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from .config import (
+    MAX_MANUAL_PRIME_STEPS_PER_SECOND,
+    MIN_MANUAL_PRIME_STEPS_PER_SECOND,
     AppConfig,
     EquipmentProfile,
     OneWireMode,
     SensePortDevice,
+    StepperProfile,
     load_config,
     materialized_analog_sensors,
     materialized_temperature_sensors,
@@ -36,7 +39,7 @@ from .drivers import (
     StepperPulseEngine,
     TemperatureReader,
 )
-from .hardware import RELAYS, SENSE_PORTS, EquipmentDriver, TemperatureDriver, WaterLevelDriver
+from .hardware import RELAYS, SENSE_PORTS, DiagnosticHalt, EquipmentDriver, TemperatureDriver, WaterLevelDriver
 from .notifications import HomeAssistantNotifier, MQTTHomeAssistantBridge, NotificationLimiter, TelegramNotifier
 from .state import EquipmentState, SensorReading, StateStore
 from .web import DashboardServer
@@ -57,7 +60,8 @@ class LoggerheadService:
         self.simulation = simulation
         self.config = load_config(config_path)
         self.store = TelemetryStore(data_dir / "loggerhead.sqlite3", max_points_default=self.config.plot_max_points)
-        self.state_store = StateStore(data_dir / "state.json")
+        self._state_lock = threading.RLock()
+        self.state_store = StateStore(data_dir / "state.json", state_lock=self._state_lock)
         self.state = self.state_store.load()
         self.relay_board = MCP23017RelayBoard(simulation=simulation)
         self.analog_reader = ADS1115AnalogReader(simulation=simulation)
@@ -75,6 +79,7 @@ class LoggerheadService:
         self._stop = threading.Event()
         self._stop_lock = threading.RLock()
         self._stopped = False
+        self._prime_lock = threading.RLock()
         self._threads: list[threading.Thread] = []
         self._prime_stop: dict[str, threading.Event] = {}
         self._prime_threads: dict[str, threading.Thread] = {}
@@ -116,7 +121,7 @@ class LoggerheadService:
             finally:
                 server.shutdown()
                 self.mqtt.close()
-                self.state_store.save(self.state)
+                self._save_state()
             if shutdown_error is not None:
                 raise shutdown_error
 
@@ -124,46 +129,59 @@ class LoggerheadService:
         with self._stop_lock:
             if self._stopped:
                 return
+            LOGGER.info("Loggerhead shutdown starting.")
             self._stop.set()
-            for event in self._prime_stop.values():
-                event.set()
-            self._clear_transient_stepper_state()
+            with self._prime_lock:
+                for event in self._prime_stop.values():
+                    event.set()
+            self.stepper_engine.request_stop()
             errors: list[Exception] = []
-            for action in (self.stepper_engine.shutdown, self.relay_board.disable_all_steppers, self.buzzer.stop):
+            for name, action in (
+                ("stepper engine", self.stepper_engine.shutdown),
+                ("stepper ENN disable", self.relay_board.disable_all_steppers),
+                ("buzzer", self.buzzer.stop),
+            ):
+                LOGGER.info("Shutdown phase: %s.", name)
                 try:
                     action()
                 except Exception as exc:
                     errors.append(exc)
-                    LOGGER.critical("Hardware shutdown action failed: %s", exc)
-            for stepper_id, thread in list(self._prime_threads.items()):
+                    LOGGER.critical("Hardware shutdown action failed during %s: %s", name, exc)
+            LOGGER.info("Shutdown phase: waiting for priming workers.")
+            for stepper_id, thread in self._prime_threads_snapshot().items():
                 if thread is threading.current_thread():
                     continue
                 thread.join(timeout=2.0)
                 if thread.is_alive():
-                    LOGGER.critical("Manual priming thread %s did not stop within timeout.", stepper_id)
-            self.state_store.save(self.state)
+                    message = f"Manual priming thread {stepper_id} did not stop within timeout."
+                    errors.append(HardwareFault(message))
+                    LOGGER.critical(message)
+            self._clear_transient_stepper_state()
+            self._save_state()
             self._stopped = True
+            LOGGER.info("Loggerhead shutdown complete.")
             if errors:
                 raise HardwareFault(f"Loggerhead shutdown could not verify all actuators disabled: {errors[0]}") from errors[0]
 
     def status(self) -> dict[str, Any]:
-        return {
-            "config": asdict(self.config),
-            "sense_ports": [asdict(item) for item in self.config.sense_ports],
-            "sensor_catalog": self._sensor_catalog(),
-            "steppers": [asdict(item) for item in self.config.steppers],
-            "equipment": {key: asdict(value) for key, value in self.state.equipment.items()},
-            "readings": {key: asdict(value) for key, value in self.state.readings.items()},
-            "water_levels": {key: value.value for key, value in self.state.water_levels.items()},
-            "alarms": {key: asdict(value) for key, value in self.state.alarms.items()},
-            "ato": {key: asdict(value) for key, value in self.state.ato.items()},
-            "manual_priming": self.state.manual_priming,
-            "diagnostics": self._diagnostics(),
-            "heartbeat": {"ok": True, "ts": time.time()},
-            "events": self.store.recent_events(30),
-            "time": time.time(),
-            "simulation": self.simulation,
-        }
+        with self._state_lock:
+            return {
+                "config": asdict(self.config),
+                "sense_ports": [asdict(item) for item in self.config.sense_ports],
+                "sensor_catalog": self._sensor_catalog(),
+                "steppers": [asdict(item) for item in self.config.steppers],
+                "equipment": {key: asdict(value) for key, value in self.state.equipment.items()},
+                "readings": {key: asdict(value) for key, value in self.state.readings.items()},
+                "water_levels": {key: value.value for key, value in self.state.water_levels.items()},
+                "alarms": {key: asdict(value) for key, value in self.state.alarms.items()},
+                "ato": {key: asdict(value) for key, value in self.state.ato.items()},
+                "manual_priming": dict(self.state.manual_priming),
+                "diagnostics": self._diagnostics(),
+                "heartbeat": {"ok": True, "ts": time.time()},
+                "events": self.store.recent_events(30),
+                "time": time.time(),
+                "simulation": self.simulation,
+            }
 
     def history(self, streams: list[str], start_ts: float, end_ts: float | None = None) -> dict[str, Any]:
         return self.store.history(streams, start_ts=start_ts, end_ts=end_ts, max_points=self.config.plot_max_points)
@@ -216,22 +234,25 @@ class LoggerheadService:
             self.relay_board.set_pin(relay.mcp_pin, active)
         elif profile.driver == EquipmentDriver.KASA_HS300:
             KasaHS300Client(profile.kasa_host).set_outlet(int(profile.pin_or_outlet), on)
-        self.state.equipment[equipment_id] = EquipmentState(equipment_id, on, source)
+        with self._state_lock:
+            self.state.equipment[equipment_id] = EquipmentState(equipment_id, on, source)
         self.store.log_event("equipment", f"{profile.name} turned {'ON' if on else 'OFF'} by {source}.", {"id": equipment_id})
         self.mqtt.publish(f"equipment/{equipment_id}", {"on": on, "source": source})
-        self.state_store.save(self.state)
+        self._save_state()
 
     def reset_ato(self, ato_id: str) -> None:
         profile = next(item for item in self.config.ato if item.id == ato_id)
-        ATOController.reset(profile, self.state)
+        with self._state_lock:
+            ATOController.reset(profile, self.state)
         self.store.log_event("ato", f"ATO {profile.name} reset from dashboard.")
-        self.state_store.save(self.state)
+        self._save_state()
 
     def silence_buzzer(self) -> None:
-        self.state.buzzer_muted_until = time.time() + self.config.buzzer.rearm_seconds
+        with self._state_lock:
+            self.state.buzzer_muted_until = time.time() + self.config.buzzer.rearm_seconds
         self.buzzer.stop()
         self.store.log_event("alarm", "Buzzer temporarily silenced.")
-        self.state_store.save(self.state)
+        self._save_state()
 
     def set_alarm_enabled(self, enabled: bool) -> None:
         self.config.buzzer.alarm_enabled = enabled
@@ -239,49 +260,96 @@ class LoggerheadService:
         if not enabled:
             self.buzzer.stop()
         self.store.log_event("alarm", f"Global alarm {'enabled' if enabled else 'disabled'}.")
-        self.state_store.save(self.state)
+        self._save_state()
 
-    def set_manual_priming(self, stepper_id: str, enabled: bool) -> None:
-        profile = next(item for item in self.config.steppers if item.id == stepper_id)
-        if enabled and self._stop.is_set():
-            raise RuntimeError("Loggerhead is stopping; manual priming cannot be started.")
-        if not enabled:
-            stop = self._prime_stop.get(stepper_id)
-            if stop:
-                stop.set()
-            self.state.manual_priming[stepper_id] = False
-            self.store.log_event("dosing", f"{profile.name} manual priming stopped.")
-            self.state_store.save(self.state)
-            return
-        if any(self.state.manual_priming.values()):
-            raise RuntimeError("Only one pump may be manually primed at a time.")
-        stop = threading.Event()
-        self._prime_stop[stepper_id] = stop
-        self.state.manual_priming[stepper_id] = True
-        thread = threading.Thread(target=self._prime_loop, args=(profile, stop), name=f"prime-{stepper_id}", daemon=True)
-        self._prime_threads[stepper_id] = thread
-        self.store.log_event("dosing", f"{profile.name} manual priming started.")
-        thread.start()
-        self.state_store.save(self.state)
+    def set_manual_priming(self, stepper_id: str, enabled: bool) -> dict[str, Any]:
+        with self._prime_lock:
+            profile = self._stepper_profile(stepper_id)
+            speed = self._manual_prime_speed(profile)
+            if enabled and self._stop.is_set():
+                raise RuntimeError("Loggerhead is stopping; manual priming cannot be started.")
+            if not enabled:
+                stop = self._prime_stop.get(stepper_id)
+                thread = self._prime_threads.get(stepper_id)
+                if stop:
+                    stop.set()
+                    self.stepper_engine.request_stop()
+                if not thread or not thread.is_alive():
+                    self._clear_prime_worker_locked(stepper_id)
+                with self._state_lock:
+                    self.state.manual_priming[stepper_id] = False
+                    if self.state.stepper_active == stepper_id:
+                        self.state.stepper_active = None
+                self.store.log_event("dosing", f"{profile.name} manual priming stop requested.")
+                self._save_state()
+                return {"id": stepper_id, "priming": False, "state": "stopping" if thread and thread.is_alive() else "stopped"}
+            for key, thread in list(self._prime_threads.items()):
+                if not thread.is_alive():
+                    self._clear_prime_worker_locked(key)
+            active_threads = {
+                key: thread for key, thread in self._prime_threads.items() if thread.is_alive()
+            }
+            if active_threads:
+                raise RuntimeError(f"Manual priming is already active for {next(iter(active_threads))}.")
+            with self._state_lock:
+                manual_active = any(self.state.manual_priming.values())
+            if manual_active:
+                raise RuntimeError("Only one pump may be manually primed at a time.")
+            stop = threading.Event()
+            thread = threading.Thread(
+                target=self._prime_loop,
+                args=(profile, stop, speed),
+                name=f"prime-{stepper_id}",
+                daemon=True,
+            )
+            self._prime_stop[stepper_id] = stop
+            self._prime_threads[stepper_id] = thread
+            with self._state_lock:
+                self.state.manual_priming[stepper_id] = True
+                self.state.stepper_active = stepper_id
+            self._save_state()
+            try:
+                thread.start()
+            except Exception:
+                self._clear_prime_worker_locked(stepper_id)
+                with self._state_lock:
+                    self.state.manual_priming[stepper_id] = False
+                    if self.state.stepper_active == stepper_id:
+                        self.state.stepper_active = None
+                self._save_state()
+                raise
+            self.store.log_event("dosing", f"{profile.name} manual priming started at {speed} step/s.")
+            return {"id": stepper_id, "priming": True, "state": "started", "speed_steps_per_second": speed}
 
-    def _prime_loop(self, profile, stop: threading.Event) -> None:
+    def _prime_loop(self, profile: StepperProfile, stop: threading.Event, speed_steps_per_second: int) -> None:
         from .hardware import require_stepper
 
         assignment = require_stepper(profile.assignment)
-        while not stop.is_set():
-            try:
+        try:
+            while not stop.is_set() and not self._stop.is_set():
                 self.stepper_engine.move(
                     assignment,
-                    steps=max(1, profile.manual_speed_steps_per_second),
-                    steps_per_second=max(1, profile.manual_speed_steps_per_second),
+                    steps=speed_steps_per_second,
+                    steps_per_second=speed_steps_per_second,
                     run_current_ma=profile.run_current_ma,
                     hold_current_ma=profile.hold_current_ma,
                 )
+        except Exception as exc:
+            LOGGER.exception("%s manual priming fault.", profile.name)
+            self._activate_alarm(f"stepper:{profile.id}", f"{profile.name} manual priming fault: {exc}", priority="high")
+        finally:
+            try:
+                self.stepper_engine.stop(assignment)
             except Exception as exc:
-                self._activate_alarm(f"stepper:{profile.id}", f"{profile.name} manual priming fault: {exc}", priority="high")
-                break
-        self.state.manual_priming[profile.id] = False
-        self.state_store.save(self.state)
+                LOGGER.critical("%s manual priming cleanup could not verify driver disabled: %s", profile.name, exc)
+                self._activate_alarm(f"stepper:{profile.id}:cleanup", f"{profile.name} cleanup fault: {exc}", priority="critical")
+            with self._prime_lock:
+                self._clear_prime_worker_locked(profile.id)
+                with self._state_lock:
+                    self.state.manual_priming[profile.id] = False
+                    if self.state.stepper_active == profile.id:
+                        self.state.stepper_active = None
+                self._save_state()
 
     def handle_mqtt_command(self, topic: str, payload: Any) -> None:
         # Implements SRS 4.8.2 Command Subscription.
@@ -297,26 +365,59 @@ class LoggerheadService:
             self.set_equipment(item.id, desired, source="restore")
 
     def _clear_transient_stepper_state(self) -> None:
-        self.state.stepper_active = None
-        self.state.manual_priming = {item.id: False for item in self.config.steppers}
+        with self._state_lock:
+            self.state.stepper_active = None
+            self.state.manual_priming = {item.id: False for item in self.config.steppers}
+
+    def _stepper_profile(self, stepper_id: str) -> StepperProfile:
+        for item in self.config.steppers:
+            if item.id == stepper_id:
+                return item
+        raise KeyError(stepper_id)
+
+    def _manual_prime_speed(self, profile: StepperProfile) -> int:
+        try:
+            speed = int(profile.manual_speed_steps_per_second)
+        except (TypeError, ValueError) as exc:
+            raise DiagnosticHalt(f"{profile.name} has invalid manual priming speed.") from exc
+        if speed < MIN_MANUAL_PRIME_STEPS_PER_SECOND or speed > MAX_MANUAL_PRIME_STEPS_PER_SECOND:
+            raise DiagnosticHalt(
+                f"{profile.name} manual priming speed must be between "
+                f"{MIN_MANUAL_PRIME_STEPS_PER_SECOND} and {MAX_MANUAL_PRIME_STEPS_PER_SECOND} step/s."
+            )
+        return speed
+
+    def _clear_prime_worker_locked(self, stepper_id: str) -> None:
+        self._prime_stop.pop(stepper_id, None)
+        thread = self._prime_threads.get(stepper_id)
+        if thread is None or not thread.is_alive() or thread is threading.current_thread():
+            self._prime_threads.pop(stepper_id, None)
+
+    def _prime_threads_snapshot(self) -> dict[str, threading.Thread]:
+        with self._prime_lock:
+            return dict(self._prime_threads)
+
+    def _save_state(self) -> None:
+        self.state_store.save(self.state)
 
     def _poll_loop(self) -> None:
         while not self._stop.is_set():
             now = time.time()
-            self._poll_temperature(now)
-            self._poll_ph(now)
-            self._poll_analog(now)
-            self._poll_water_levels(now)
-            self._poll_health(now)
-            self._evaluate_ato(now)
-            self._sound_buzzer_if_needed(now)
-            self._publish_telemetry()
-            if now - self._last_polled_log >= self.config.database_poll_seconds:
-                self._last_polled_log = now
-                self._log_poll_snapshot(now)
-            if self.store.prune_if_critical():
-                self._activate_alarm("storage:disk", "Primary filesystem free space is below warning threshold.", priority="high")
-            self.state_store.save(self.state)
+            with self._state_lock:
+                self._poll_temperature(now)
+                self._poll_ph(now)
+                self._poll_analog(now)
+                self._poll_water_levels(now)
+                self._poll_health(now)
+                self._evaluate_ato(now)
+                self._sound_buzzer_if_needed(now)
+                self._publish_telemetry()
+                if now - self._last_polled_log >= self.config.database_poll_seconds:
+                    self._last_polled_log = now
+                    self._log_poll_snapshot(now)
+                if self.store.prune_if_critical():
+                    self._activate_alarm("storage:disk", "Primary filesystem free space is below warning threshold.", priority="high")
+                self._save_state()
             self._stop.wait(1.0)
 
     def _poll_temperature(self, now: float) -> None:
@@ -391,11 +492,12 @@ class LoggerheadService:
             self.state.ato[profile.id] = ato_state
 
     def _register_alarm(self, alarm) -> None:
-        existing = self.state.alarms.get(alarm.id)
-        if existing and existing.active:
-            alarm.first_seen = existing.first_seen
-            alarm.last_notified = existing.last_notified
-        self.state.alarms[alarm.id] = alarm
+        with self._state_lock:
+            existing = self.state.alarms.get(alarm.id)
+            if existing and existing.active:
+                alarm.first_seen = existing.first_seen
+                alarm.last_notified = existing.last_notified
+            self.state.alarms[alarm.id] = alarm
         self.mqtt.publish(f"alerts/{alarm.id}", {"active": True, "message": alarm.message, "priority": alarm.priority.value})
         if not self.config.buzzer.alarm_enabled:
             return

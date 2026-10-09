@@ -20,6 +20,10 @@ from .hardware import (
     require_stepper,
 )
 
+MIN_MANUAL_PRIME_STEPS_PER_SECOND = 1
+MAX_MANUAL_PRIME_STEPS_PER_SECOND = 5000
+DEFAULT_MANUAL_PRIME_STEPS_PER_SECOND = 400
+
 
 class SensePortDevice(StrEnum):
     EMPTY = "empty"
@@ -184,7 +188,6 @@ class DosingProfile:
     window_end: str = "20:00"
     doses_per_day: int = 12
     stepper: bool = False
-    manual_speed_steps_per_second: int = 400
 
 
 @dataclass
@@ -198,6 +201,7 @@ class StepperProfile:
     microsteps: int = 16
     steps_per_ml: float = 800.0
     stallguard_threshold: int = 50
+    manual_speed_steps_per_second: int = DEFAULT_MANUAL_PRIME_STEPS_PER_SECOND
 
 
 @dataclass
@@ -303,10 +307,35 @@ def load_config(path: Path) -> AppConfig:
         return config
     with path.open("r", encoding="utf-8") as handle:
         raw = json.load(handle)
+    _migrate_raw_config(raw)
     config = from_dict(AppConfig, raw)
     apply_config_migrations(config)
     validate_config(config)
     return config
+
+
+def _migrate_raw_config(raw: dict[str, Any]) -> None:
+    """Move legacy fields before dataclass coercion can drop them."""
+    dosing = raw.get("dosing", [])
+    steppers = raw.get("steppers", [])
+    if not isinstance(dosing, list) or not isinstance(steppers, list):
+        return
+    legacy_speeds = {
+        item.get("actuator"): item.get("manual_speed_steps_per_second")
+        for item in dosing
+        if isinstance(item, dict) and item.get("stepper") and "manual_speed_steps_per_second" in item
+    }
+    for stepper in steppers:
+        if not isinstance(stepper, dict):
+            continue
+        stepper_id = stepper.get("id")
+        current_speed = stepper.get("manual_speed_steps_per_second", DEFAULT_MANUAL_PRIME_STEPS_PER_SECOND)
+        try:
+            current_speed_is_default = int(current_speed) == DEFAULT_MANUAL_PRIME_STEPS_PER_SECOND
+        except (TypeError, ValueError):
+            current_speed_is_default = False
+        if stepper_id in legacy_speeds and current_speed_is_default:
+            stepper["manual_speed_steps_per_second"] = legacy_speeds[stepper_id]
 
 
 def save_config(path: Path, config: AppConfig) -> None:
@@ -375,6 +404,21 @@ def validate_config(config: AppConfig) -> None:
         require_stepper(item.assignment)
         if item.hold_current_ma < 0:
             raise DiagnosticHalt("Stepper holding current cannot be negative.")
+        if item.run_current_ma <= 0:
+            raise DiagnosticHalt("Stepper run current must be greater than zero.")
+        try:
+            manual_speed = int(item.manual_speed_steps_per_second)
+        except (TypeError, ValueError) as exc:
+            raise DiagnosticHalt(f"Stepper {item.id} manual priming speed must be an integer.") from exc
+        if manual_speed < MIN_MANUAL_PRIME_STEPS_PER_SECOND:
+            raise DiagnosticHalt(
+                f"Stepper manual priming speed must be at least {MIN_MANUAL_PRIME_STEPS_PER_SECOND} step/s."
+            )
+        if manual_speed > MAX_MANUAL_PRIME_STEPS_PER_SECOND:
+            raise DiagnosticHalt(
+                f"Stepper manual priming speed must be no more than {MAX_MANUAL_PRIME_STEPS_PER_SECOND} step/s."
+            )
+        item.manual_speed_steps_per_second = manual_speed
     for item in config.dosing:
         if item.stepper and item.actuator not in stepper_ids:
             raise DiagnosticHalt(f"Dosing profile {item.id} references unknown stepper {item.actuator}.")
