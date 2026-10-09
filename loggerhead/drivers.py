@@ -602,10 +602,25 @@ class TMC2209UART:
 
     def diagnostics(self, node: int) -> dict[str, Any]:
         drv = self.read_register(node, self.REG_DRV_STATUS)
+        sg_result = self.read_register(node, self.REG_SG_RESULT) & 0x3FF
         return {
-            "sg_result": self.read_register(node, self.REG_SG_RESULT),
-            "overtemp_warning": bool(drv & (1 << 26)),
-            "overtemp_shutdown": bool(drv & (1 << 25)),
+            "drv_status": drv,
+            "sg_result": sg_result,
+            "standstill": bool(drv & (1 << 31)),
+            "stealthchop": bool(drv & (1 << 30)),
+            "cs_actual": (drv >> 16) & 0x1F,
+            "overtemp_warning": bool(drv & 0x01),
+            "overtemp_shutdown": bool(drv & 0x02),
+            "short_to_ground_a": bool(drv & (1 << 2)),
+            "short_to_ground_b": bool(drv & (1 << 3)),
+            "short_to_supply_a": bool(drv & (1 << 4)),
+            "short_to_supply_b": bool(drv & (1 << 5)),
+            "open_load_a": bool(drv & (1 << 6)),
+            "open_load_b": bool(drv & (1 << 7)),
+            "temp_120c": bool(drv & (1 << 8)),
+            "temp_143c": bool(drv & (1 << 9)),
+            "temp_150c": bool(drv & (1 << 10)),
+            "temp_157c": bool(drv & (1 << 11)),
         }
 
 
@@ -643,7 +658,17 @@ class StepperPulseEngine:
             except Exception as exc:
                 raise HardwareFault(f"Stepper pulse hardware unavailable in real hardware mode: {exc}") from exc
 
-    def move(self, assignment: StepperAssignment, *, steps: int, steps_per_second: int, run_current_ma: int, hold_current_ma: int = 0) -> None:
+    def move(
+        self,
+        assignment: StepperAssignment,
+        *,
+        steps: int,
+        steps_per_second: int,
+        run_current_ma: int,
+        hold_current_ma: int = 0,
+        microsteps: int = 16,
+        stallguard_threshold: int = 0,
+    ) -> None:
         if self._shutdown.is_set():
             raise HardwareFault("Stepper engine is shut down.")
         if self._fault is not None:
@@ -656,7 +681,15 @@ class StepperPulseEngine:
         try:
             self.uart.set_current(assignment.uart_address, run_current_ma, hold_current_ma)
             self.relay_board.set_stepper_enabled(assignment, True)
-            self._pulse_windowed(assignment, steps=steps, steps_per_second=steps_per_second)
+            self._pulse_windowed(
+                assignment,
+                steps=steps,
+                steps_per_second=steps_per_second,
+                run_current_ma=run_current_ma,
+                hold_current_ma=hold_current_ma,
+                microsteps=microsteps,
+                stallguard_threshold=stallguard_threshold,
+            )
         except BaseException as exc:
             primary_error = exc
             raise
@@ -685,18 +718,36 @@ class StepperPulseEngine:
         self._stop_event.set()
         self.relay_board.disable_all_steppers()
 
-    def _pulse_windowed(self, assignment: StepperAssignment, *, steps: int, steps_per_second: int) -> None:
+    def _pulse_windowed(
+        self,
+        assignment: StepperAssignment,
+        *,
+        steps: int,
+        steps_per_second: int,
+        run_current_ma: int = 0,
+        hold_current_ma: int = 0,
+        microsteps: int = 16,
+        stallguard_threshold: int = 0,
+    ) -> None:
         # Implements SRS 3.4.3.1 with bounded chunks so pigpio queues never grow unbounded.
         delay = 1.0 / max(1, steps_per_second)
         remaining = abs(steps)
         window = deque([min(remaining, 256)])
+        moved = 0
         while remaining > 0 and not self._stop_event.is_set():
             chunk = window.popleft()
             diagnostics = self.uart.diagnostics(assignment.uart_address)
-            if diagnostics["overtemp_warning"] or diagnostics["overtemp_shutdown"]:
-                raise HardwareUnavailable(f"Stepper {assignment.name} reported thermal warning.")
-            if diagnostics["sg_result"] < 10:
-                raise HardwareUnavailable(f"Stepper {assignment.name} reported stall/load fault.")
+            self._check_stepper_diagnostics(
+                assignment,
+                diagnostics,
+                phase="pre-pulse",
+                moved_steps=moved,
+                steps_per_second=steps_per_second,
+                run_current_ma=run_current_ma,
+                hold_current_ma=hold_current_ma,
+                microsteps=microsteps,
+                stallguard_threshold=stallguard_threshold,
+            )
             if self.simulation or not self.pi:
                 self._stop_event.wait(chunk * delay)
             else:
@@ -712,8 +763,80 @@ class StepperPulseEngine:
                     if self._stop_event.wait(delay / 2):
                         break
             remaining -= chunk
+            moved += chunk
+            diagnostics = self.uart.diagnostics(assignment.uart_address)
+            self._check_stepper_diagnostics(
+                assignment,
+                diagnostics,
+                phase="post-pulse",
+                moved_steps=moved,
+                steps_per_second=steps_per_second,
+                run_current_ma=run_current_ma,
+                hold_current_ma=hold_current_ma,
+                microsteps=microsteps,
+                stallguard_threshold=stallguard_threshold,
+            )
             if remaining:
                 window.append(min(remaining, 256))
+
+    def _check_stepper_diagnostics(
+        self,
+        assignment: StepperAssignment,
+        diagnostics: dict[str, Any],
+        *,
+        phase: str,
+        moved_steps: int,
+        steps_per_second: int,
+        run_current_ma: int,
+        hold_current_ma: int,
+        microsteps: int,
+        stallguard_threshold: int,
+    ) -> None:
+        context = (
+            "stepper=%s phase=%s drv_status=0x%08x sg_result=%s standstill=%s stealthchop=%s "
+            "cs_actual=%s speed=%s run_current_ma=%s hold_current_ma=%s microsteps=%s moved_steps=%s"
+        )
+        context_args = (
+            assignment.name,
+            phase,
+            diagnostics.get("drv_status", 0),
+            diagnostics.get("sg_result"),
+            diagnostics.get("standstill"),
+            diagnostics.get("stealthchop"),
+            diagnostics.get("cs_actual"),
+            steps_per_second,
+            run_current_ma,
+            hold_current_ma,
+            microsteps,
+            moved_steps,
+        )
+        if diagnostics.get("overtemp_shutdown") or diagnostics.get("overtemp_warning"):
+            LOGGER.error("TMC2209 thermal fault: " + context, *context_args)
+            raise HardwareUnavailable(f"Stepper {assignment.name} reported thermal warning.")
+        short_flags = [
+            key
+            for key in ("short_to_ground_a", "short_to_ground_b", "short_to_supply_a", "short_to_supply_b")
+            if diagnostics.get(key)
+        ]
+        if short_flags:
+            LOGGER.error("TMC2209 short-circuit fault (%s): " + context, ",".join(short_flags), *context_args)
+            raise HardwareUnavailable(f"Stepper {assignment.name} reported electrical fault: {','.join(short_flags)}.")
+        if diagnostics.get("open_load_a") or diagnostics.get("open_load_b"):
+            LOGGER.warning("TMC2209 open-load indicator: " + context, *context_args)
+
+        fullstep_warmup_steps = max(1, 4 * max(1, microsteps))
+        stallguard_context_valid = (
+            moved_steps >= fullstep_warmup_steps
+            and not diagnostics.get("standstill")
+            and bool(diagnostics.get("stealthchop"))
+            and stallguard_threshold > 0
+        )
+        if stallguard_context_valid and diagnostics.get("sg_result", 0) <= stallguard_threshold:
+            LOGGER.warning(
+                "TMC2209 low StallGuard4 load value below configured threshold=%s: " + context,
+                stallguard_threshold,
+                *context_args,
+            )
 
     @staticmethod
     def estimate_current_ma(run_current_ma: int, duty_cycle: float) -> float:

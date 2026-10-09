@@ -9,6 +9,7 @@ from loggerhead.drivers import (
     TMC2209UART,
     Buzzer,
     HardwareFault,
+    HardwareUnavailable,
     HydrosTripleClassifier,
     KasaHS300Client,
     MCP23017RelayBoard,
@@ -90,6 +91,22 @@ class FakeSerial:
         return chunk
 
 
+class FakeDiagnosticUART:
+    REG_IHOLD_IRUN = TMC2209UART.REG_IHOLD_IRUN
+
+    def __init__(self, diagnostics: list[dict[str, object]]) -> None:
+        self.diagnostics_queue = list(diagnostics)
+        self.current_writes: list[tuple[int, int, int]] = []
+
+    def set_current(self, node: int, run_current_ma: int, hold_current_ma: int) -> None:
+        self.current_writes.append((node, run_current_ma, hold_current_ma))
+
+    def diagnostics(self, _node: int) -> dict[str, object]:
+        if self.diagnostics_queue:
+            return dict(self.diagnostics_queue.pop(0))
+        return tmc_diag()
+
+
 class FakePigpioPi:
     connected = True
 
@@ -98,6 +115,26 @@ class FakePigpioPi:
 
     def hardware_PWM(self, bcm_pin: int, frequency_hz: int, duty: int) -> None:
         self.hardware_pwm_calls.append((bcm_pin, frequency_hz, duty))
+
+
+def tmc_diag(**overrides: object) -> dict[str, object]:
+    data: dict[str, object] = {
+        "drv_status": 0,
+        "sg_result": 100,
+        "standstill": False,
+        "stealthchop": True,
+        "cs_actual": 20,
+        "overtemp_warning": False,
+        "overtemp_shutdown": False,
+        "short_to_ground_a": False,
+        "short_to_ground_b": False,
+        "short_to_supply_a": False,
+        "short_to_supply_b": False,
+        "open_load_a": False,
+        "open_load_b": False,
+    }
+    data.update(overrides)
+    return data
 
 
 @pytest.mark.parametrize(
@@ -255,6 +292,70 @@ def test_stepper_interlock_releases_after_move() -> None:
     assert relay.shadow_a == 0xF0
     engine.move(STEPPERS["dose1"], steps=1, steps_per_second=1000, run_current_ma=500)
     assert engine.active_stepper is None
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_low_sg_result_at_standstill_is_not_a_stall_fault() -> None:
+    relay = MCP23017RelayBoard(simulation=True)
+    uart = FakeDiagnosticUART(
+        [
+            tmc_diag(sg_result=0, standstill=True),
+            tmc_diag(sg_result=0, standstill=True),
+        ]
+    )
+    engine = StepperPulseEngine(uart, relay, simulation=True)
+    engine.move(STEPPERS["dose1"], steps=1, steps_per_second=1000, run_current_ma=500, stallguard_threshold=50)
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_low_sg_result_at_low_speed_is_logged_not_faulted() -> None:
+    relay = MCP23017RelayBoard(simulation=True)
+    uart = FakeDiagnosticUART(
+        [
+            tmc_diag(sg_result=0, standstill=False, stealthchop=True),
+            tmc_diag(sg_result=0, standstill=False, stealthchop=True),
+        ]
+    )
+    engine = StepperPulseEngine(uart, relay, simulation=True)
+    engine.move(
+        STEPPERS["dose1"],
+        steps=8,
+        steps_per_second=8,
+        run_current_ma=500,
+        microsteps=16,
+        stallguard_threshold=50,
+    )
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_open_load_indicator_does_not_stop_at_startup() -> None:
+    relay = MCP23017RelayBoard(simulation=True)
+    uart = FakeDiagnosticUART(
+        [
+            tmc_diag(open_load_a=True, open_load_b=True, standstill=True, sg_result=0),
+            tmc_diag(open_load_a=True, open_load_b=True, standstill=True, sg_result=0),
+        ]
+    )
+    engine = StepperPulseEngine(uart, relay, simulation=True)
+    engine.move(STEPPERS["dose1"], steps=1, steps_per_second=1000, run_current_ma=500)
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_short_to_ground_is_genuine_fault() -> None:
+    relay = MCP23017RelayBoard(simulation=True)
+    uart = FakeDiagnosticUART([tmc_diag(short_to_ground_a=True, drv_status=1 << 2)])
+    engine = StepperPulseEngine(uart, relay, simulation=True)
+    with pytest.raises(HardwareUnavailable, match="electrical fault"):
+        engine.move(STEPPERS["dose1"], steps=1, steps_per_second=1000, run_current_ma=500)
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_overtemp_is_genuine_fault() -> None:
+    relay = MCP23017RelayBoard(simulation=True)
+    uart = FakeDiagnosticUART([tmc_diag(overtemp_shutdown=True, drv_status=0x02)])
+    engine = StepperPulseEngine(uart, relay, simulation=True)
+    with pytest.raises(HardwareUnavailable, match="thermal warning"):
+        engine.move(STEPPERS["dose1"], steps=1, steps_per_second=1000, run_current_ma=500)
     assert relay.shadow_a == 0xF0
 
 

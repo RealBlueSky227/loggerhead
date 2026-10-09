@@ -337,6 +337,8 @@ class LoggerheadService:
                     steps_per_second=speed_steps_per_second,
                     run_current_ma=profile.run_current_ma,
                     hold_current_ma=profile.hold_current_ma,
+                    microsteps=profile.microsteps,
+                    stallguard_threshold=profile.stallguard_threshold,
                 )
         except Exception as exc:
             LOGGER.exception("%s manual priming fault.", profile.name)
