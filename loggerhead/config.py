@@ -23,6 +23,9 @@ from .hardware import (
 MIN_MANUAL_PRIME_STEPS_PER_SECOND = 1
 MAX_MANUAL_PRIME_STEPS_PER_SECOND = 5000
 DEFAULT_MANUAL_PRIME_STEPS_PER_SECOND = 400
+DEFAULT_MANUAL_PRIME_MAX_SECONDS = 60.0
+DEFAULT_MANUAL_PRIME_MAX_STEPS = 300_000
+SUPPORTED_MICROSTEPS = {1, 2, 4, 8, 16, 32, 64, 128, 256}
 
 
 class SensePortDevice(StrEnum):
@@ -202,6 +205,9 @@ class StepperProfile:
     steps_per_ml: float = 800.0
     stallguard_threshold: int = 50
     manual_speed_steps_per_second: int = DEFAULT_MANUAL_PRIME_STEPS_PER_SECOND
+    manual_max_seconds: float = DEFAULT_MANUAL_PRIME_MAX_SECONDS
+    manual_max_steps: int = DEFAULT_MANUAL_PRIME_MAX_STEPS
+    direction_high: bool = True
 
 
 @dataclass
@@ -372,8 +378,13 @@ def validate_config(config: AppConfig) -> None:
     materialized_analog = materialized_analog_sensors(config)
     water_ids = {item.id for item in materialized_water}
     stepper_ids = {item.id for item in config.steppers}
+    stepper_assignments = [item.assignment for item in config.steppers]
     if len(equipment_ids) != len(config.equipment):
         raise DiagnosticHalt("Equipment profile IDs must be unique.")
+    if len(stepper_ids) != len(config.steppers):
+        raise DiagnosticHalt("Stepper profile IDs must be unique.")
+    if len(set(stepper_assignments)) != len(stepper_assignments):
+        raise DiagnosticHalt("Stepper assignments must be unique.")
     for item in config.equipment:
         if item.driver == EquipmentDriver.MCP23017_RELAY:
             require_relay(item.pin_or_outlet)
@@ -406,6 +417,16 @@ def validate_config(config: AppConfig) -> None:
             raise DiagnosticHalt("Stepper holding current cannot be negative.")
         if item.run_current_ma <= 0:
             raise DiagnosticHalt("Stepper run current must be greater than zero.")
+        if item.hold_current_ma > item.run_current_ma:
+            raise DiagnosticHalt("Stepper holding current cannot exceed running current.")
+        if int(item.microsteps) not in SUPPORTED_MICROSTEPS:
+            raise DiagnosticHalt(f"Stepper microsteps must be one of {sorted(SUPPORTED_MICROSTEPS)}.")
+        item.microsteps = int(item.microsteps)
+        if item.steps_per_ml <= 0:
+            raise DiagnosticHalt("Stepper steps_per_ml must be greater than zero.")
+        if item.stallguard_threshold < 0 or item.stallguard_threshold > 255:
+            raise DiagnosticHalt("Stepper StallGuard threshold must be between 0 and 255.")
+        item.stallguard_threshold = int(item.stallguard_threshold)
         try:
             manual_speed = int(item.manual_speed_steps_per_second)
         except (TypeError, ValueError) as exc:
@@ -419,6 +440,13 @@ def validate_config(config: AppConfig) -> None:
                 f"Stepper manual priming speed must be no more than {MAX_MANUAL_PRIME_STEPS_PER_SECOND} step/s."
             )
         item.manual_speed_steps_per_second = manual_speed
+        item.manual_max_seconds = float(item.manual_max_seconds)
+        if item.manual_max_seconds <= 0:
+            raise DiagnosticHalt("Stepper manual priming max seconds must be greater than zero.")
+        item.manual_max_steps = int(item.manual_max_steps)
+        if item.manual_max_steps <= 0:
+            raise DiagnosticHalt("Stepper manual priming max steps must be greater than zero.")
+        item.direction_high = bool(item.direction_high)
     for item in config.dosing:
         if item.stepper and item.actuator not in stepper_ids:
             raise DiagnosticHalt(f"Dosing profile {item.id} references unknown stepper {item.actuator}.")

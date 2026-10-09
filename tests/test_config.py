@@ -65,3 +65,34 @@ def test_rejects_invalid_stepper_manual_prime_speed() -> None:
     config.steppers[0].manual_speed_steps_per_second = MAX_MANUAL_PRIME_STEPS_PER_SECOND + 1
     with pytest.raises(DiagnosticHalt):
         validate_config(config)
+
+
+def test_stepper_safety_fields_keep_backward_compatible_defaults(tmp_path) -> None:
+    path = tmp_path / "loggerhead.json"
+    config = default_config()
+    raw = json.loads(json.dumps(config, default=lambda value: value.value if hasattr(value, "value") else value.__dict__))
+    for stepper in raw["steppers"]:
+        stepper.pop("manual_max_seconds", None)
+        stepper.pop("manual_max_steps", None)
+        stepper.pop("direction_high", None)
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = load_config(path)
+
+    assert loaded.steppers[0].manual_max_seconds == 60.0
+    assert loaded.steppers[0].manual_max_steps == 300_000
+    assert loaded.steppers[0].direction_high is True
+
+
+def test_rejects_invalid_stepper_microsteps() -> None:
+    config = default_config()
+    config.steppers[0].microsteps = 3
+    with pytest.raises(DiagnosticHalt):
+        validate_config(config)
+
+
+def test_rejects_duplicate_stepper_assignments() -> None:
+    config = default_config()
+    config.steppers[1].assignment = config.steppers[0].assignment
+    with pytest.raises(DiagnosticHalt):
+        validate_config(config)

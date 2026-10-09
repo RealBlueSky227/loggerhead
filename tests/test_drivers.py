@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import types
 
 import pytest
@@ -14,6 +15,7 @@ from loggerhead.drivers import (
     KasaHS300Client,
     MCP23017RelayBoard,
     StepperPulseEngine,
+    StepperRunResult,
 )
 from loggerhead.hardware import RELAYS, STEPPERS, DiagnosticHalt, LevelState
 
@@ -97,9 +99,13 @@ class FakeDiagnosticUART:
     def __init__(self, diagnostics: list[dict[str, object]]) -> None:
         self.diagnostics_queue = list(diagnostics)
         self.current_writes: list[tuple[int, int, int]] = []
+        self.configure_calls: list[tuple[int, int, int]] = []
 
     def set_current(self, node: int, run_current_ma: int, hold_current_ma: int) -> None:
         self.current_writes.append((node, run_current_ma, hold_current_ma))
+
+    def configure_driver(self, node: int, *, microsteps: int, stallguard_threshold: int = 0) -> None:
+        self.configure_calls.append((node, microsteps, stallguard_threshold))
 
     def diagnostics(self, _node: int) -> dict[str, object]:
         if self.diagnostics_queue:
@@ -112,9 +118,17 @@ class FakePigpioPi:
 
     def __init__(self) -> None:
         self.hardware_pwm_calls: list[tuple[int, int, int]] = []
+        self.mode_calls: list[tuple[int, int]] = []
+        self.write_calls: list[tuple[int, int]] = []
 
     def hardware_PWM(self, bcm_pin: int, frequency_hz: int, duty: int) -> None:
         self.hardware_pwm_calls.append((bcm_pin, frequency_hz, duty))
+
+    def set_mode(self, bcm_pin: int, mode: int) -> None:
+        self.mode_calls.append((bcm_pin, mode))
+
+    def write(self, bcm_pin: int, value: int) -> None:
+        self.write_calls.append((bcm_pin, value))
 
 
 def tmc_diag(**overrides: object) -> dict[str, object]:
@@ -284,6 +298,28 @@ def test_tmc_read_request_and_response_crc_match_datasheet_shape() -> None:
     assert uart.serial.writes == [bytes.fromhex("05036f69")]
 
 
+def test_tmc_configure_driver_sets_uart_microsteps_and_stallguard() -> None:
+    uart = TMC2209UART(simulation=True)
+    uart.configure_driver(2, microsteps=16, stallguard_threshold=23)
+
+    assert uart.read_register(2, uart.REG_GCONF) & (
+        uart.GCONF_PDN_DISABLE | uart.GCONF_MSTEP_REG_SELECT
+    ) == (uart.GCONF_PDN_DISABLE | uart.GCONF_MSTEP_REG_SELECT)
+    assert uart.read_register(2, uart.REG_CHOPCONF) & uart.CHOPCONF_MRES_MASK == (
+        uart.MICROSTEP_TO_MRES[16] << uart.CHOPCONF_MRES_SHIFT
+    )
+    assert uart.read_register(2, uart.REG_TPOWERDOWN) == 20
+    assert uart.read_register(2, uart.REG_SGTHRS) == 23
+
+
+def test_tmc_configure_driver_rejects_startup_charge_pump_fault() -> None:
+    uart = TMC2209UART(simulation=True)
+    uart._sim_registers[(0, uart.REG_GSTAT)] = uart.GSTAT_UV_CP
+
+    with pytest.raises(HardwareFault, match="charge-pump undervoltage"):
+        uart.configure_driver(0, microsteps=16)
+
+
 def test_stepper_interlock_releases_after_move() -> None:
     relay = MCP23017RelayBoard(simulation=True)
     relay.set_stepper_enabled(STEPPERS["dose3"], True)
@@ -292,6 +328,63 @@ def test_stepper_interlock_releases_after_move() -> None:
     assert relay.shadow_a == 0xF0
     engine.move(STEPPERS["dose1"], steps=1, steps_per_second=1000, run_current_ma=500)
     assert engine.active_stepper is None
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_real_gpio_path_initializes_step_and_direction(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_pi = FakePigpioPi()
+    monkeypatch.setitem(sys.modules, "pigpio", types.SimpleNamespace(OUTPUT=1, pi=lambda: fake_pi))
+    relay = MCP23017RelayBoard(simulation=True)
+    uart = TMC2209UART(simulation=True)
+    engine = StepperPulseEngine(uart, relay, simulation=False)
+
+    engine.move(
+        STEPPERS["dose1"],
+        steps=2,
+        steps_per_second=5000,
+        run_current_ma=500,
+        microsteps=8,
+        stallguard_threshold=17,
+        direction_high=False,
+    )
+
+    assert (STEPPERS["dose1"].step_bcm, 1) in fake_pi.mode_calls
+    assert (STEPPERS["dose1"].direction_bcm, 1) in fake_pi.mode_calls
+    assert fake_pi.write_calls[:2] == [
+        (STEPPERS["dose1"].step_bcm, 0),
+        (STEPPERS["dose1"].direction_bcm, 0),
+    ]
+    assert fake_pi.write_calls[-1] == (STEPPERS["dose1"].step_bcm, 0)
+    assert uart.read_register(0, uart.REG_SGTHRS) == 17
+    assert uart.read_register(0, uart.REG_CHOPCONF) & uart.CHOPCONF_MRES_MASK == (
+        uart.MICROSTEP_TO_MRES[8] << uart.CHOPCONF_MRES_SHIFT
+    )
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_continuous_run_enables_once_and_honors_step_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    relay = MCP23017RelayBoard(simulation=True)
+    uart = TMC2209UART(simulation=True)
+    engine = StepperPulseEngine(uart, relay, simulation=True)
+    enable_calls: list[bool] = []
+    original_set_stepper_enabled = relay.set_stepper_enabled
+
+    def track_enable(assignment, enabled: bool) -> None:
+        enable_calls.append(enabled)
+        original_set_stepper_enabled(assignment, enabled)
+
+    monkeypatch.setattr(relay, "set_stepper_enabled", track_enable)
+    result = engine.run_continuous(
+        STEPPERS["dose1"],
+        stop_event=threading.Event(),
+        steps_per_second=5000,
+        run_current_ma=500,
+        max_seconds=5.0,
+        max_steps=3,
+    )
+
+    assert result == StepperRunResult(3, "max_steps")
+    assert enable_calls == [True, False]
     assert relay.shadow_a == 0xF0
 
 

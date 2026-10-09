@@ -39,13 +39,20 @@ from .drivers import (
     StepperPulseEngine,
     TemperatureReader,
 )
-from .hardware import RELAYS, SENSE_PORTS, DiagnosticHalt, EquipmentDriver, TemperatureDriver, WaterLevelDriver
+from .hardware import (
+    RELAYS,
+    SENSE_PORTS,
+    DiagnosticHalt,
+    EquipmentDriver,
+    TemperatureDriver,
+    WaterLevelDriver,
+    require_stepper,
+)
 from .notifications import HomeAssistantNotifier, MQTTHomeAssistantBridge, NotificationLimiter, TelegramNotifier
 from .state import EquipmentState, SensorReading, StateStore
 from .web import DashboardServer
 
 LOGGER = logging.getLogger(__name__)
-MANUAL_PRIME_CHUNK_SECONDS = 1.0
 
 
 class LoggerheadService:
@@ -71,6 +78,13 @@ class LoggerheadService:
         self.ph_sensor = EzoPHSensor(simulation=simulation)
         self.uart = TMC2209UART(simulation=simulation)
         self.stepper_engine = StepperPulseEngine(self.uart, self.relay_board, simulation=simulation)
+        for profile in self.config.steppers:
+            self.stepper_engine.configure_driver(
+                require_stepper(profile.assignment),
+                microsteps=profile.microsteps,
+                stallguard_threshold=profile.stallguard_threshold,
+                direction_high=profile.direction_high,
+            )
         self.health = HostHealthMonitor()
         self.telegram = TelegramNotifier(self.config.telegram)
         self.ha_notifier = HomeAssistantNotifier(self.config.home_assistant_notify)
@@ -325,20 +339,25 @@ class LoggerheadService:
             return {"id": stepper_id, "priming": True, "state": "started", "speed_steps_per_second": speed}
 
     def _prime_loop(self, profile: StepperProfile, stop: threading.Event, speed_steps_per_second: int) -> None:
-        from .hardware import require_stepper
-
         assignment = require_stepper(profile.assignment)
-        chunk_steps = max(1, round(speed_steps_per_second * MANUAL_PRIME_CHUNK_SECONDS))
         try:
-            while not stop.is_set() and not self._stop.is_set():
-                self.stepper_engine.move(
-                    assignment,
-                    steps=chunk_steps,
-                    steps_per_second=speed_steps_per_second,
-                    run_current_ma=profile.run_current_ma,
-                    hold_current_ma=profile.hold_current_ma,
-                    microsteps=profile.microsteps,
-                    stallguard_threshold=profile.stallguard_threshold,
+            result = self.stepper_engine.run_continuous(
+                assignment,
+                stop_event=stop,
+                steps_per_second=speed_steps_per_second,
+                run_current_ma=profile.run_current_ma,
+                hold_current_ma=profile.hold_current_ma,
+                microsteps=profile.microsteps,
+                stallguard_threshold=profile.stallguard_threshold,
+                direction_high=profile.direction_high,
+                max_seconds=profile.manual_max_seconds,
+                max_steps=profile.manual_max_steps,
+            )
+            if result.reason in {"max_seconds", "max_steps"}:
+                self._activate_alarm(
+                    f"stepper:{profile.id}:prime-limit",
+                    f"{profile.name} manual priming stopped at {result.steps_sent} steps due to {result.reason}.",
+                    priority="high",
                 )
         except Exception as exc:
             LOGGER.exception("%s manual priming fault.", profile.name)

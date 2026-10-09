@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from loggerhead.drivers import HardwareFault
+from loggerhead.drivers import HardwareFault, StepperRunResult
 from loggerhead.hardware import STEPPERS, AlarmPriority, DiagnosticHalt
 from loggerhead.service import LoggerheadService
 from loggerhead.state import AlarmState
@@ -26,16 +26,30 @@ def wait_for(predicate, timeout: float = 1.0) -> None:
 
 def test_manual_priming_starts_all_pumps_with_configured_speed(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = make_service(tmp_path)
-    calls: list[tuple[str, int, int]] = []
+    calls: list[tuple[str, int, float, int, bool]] = []
 
-    def fake_move(assignment, *, steps: int, steps_per_second: int, **_kwargs) -> None:
-        service.stepper_engine._stop_event.clear()
-        calls.append((assignment.name, steps, steps_per_second))
-        service.stepper_engine._stop_event.wait(0.2)
+    def fake_run_continuous(assignment, *, stop_event: threading.Event, steps_per_second: int, **kwargs) -> StepperRunResult:
+        calls.append(
+            (
+                assignment.name,
+                steps_per_second,
+                kwargs["max_seconds"],
+                kwargs["max_steps"],
+                kwargs["direction_high"],
+            )
+        )
+        stop_event.wait(0.2)
+        return StepperRunResult(0, "stopped")
 
-    monkeypatch.setattr(service.stepper_engine, "move", fake_move)
+    monkeypatch.setattr(service.stepper_engine, "run_continuous", fake_run_continuous)
     for index, profile in enumerate(service.config.steppers, start=1):
-        expected = (profile.assignment, 100 + index, 100 + index)
+        expected = (
+            profile.assignment,
+            100 + index,
+            profile.manual_max_seconds,
+            profile.manual_max_steps,
+            profile.direction_high,
+        )
         profile.manual_speed_steps_per_second = 100 + index
         result = service.set_manual_priming(profile.id, True)
         assert result["speed_steps_per_second"] == 100 + index
@@ -46,19 +60,19 @@ def test_manual_priming_starts_all_pumps_with_configured_speed(tmp_path, monkeyp
             thread.join(timeout=1.0)
         assert service.state.manual_priming[profile.id] is False
         assert service.state.stepper_active is None
-    assert [name for name, _steps, _speed in calls] == list(STEPPERS)
+    assert [name for name, _speed, _max_seconds, _max_steps, _direction in calls] == list(STEPPERS)
 
 
 def test_manual_priming_prime_stop_prime_again(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = make_service(tmp_path)
     started = threading.Event()
 
-    def fake_move(_assignment, **_kwargs) -> None:
-        service.stepper_engine._stop_event.clear()
+    def fake_run_continuous(_assignment, *, stop_event: threading.Event, **_kwargs) -> StepperRunResult:
         started.set()
-        service.stepper_engine._stop_event.wait(0.2)
+        stop_event.wait(0.2)
+        return StepperRunResult(0, "stopped")
 
-    monkeypatch.setattr(service.stepper_engine, "move", fake_move)
+    monkeypatch.setattr(service.stepper_engine, "run_continuous", fake_run_continuous)
     service.set_manual_priming("dose1", True)
     assert started.wait(1.0)
     service.set_manual_priming("dose1", False)
@@ -83,12 +97,12 @@ def test_manual_priming_rejects_competing_pumps(tmp_path, monkeypatch: pytest.Mo
     service = make_service(tmp_path)
     started = threading.Event()
 
-    def fake_move(_assignment, **_kwargs) -> None:
-        service.stepper_engine._stop_event.clear()
+    def fake_run_continuous(_assignment, *, stop_event: threading.Event, **_kwargs) -> StepperRunResult:
         started.set()
-        service.stepper_engine._stop_event.wait(0.2)
+        stop_event.wait(0.2)
+        return StepperRunResult(0, "stopped")
 
-    monkeypatch.setattr(service.stepper_engine, "move", fake_move)
+    monkeypatch.setattr(service.stepper_engine, "run_continuous", fake_run_continuous)
     service.set_manual_priming("dose1", True)
     assert started.wait(1.0)
     with pytest.raises(RuntimeError, match="already active"):
@@ -99,10 +113,10 @@ def test_manual_priming_rejects_competing_pumps(tmp_path, monkeypatch: pytest.Mo
 def test_manual_priming_worker_error_clears_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = make_service(tmp_path)
 
-    def fail_move(_assignment, **_kwargs) -> None:
+    def fail_run_continuous(_assignment, **_kwargs) -> StepperRunResult:
         raise HardwareFault("move failed")
 
-    monkeypatch.setattr(service.stepper_engine, "move", fail_move)
+    monkeypatch.setattr(service.stepper_engine, "run_continuous", fail_run_continuous)
     service.set_manual_priming("dose1", True)
     wait_for(lambda: service.state.manual_priming["dose1"] is False)
     assert service.state.stepper_active is None
@@ -112,16 +126,32 @@ def test_manual_priming_worker_error_clears_state(tmp_path, monkeypatch: pytest.
     assert "manual priming fault" in alarm.message
 
 
+def test_manual_priming_limit_alarm_clears_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+
+    def limit_run_continuous(_assignment, **_kwargs) -> StepperRunResult:
+        return StepperRunResult(12, "max_steps")
+
+    monkeypatch.setattr(service.stepper_engine, "run_continuous", limit_run_continuous)
+    service.set_manual_priming("dose1", True)
+
+    wait_for(lambda: service.state.manual_priming["dose1"] is False)
+    alarm = service.state.alarms["stepper:dose1:prime-limit"]
+    assert alarm.active is True
+    assert alarm.priority == AlarmPriority.HIGH
+    assert "12 steps" in alarm.message
+
+
 def test_shutdown_blocks_new_priming_and_clears_active_worker(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = make_service(tmp_path)
     started = threading.Event()
 
-    def fake_move(_assignment, **_kwargs) -> None:
-        service.stepper_engine._stop_event.clear()
+    def fake_run_continuous(_assignment, *, stop_event: threading.Event, **_kwargs) -> StepperRunResult:
         started.set()
-        service.stepper_engine._stop_event.wait(0.5)
+        stop_event.wait(0.5)
+        return StepperRunResult(0, "stopped")
 
-    monkeypatch.setattr(service.stepper_engine, "move", fake_move)
+    monkeypatch.setattr(service.stepper_engine, "run_continuous", fake_run_continuous)
     service.set_manual_priming("dose1", True)
     assert started.wait(1.0)
     service.stop()
