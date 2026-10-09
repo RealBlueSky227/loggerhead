@@ -28,6 +28,7 @@ from .drivers import (
     BinaryLevelSensor,
     Buzzer,
     EzoPHSensor,
+    HardwareFault,
     HostHealthMonitor,
     HydrosTripleClassifier,
     KasaHS300Client,
@@ -72,6 +73,8 @@ class LoggerheadService:
         self.mqtt.set_command_handler(self.handle_mqtt_command)
         self.notifications = NotificationLimiter()
         self._stop = threading.Event()
+        self._stop_lock = threading.RLock()
+        self._stopped = False
         self._threads: list[threading.Thread] = []
         self._prime_stop: dict[str, threading.Event] = {}
         self._prime_threads: dict[str, threading.Thread] = {}
@@ -85,6 +88,7 @@ class LoggerheadService:
             if sensor.driver == WaterLevelDriver.HYDROS_TRIPLE
         }
         self._last_polled_log = 0.0
+        self._clear_transient_stepper_state()
         self._restore_equipment_defaults()
 
     def run(self, *, host: str = "0.0.0.0", port: int = 8080) -> None:
@@ -97,16 +101,50 @@ class LoggerheadService:
         ]
         for thread in self._threads:
             thread.start()
-        signal.signal(signal.SIGTERM, lambda *_: self.stop())
-        signal.signal(signal.SIGINT, lambda *_: self.stop())
-        while not self._stop.is_set():
-            time.sleep(0.25)
-        server.shutdown()
-        self.mqtt.close()
-        self.state_store.save(self.state)
+        signal.signal(signal.SIGTERM, lambda *_: self._stop.set())
+        signal.signal(signal.SIGINT, lambda *_: self._stop.set())
+        shutdown_error: HardwareFault | None = None
+        try:
+            while not self._stop.is_set():
+                time.sleep(0.25)
+        finally:
+            try:
+                self.stop()
+            except HardwareFault as exc:
+                shutdown_error = exc
+                LOGGER.critical("Loggerhead shutdown completed with hardware fault: %s", exc)
+            finally:
+                server.shutdown()
+                self.mqtt.close()
+                self.state_store.save(self.state)
+            if shutdown_error is not None:
+                raise shutdown_error
 
     def stop(self) -> None:
-        self._stop.set()
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stop.set()
+            for event in self._prime_stop.values():
+                event.set()
+            self._clear_transient_stepper_state()
+            errors: list[Exception] = []
+            for action in (self.stepper_engine.shutdown, self.relay_board.disable_all_steppers, self.buzzer.stop):
+                try:
+                    action()
+                except Exception as exc:
+                    errors.append(exc)
+                    LOGGER.critical("Hardware shutdown action failed: %s", exc)
+            for stepper_id, thread in list(self._prime_threads.items()):
+                if thread is threading.current_thread():
+                    continue
+                thread.join(timeout=2.0)
+                if thread.is_alive():
+                    LOGGER.critical("Manual priming thread %s did not stop within timeout.", stepper_id)
+            self.state_store.save(self.state)
+            self._stopped = True
+            if errors:
+                raise HardwareFault(f"Loggerhead shutdown could not verify all actuators disabled: {errors[0]}") from errors[0]
 
     def status(self) -> dict[str, Any]:
         return {
@@ -169,6 +207,8 @@ class LoggerheadService:
         self.store.log_event("config", f"Sense Port {number} set to {port.device.value}.")
 
     def set_equipment(self, equipment_id: str, on: bool, *, source: str = "manual") -> None:
+        if self._stop.is_set():
+            raise RuntimeError("Loggerhead is stopping; equipment commands are blocked.")
         profile = self._equipment_profile(equipment_id)
         if profile.driver == EquipmentDriver.MCP23017_RELAY:
             relay = RELAYS[profile.pin_or_outlet]
@@ -203,6 +243,8 @@ class LoggerheadService:
 
     def set_manual_priming(self, stepper_id: str, enabled: bool) -> None:
         profile = next(item for item in self.config.steppers if item.id == stepper_id)
+        if enabled and self._stop.is_set():
+            raise RuntimeError("Loggerhead is stopping; manual priming cannot be started.")
         if not enabled:
             stop = self._prime_stop.get(stepper_id)
             if stop:
@@ -253,6 +295,10 @@ class LoggerheadService:
             existing = self.state.equipment.get(item.id)
             desired = existing.on if existing else item.default_on
             self.set_equipment(item.id, desired, source="restore")
+
+    def _clear_transient_stepper_state(self) -> None:
+        self.state.stepper_active = None
+        self.state.manual_priming = {item.id: False for item in self.config.steppers}
 
     def _poll_loop(self) -> None:
         while not self._stop.is_set():

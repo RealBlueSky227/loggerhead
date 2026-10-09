@@ -31,6 +31,10 @@ class HardwareUnavailable(RuntimeError):
     """Raised when a hardware operation is requested without available Pi libraries."""
 
 
+class HardwareFault(RuntimeError):
+    """Raised when actuator hardware cannot be proven to be in the requested state."""
+
+
 class HydrosTripleClassifier:
     """Classifies Hydros Triple PWM periods into water-level states.
 
@@ -176,6 +180,8 @@ class MCP23017RelayBoard:
         self.simulation = simulation
         self.shadow_a = self.STEPPER_ENABLE_MASK_A
         self.shadow_b = 0
+        self._lock = threading.RLock()
+        self._fault: HardwareFault | None = None
         self.bus = None
         if not simulation:
             try:
@@ -184,66 +190,120 @@ class MCP23017RelayBoard:
                 self.bus = SMBus(bus_id)
                 self._initialize_outputs_safely()
             except Exception as exc:
-                LOGGER.warning("MCP23017 unavailable, falling back to simulation: %s", exc)
-                self.simulation = True
+                fault = exc if isinstance(exc, HardwareFault) else HardwareFault(f"MCP23017 initialization failed: {exc}")
+                self._fault = fault
+                LOGGER.critical("MCP23017 actuator hardware fault: %s", fault)
+                if isinstance(exc, HardwareFault):
+                    raise
+                raise fault from exc
 
     def _initialize_outputs_safely(self) -> None:
         if not self.bus:
             return
-        # SRS 3.4.4, 3.4.5, and 8.1 safety: TMC2209 ENN is active-low, so
-        # GPA4-GPA7 must be preloaded HIGH before those pins become outputs.
-        # Read existing latches first so warm restarts preserve AC relay state.
-        self.shadow_a = self._read_register(self.OLATA, self.GPIOA) | self.STEPPER_ENABLE_MASK_A
-        self.shadow_b = self._read_register(self.OLATB, self.GPIOB)
-        self.bus.write_byte_data(self.address, self.OLATA, self.shadow_a)
-        self.bus.write_byte_data(self.address, self.OLATB, self.shadow_b)
-        self.bus.write_byte_data(self.address, self.IODIRA, self.ALL_OUTPUTS)
-        self.bus.write_byte_data(self.address, self.IODIRB, self.ALL_OUTPUTS)
+        with self._lock:
+            # SRS 3.4.4, 3.4.5, and 8.1 safety: TMC2209 ENN is active-low, so
+            # GPA4-GPA7 must be preloaded HIGH before those pins become outputs.
+            # Read existing latches first so warm restarts preserve AC relay state.
+            self.shadow_a = self._read_register(self.OLATA, self.GPIOA) | self.STEPPER_ENABLE_MASK_A
+            self.shadow_b = self._read_register(self.OLATB, self.GPIOB)
+            self._write_register_verified(self.OLATA, self.shadow_a)
+            self._write_register_verified(self.OLATB, self.shadow_b)
+            self._write_register_verified(self.IODIRA, self.ALL_OUTPUTS)
+            self._write_register_verified(self.IODIRB, self.ALL_OUTPUTS)
 
     def _read_register(self, preferred: int, fallback: int) -> int:
         if not self.bus:
             return 0
+        last_error: Exception | None = None
         for register in (preferred, fallback):
             try:
                 return int(self.bus.read_byte_data(self.address, register))
-            except Exception:
+            except Exception as exc:
+                last_error = exc
                 continue
-        return 0
+        raise HardwareFault(f"MCP23017 readback failed for registers {preferred:#04x}/{fallback:#04x}: {last_error}")
+
+    def _write_register_verified(self, register: int, value: int) -> None:
+        if self.simulation or not self.bus:
+            return
+        try:
+            self.bus.write_byte_data(self.address, register, value)
+            observed = int(self.bus.read_byte_data(self.address, register))
+        except Exception as exc:
+            self._fault = HardwareFault(f"MCP23017 write/readback failed for register {register:#04x}: {exc}")
+            raise self._fault from exc
+        if observed != value:
+            self._fault = HardwareFault(
+                f"MCP23017 register {register:#04x} readback mismatch: wrote {value:#04x}, observed {observed:#04x}"
+            )
+            raise self._fault
+
+    def _assert_healthy(self) -> None:
+        if self._fault is not None:
+            raise HardwareFault(f"MCP23017 is faulted; actuator operations are blocked: {self._fault}")
+
+    @staticmethod
+    def _is_protected_stepper_pin(pin: str) -> bool:
+        return pin.startswith("GPA") and pin[3:].isdigit() and 4 <= int(pin[3:]) <= 7
 
     def set_pin(self, pin: str, active: bool) -> None:
         port = pin[:3]
         bit = int(pin[3:])
         if port not in {"GPA", "GPB"} or bit < 0 or bit > 7:
             raise DiagnosticHalt(f"Invalid MCP23017 pin {pin!r}.")
-        mask = 1 << bit
-        if port == "GPA":
-            self.shadow_a = self.shadow_a | mask if active else self.shadow_a & ~mask
-            register = self.OLATA
-            value = self.shadow_a
-        else:
-            self.shadow_b = self.shadow_b | mask if active else self.shadow_b & ~mask
-            register = self.OLATB
-            value = self.shadow_b
-        if not self.simulation and self.bus:
-            self.bus.write_byte_data(self.address, register, value)
+        if self._is_protected_stepper_pin(pin):
+            raise DiagnosticHalt(f"{pin} is a protected active-low TMC2209 ENN pin; use set_stepper_enabled().")
+        with self._lock:
+            self._assert_healthy()
+            mask = 1 << bit
+            if port == "GPA":
+                value = self.shadow_a | mask if active else self.shadow_a & ~mask
+                self._write_register_verified(self.OLATA, value)
+                self.shadow_a = value
+            else:
+                value = self.shadow_b | mask if active else self.shadow_b & ~mask
+                self._write_register_verified(self.OLATB, value)
+                self.shadow_b = value
 
     def set_stepper_enabled(self, assignment: StepperAssignment, enabled: bool) -> None:
         # The TMC2209 ENN input is active-low: HIGH disables, LOW enables.
         # Encapsulate that inversion here so stepper code never relies on raw
         # GPIO polarity. When enabling one pump, first disable all other pumps.
-        if enabled:
-            self.shadow_a |= self.STEPPER_ENABLE_MASK_A
-            bit = int(assignment.enable_pin[3:])
-            self.shadow_a &= ~(1 << bit)
-            if not self.simulation and self.bus:
-                self.bus.write_byte_data(self.address, self.OLATA, self.shadow_a)
-            return
-        self.set_pin(assignment.enable_pin, True)
+        self._validate_stepper_assignment(assignment)
+        with self._lock:
+            self._assert_healthy()
+            if enabled:
+                disabled_value = self.shadow_a | self.STEPPER_ENABLE_MASK_A
+                self._write_register_verified(self.OLATA, disabled_value)
+                self.shadow_a = disabled_value
+                bit = int(assignment.enable_pin[3:])
+                enabled_value = disabled_value & ~(1 << bit)
+                self._assert_single_stepper_low(enabled_value)
+                self._write_register_verified(self.OLATA, enabled_value)
+                self.shadow_a = enabled_value
+                return
+            self._disable_stepper_locked(assignment)
+
+    def _disable_stepper_locked(self, assignment: StepperAssignment) -> None:
+        bit = int(assignment.enable_pin[3:])
+        value = self.shadow_a | (1 << bit)
+        self._write_register_verified(self.OLATA, value)
+        self.shadow_a = value
+
+    def _validate_stepper_assignment(self, assignment: StepperAssignment) -> None:
+        if not self._is_protected_stepper_pin(assignment.enable_pin):
+            raise DiagnosticHalt(f"{assignment.enable_pin} is not one of the protected GPA4-GPA7 stepper ENN pins.")
+
+    def _assert_single_stepper_low(self, value: int) -> None:
+        low_mask = (~value) & self.STEPPER_ENABLE_MASK_A
+        if low_mask and low_mask & (low_mask - 1):
+            raise HardwareFault(f"Refusing GPIOA value {value:#04x}; multiple TMC2209 ENN lines would be LOW.")
 
     def disable_all_steppers(self) -> None:
-        self.shadow_a |= self.STEPPER_ENABLE_MASK_A
-        if not self.simulation and self.bus:
-            self.bus.write_byte_data(self.address, self.OLATA, self.shadow_a)
+        with self._lock:
+            self._assert_healthy()
+            self.shadow_a |= self.STEPPER_ENABLE_MASK_A
+            self._write_register_verified(self.OLATA, self.shadow_a)
 
     @staticmethod
     def software_to_physical(desired_on: bool, *, normally_on: bool, relay: RelayAssignment) -> bool:
@@ -446,6 +506,7 @@ class TMC2209UART:
     SYNC = 0x05
     MASTER = 0xFF
     REG_GSTAT = 0x01
+    REG_IFCNT = 0x02
     REG_IHOLD_IRUN = 0x10
     REG_DRV_STATUS = 0x6F
     REG_SG_RESULT = 0x41
@@ -459,8 +520,7 @@ class TMC2209UART:
 
                 self.serial = serial.Serial(port, baudrate=baudrate, timeout=0.2)
             except Exception as exc:
-                LOGGER.warning("TMC2209 UART unavailable, falling back to simulation: %s", exc)
-                self.simulation = True
+                raise HardwareFault(f"TMC2209 UART unavailable in real hardware mode: {exc}") from exc
 
     @staticmethod
     def crc8(data: bytes) -> int:
@@ -475,25 +535,63 @@ class TMC2209UART:
                 current >>= 1
         return crc
 
-    def write_register(self, node: int, register: int, value: int) -> None:
+    def _validate_node(self, node: int) -> None:
         if node not in {0, 1, 2, 3}:
             raise DiagnosticHalt("TMC2209 UART nodes are fixed to addresses 0-3.")
-        payload = bytes([self.SYNC, self.MASTER, node, register | 0x80]) + value.to_bytes(4, "big")
+
+    def _write_frame(self, node: int, register: int, value: int) -> bytes:
+        self._validate_node(node)
+        payload = bytes([self.SYNC, node, register | 0x80]) + (value & 0xFFFFFFFF).to_bytes(4, "big")
+        return payload + bytes([self.crc8(payload)])
+
+    def _read_frame(self, node: int, register: int) -> bytes:
+        self._validate_node(node)
+        payload = bytes([self.SYNC, node, register & 0x7F])
         frame = payload + bytes([self.crc8(payload)])
+        return frame
+
+    def write_register(self, node: int, register: int, value: int, *, verify: bool = True) -> None:
         if not self.simulation and self.serial:
+            before = self.read_register(node, self.REG_IFCNT) if verify else None
+            frame = self._write_frame(node, register, value)
             self.serial.write(frame)
+            if verify:
+                after = self.read_register(node, self.REG_IFCNT)
+                if before is not None and after == before:
+                    raise HardwareFault(f"TMC2209 node {node} did not acknowledge write to register {register:#04x}.")
 
     def read_register(self, node: int, register: int) -> int:
         if self.simulation or not self.serial:
             if register == self.REG_SG_RESULT:
                 return 100
             return 0
-        request = bytes([self.SYNC, self.MASTER, node, register & 0x7F])
-        self.serial.write(request + bytes([self.crc8(request)]))
-        response = self.serial.read(8)
-        if len(response) < 8:
-            raise TimeoutError("TMC2209 UART read timed out.")
+        request = self._read_frame(node, register)
+        self.serial.write(request)
+        response = self._read_valid_response(register)
         return int.from_bytes(response[3:7], "big")
+
+    def _read_valid_response(self, register: int) -> bytes:
+        if not self.serial:
+            raise HardwareFault("TMC2209 serial port is not open.")
+        deadline = time.monotonic() + 0.5
+        buffer = bytearray()
+        while time.monotonic() < deadline:
+            chunk = self.serial.read(1)
+            if chunk:
+                buffer.extend(chunk)
+                while len(buffer) >= 8:
+                    window = bytes(buffer[:8])
+                    if (
+                        window[0] == self.SYNC
+                        and window[1] == self.MASTER
+                        and window[2] == (register & 0x7F)
+                        and self.crc8(window[:-1]) == window[-1]
+                    ):
+                        return window
+                    del buffer[0]
+            else:
+                time.sleep(0.005)
+        raise TimeoutError(f"TMC2209 UART read timed out for register {register:#04x}.")
 
     def set_current(self, node: int, run_current_ma: int, hold_current_ma: int) -> None:
         ihold = min(31, max(0, round(hold_current_ma / max(run_current_ma, 1) * 31)))
@@ -529,6 +627,8 @@ class StepperPulseEngine:
         self.simulation = simulation
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._shutdown = threading.Event()
+        self._fault: Exception | None = None
         self.active_stepper: str | None = None
         self.pi = None
         self.relay_board.disable_all_steppers()
@@ -540,27 +640,46 @@ class StepperPulseEngine:
                 if not self.pi.connected:
                     raise HardwareUnavailable("pigpiod is not connected.")
             except Exception as exc:
-                LOGGER.warning("Stepper pigpio unavailable, falling back to simulation: %s", exc)
-                self.simulation = True
+                raise HardwareFault(f"Stepper pulse hardware unavailable in real hardware mode: {exc}") from exc
 
     def move(self, assignment: StepperAssignment, *, steps: int, steps_per_second: int, run_current_ma: int, hold_current_ma: int = 0) -> None:
+        if self._shutdown.is_set():
+            raise HardwareFault("Stepper engine is shut down.")
+        if self._fault is not None:
+            raise HardwareFault(f"Stepper engine is faulted; moves are blocked: {self._fault}") from self._fault
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("A stepper motor is already active.")
         self.active_stepper = assignment.name
         self._stop_event.clear()
+        primary_error: BaseException | None = None
         try:
             self.uart.set_current(assignment.uart_address, run_current_ma, hold_current_ma)
             self.relay_board.set_stepper_enabled(assignment, True)
             self._pulse_windowed(assignment, steps=steps, steps_per_second=steps_per_second)
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            self.stop(assignment)
-            self.active_stepper = None
-            self._lock.release()
+            try:
+                self.stop(assignment)
+            except Exception as shutdown_error:
+                self._fault = shutdown_error
+                LOGGER.critical("Stepper %s failed to reach disabled state: %s", assignment.name, shutdown_error)
+                if primary_error is None:
+                    raise
+            finally:
+                self.active_stepper = None
+                self._lock.release()
 
     def stop(self, assignment: StepperAssignment) -> None:
         self._stop_event.set()
         self.relay_board.set_stepper_enabled(assignment, False)
         self.uart.set_current(assignment.uart_address, 0, 0)
+
+    def shutdown(self) -> None:
+        self._shutdown.set()
+        self._stop_event.set()
+        self.relay_board.disable_all_steppers()
 
     def _pulse_windowed(self, assignment: StepperAssignment, *, steps: int, steps_per_second: int) -> None:
         # Implements SRS 3.4.3.1 with bounded chunks so pigpio queues never grow unbounded.
