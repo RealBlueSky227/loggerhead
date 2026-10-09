@@ -45,6 +45,7 @@ from .state import EquipmentState, SensorReading, StateStore
 from .web import DashboardServer
 
 LOGGER = logging.getLogger(__name__)
+MANUAL_PRIME_CHUNK_SECONDS = 1.0
 
 
 class LoggerheadService:
@@ -325,11 +326,12 @@ class LoggerheadService:
         from .hardware import require_stepper
 
         assignment = require_stepper(profile.assignment)
+        chunk_steps = max(1, round(speed_steps_per_second * MANUAL_PRIME_CHUNK_SECONDS))
         try:
             while not stop.is_set() and not self._stop.is_set():
                 self.stepper_engine.move(
                     assignment,
-                    steps=speed_steps_per_second,
+                    steps=chunk_steps,
                     steps_per_second=speed_steps_per_second,
                     run_current_ma=profile.run_current_ma,
                     hold_current_ma=profile.hold_current_ma,
