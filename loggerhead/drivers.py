@@ -166,11 +166,15 @@ class MCP23017RelayBoard:
     IODIRB = 0x01
     OLATA = 0x14
     OLATB = 0x15
+    GPIOA = 0x12
+    GPIOB = 0x13
+    ALL_OUTPUTS = 0x00
+    STEPPER_ENABLE_MASK_A = 0xF0
 
     def __init__(self, *, bus_id: int = 1, address: int = MCP23017_ADDRESS, simulation: bool = False) -> None:
         self.address = address
         self.simulation = simulation
-        self.shadow_a = 0
+        self.shadow_a = self.STEPPER_ENABLE_MASK_A
         self.shadow_b = 0
         self.bus = None
         if not simulation:
@@ -178,11 +182,33 @@ class MCP23017RelayBoard:
                 from smbus2 import SMBus  # type: ignore
 
                 self.bus = SMBus(bus_id)
-                self.bus.write_byte_data(address, self.IODIRA, 0x00)
-                self.bus.write_byte_data(address, self.IODIRB, 0x00)
+                self._initialize_outputs_safely()
             except Exception as exc:
                 LOGGER.warning("MCP23017 unavailable, falling back to simulation: %s", exc)
                 self.simulation = True
+
+    def _initialize_outputs_safely(self) -> None:
+        if not self.bus:
+            return
+        # SRS 3.4.4, 3.4.5, and 8.1 safety: TMC2209 ENN is active-low, so
+        # GPA4-GPA7 must be preloaded HIGH before those pins become outputs.
+        # Read existing latches first so warm restarts preserve AC relay state.
+        self.shadow_a = self._read_register(self.OLATA, self.GPIOA) | self.STEPPER_ENABLE_MASK_A
+        self.shadow_b = self._read_register(self.OLATB, self.GPIOB)
+        self.bus.write_byte_data(self.address, self.OLATA, self.shadow_a)
+        self.bus.write_byte_data(self.address, self.OLATB, self.shadow_b)
+        self.bus.write_byte_data(self.address, self.IODIRA, self.ALL_OUTPUTS)
+        self.bus.write_byte_data(self.address, self.IODIRB, self.ALL_OUTPUTS)
+
+    def _read_register(self, preferred: int, fallback: int) -> int:
+        if not self.bus:
+            return 0
+        for register in (preferred, fallback):
+            try:
+                return int(self.bus.read_byte_data(self.address, register))
+            except Exception:
+                continue
+        return 0
 
     def set_pin(self, pin: str, active: bool) -> None:
         port = pin[:3]
@@ -200,6 +226,24 @@ class MCP23017RelayBoard:
             value = self.shadow_b
         if not self.simulation and self.bus:
             self.bus.write_byte_data(self.address, register, value)
+
+    def set_stepper_enabled(self, assignment: StepperAssignment, enabled: bool) -> None:
+        # The TMC2209 ENN input is active-low: HIGH disables, LOW enables.
+        # Encapsulate that inversion here so stepper code never relies on raw
+        # GPIO polarity. When enabling one pump, first disable all other pumps.
+        if enabled:
+            self.shadow_a |= self.STEPPER_ENABLE_MASK_A
+            bit = int(assignment.enable_pin[3:])
+            self.shadow_a &= ~(1 << bit)
+            if not self.simulation and self.bus:
+                self.bus.write_byte_data(self.address, self.OLATA, self.shadow_a)
+            return
+        self.set_pin(assignment.enable_pin, True)
+
+    def disable_all_steppers(self) -> None:
+        self.shadow_a |= self.STEPPER_ENABLE_MASK_A
+        if not self.simulation and self.bus:
+            self.bus.write_byte_data(self.address, self.OLATA, self.shadow_a)
 
     @staticmethod
     def software_to_physical(desired_on: bool, *, normally_on: bool, relay: RelayAssignment) -> bool:
@@ -487,6 +531,7 @@ class StepperPulseEngine:
         self._stop_event = threading.Event()
         self.active_stepper: str | None = None
         self.pi = None
+        self.relay_board.disable_all_steppers()
         if not simulation:
             try:
                 import pigpio  # type: ignore
@@ -505,7 +550,7 @@ class StepperPulseEngine:
         self._stop_event.clear()
         try:
             self.uart.set_current(assignment.uart_address, run_current_ma, hold_current_ma)
-            self.relay_board.set_pin(assignment.enable_pin, True)
+            self.relay_board.set_stepper_enabled(assignment, True)
             self._pulse_windowed(assignment, steps=steps, steps_per_second=steps_per_second)
         finally:
             self.stop(assignment)
@@ -514,7 +559,7 @@ class StepperPulseEngine:
 
     def stop(self, assignment: StepperAssignment) -> None:
         self._stop_event.set()
-        self.relay_board.set_pin(assignment.enable_pin, False)
+        self.relay_board.set_stepper_enabled(assignment, False)
         self.uart.set_current(assignment.uart_address, 0, 0)
 
     def _pulse_windowed(self, assignment: StepperAssignment, *, steps: int, steps_per_second: int) -> None:
