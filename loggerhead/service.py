@@ -84,6 +84,7 @@ class LoggerheadService:
         self._threads: list[threading.Thread] = []
         self._prime_stop: dict[str, threading.Event] = {}
         self._prime_threads: dict[str, threading.Thread] = {}
+        self._restart_suppressed_alarm_ids = self._active_audible_alarm_ids()
         self._level_since: dict[str, float] = {}
         self._hydros: dict[str, HydrosTripleClassifier] = {
             sensor.id: HydrosTripleClassifier(
@@ -95,6 +96,7 @@ class LoggerheadService:
         }
         self._last_polled_log = 0.0
         self._clear_transient_stepper_state()
+        self.buzzer.stop()
         self._restore_equipment_defaults()
 
     def run(self, *, host: str = "0.0.0.0", port: int = 8080) -> None:
@@ -515,11 +517,24 @@ class LoggerheadService:
         self._register_alarm(AlarmState(alarm_id, message, AlarmPriority(priority), first_seen=time.time()))
 
     def _sound_buzzer_if_needed(self, now: float) -> None:
-        active = [alarm for alarm in self.state.alarms.values() if alarm.active and alarm.priority.value in {"high", "critical"}]
+        active_ids = self._active_audible_alarm_ids()
+        self._restart_suppressed_alarm_ids.intersection_update(active_ids)
+        active = [
+            alarm
+            for alarm in self.state.alarms.values()
+            if alarm.id in active_ids and alarm.id not in self._restart_suppressed_alarm_ids
+        ]
         if not self.config.buzzer.enabled or not self.config.buzzer.alarm_enabled or not active or now < self.state.buzzer_muted_until:
             self.buzzer.stop()
             return
         self.buzzer.sound(max((alarm.priority for alarm in active), key=lambda p: ["info", "warning", "high", "critical"].index(p.value)))
+
+    def _active_audible_alarm_ids(self) -> set[str]:
+        return {
+            alarm.id
+            for alarm in self.state.alarms.values()
+            if alarm.active and alarm.priority.value in {"high", "critical"}
+        }
 
     def _poll_analog(self, now: float) -> None:
         for sensor in materialized_analog_sensors(self.config):

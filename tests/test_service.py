@@ -8,6 +8,7 @@ import pytest
 from loggerhead.drivers import HardwareFault
 from loggerhead.hardware import STEPPERS, AlarmPriority, DiagnosticHalt
 from loggerhead.service import LoggerheadService
+from loggerhead.state import AlarmState
 
 
 def make_service(tmp_path) -> LoggerheadService:
@@ -141,4 +142,32 @@ def test_startup_does_not_resume_persisted_manual_priming(tmp_path) -> None:
     assert restarted.state.stepper_active is None
     assert all(value is False for value in restarted.state.manual_priming.values())
     assert restarted._prime_threads == {}
+
+
+def test_restart_suppresses_audible_buzzer_for_persisted_alarm(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = tmp_path / "config" / "loggerhead.json"
+    data_dir = tmp_path / "data"
+    service = LoggerheadService(config_path, data_dir, simulation=True)
+    service.state.alarms["water:sump"] = AlarmState("water:sump", "Sump level high.", AlarmPriority.HIGH, active=True)
+    service.state_store.save(service.state)
+
+    restarted = LoggerheadService(config_path, data_dir, simulation=True)
+    sound_calls: list[AlarmPriority] = []
+    monkeypatch.setattr(restarted.buzzer, "sound", lambda priority=AlarmPriority.HIGH: sound_calls.append(priority))
+
+    restarted._sound_buzzer_if_needed(time.time())
+
+    assert sound_calls == []
+    assert "water:sump" in restarted._restart_suppressed_alarm_ids
+
+
+def test_new_high_alarm_after_restart_can_still_sound(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    sound_calls: list[AlarmPriority] = []
+    monkeypatch.setattr(service.buzzer, "sound", lambda priority=AlarmPriority.HIGH: sound_calls.append(priority))
+
+    service.state.alarms["stepper:dose1"] = AlarmState("stepper:dose1", "Dose fault.", AlarmPriority.HIGH, active=True)
+    service._sound_buzzer_if_needed(time.time())
+
+    assert sound_calls == [AlarmPriority.HIGH]
 
