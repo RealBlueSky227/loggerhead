@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 import types
 
 import pytest
@@ -14,10 +15,10 @@ from loggerhead.drivers import (
     HydrosTripleClassifier,
     KasaHS300Client,
     MCP23017RelayBoard,
+    PigpioResourceCoordinator,
     StepperPulseEngine,
-    StepperRunResult,
 )
-from loggerhead.hardware import RELAYS, STEPPERS, DiagnosticHalt, LevelState
+from loggerhead.hardware import RELAYS, STEPPERS, AlarmPriority, DiagnosticHalt, LevelState
 
 
 class FakeMCPBus:
@@ -93,6 +94,13 @@ class FakeSerial:
         return chunk
 
 
+class FakePigpioPulse:
+    def __init__(self, gpio_on: int, gpio_off: int, delay: int) -> None:
+        self.gpio_on = gpio_on
+        self.gpio_off = gpio_off
+        self.delay = delay
+
+
 class FakeDiagnosticUART:
     REG_IHOLD_IRUN = TMC2209UART.REG_IHOLD_IRUN
 
@@ -120,6 +128,20 @@ class FakePigpioPi:
         self.hardware_pwm_calls: list[tuple[int, int, int]] = []
         self.mode_calls: list[tuple[int, int]] = []
         self.write_calls: list[tuple[int, int]] = []
+        self.wave_add_generic_calls: list[list[FakePigpioPulse]] = []
+        self.wave_create_calls = 0
+        self.wave_send_once_calls: list[int] = []
+        self.wave_delete_calls: list[int] = []
+        self.wave_tx_stop_calls = 0
+        self.created_waves: dict[int, list[FakePigpioPulse]] = {}
+        self.deleted_waves: set[int] = set()
+        self.next_wave_id = 1
+        self.wave_add_result = 0
+        self.wave_create_result: int | None = None
+        self.wave_send_result: int | None = None
+        self.busy_cycles = 0
+        self.busy_checks = 0
+        self.on_busy = None
 
     def hardware_PWM(self, bcm_pin: int, frequency_hz: int, duty: int) -> None:
         self.hardware_pwm_calls.append((bcm_pin, frequency_hz, duty))
@@ -129,6 +151,42 @@ class FakePigpioPi:
 
     def write(self, bcm_pin: int, value: int) -> None:
         self.write_calls.append((bcm_pin, value))
+
+    def wave_add_generic(self, pulses: list[FakePigpioPulse]) -> int:
+        self.wave_add_generic_calls.append(list(pulses))
+        return self.wave_add_result
+
+    def wave_create(self) -> int:
+        self.wave_create_calls += 1
+        if self.wave_create_result is not None:
+            return self.wave_create_result
+        wave_id = self.next_wave_id
+        self.next_wave_id += 1
+        self.created_waves[wave_id] = self.wave_add_generic_calls[-1]
+        return wave_id
+
+    def wave_send_once(self, wave_id: int) -> int:
+        self.wave_send_once_calls.append(wave_id)
+        if self.wave_send_result is not None:
+            return self.wave_send_result
+        return wave_id
+
+    def wave_tx_busy(self) -> bool:
+        self.busy_checks += 1
+        if self.on_busy:
+            self.on_busy(self)
+        if self.busy_cycles > 0:
+            self.busy_cycles -= 1
+            return True
+        return False
+
+    def wave_tx_stop(self) -> None:
+        self.wave_tx_stop_calls += 1
+        self.busy_cycles = 0
+
+    def wave_delete(self, wave_id: int) -> None:
+        self.wave_delete_calls.append(wave_id)
+        self.deleted_waves.add(wave_id)
 
 
 def tmc_diag(**overrides: object) -> dict[str, object]:
@@ -149,6 +207,24 @@ def tmc_diag(**overrides: object) -> dict[str, object]:
     }
     data.update(overrides)
     return data
+
+
+def make_real_stepper_engine(monkeypatch: pytest.MonkeyPatch, fake_pi: FakePigpioPi | None = None):
+    fake_pi = fake_pi or FakePigpioPi()
+    monkeypatch.setitem(
+        sys.modules,
+        "pigpio",
+        types.SimpleNamespace(OUTPUT=1, pulse=FakePigpioPulse, pi=lambda: fake_pi),
+    )
+    relay = MCP23017RelayBoard(simulation=True)
+    uart = TMC2209UART(simulation=True)
+    engine = StepperPulseEngine(uart, relay, simulation=False)
+    return engine, relay, uart, fake_pi
+
+
+@pytest.fixture(autouse=True)
+def reset_pigpio_resource_coordinator() -> None:
+    PigpioResourceCoordinator.reset_for_tests()
 
 
 @pytest.mark.parametrize(
@@ -332,11 +408,7 @@ def test_stepper_interlock_releases_after_move() -> None:
 
 
 def test_stepper_real_gpio_path_initializes_step_and_direction(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_pi = FakePigpioPi()
-    monkeypatch.setitem(sys.modules, "pigpio", types.SimpleNamespace(OUTPUT=1, pi=lambda: fake_pi))
-    relay = MCP23017RelayBoard(simulation=True)
-    uart = TMC2209UART(simulation=True)
-    engine = StepperPulseEngine(uart, relay, simulation=False)
+    engine, relay, uart, fake_pi = make_real_stepper_engine(monkeypatch)
 
     engine.move(
         STEPPERS["dose1"],
@@ -355,11 +427,215 @@ def test_stepper_real_gpio_path_initializes_step_and_direction(monkeypatch: pyte
         (STEPPERS["dose1"].direction_bcm, 0),
     ]
     assert fake_pi.write_calls[-1] == (STEPPERS["dose1"].step_bcm, 0)
+    assert fake_pi.wave_send_once_calls == [1]
+    assert fake_pi.wave_delete_calls == [1]
     assert uart.read_register(0, uart.REG_SGTHRS) == 17
     assert uart.read_register(0, uart.REG_CHOPCONF) & uart.CHOPCONF_MRES_MASK == (
         uart.MICROSTEP_TO_MRES[8] << uart.CHOPCONF_MRES_SHIFT
     )
     assert relay.shadow_a == 0xF0
+
+
+@pytest.mark.parametrize("steps_per_second", [100, 400, 1000, 5000])
+def test_stepper_waveform_uses_dma_timed_edges(monkeypatch: pytest.MonkeyPatch, steps_per_second: int) -> None:
+    engine, _relay, _uart, fake_pi = make_real_stepper_engine(monkeypatch)
+
+    engine.move(STEPPERS["dose1"], steps=10, steps_per_second=steps_per_second, run_current_ma=500)
+
+    pulses = fake_pi.wave_add_generic_calls[0]
+    step_mask = 1 << STEPPERS["dose1"].step_bcm
+    assert len(pulses) == 20
+    for high, low in zip(pulses[::2], pulses[1::2], strict=True):
+        assert (high.gpio_on, high.gpio_off, high.delay) == (step_mask, 0, engine.STEP_HIGH_US)
+        assert low.gpio_on == 0
+        assert low.gpio_off == step_mask
+        assert high.delay + low.delay == 1_000_000 // steps_per_second
+
+
+def test_stepper_waveform_preserves_exact_requested_pulse_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine, _relay, _uart, fake_pi = make_real_stepper_engine(monkeypatch)
+
+    engine.move(STEPPERS["dose1"], steps=257, steps_per_second=1000, run_current_ma=500)
+
+    assert len(fake_pi.wave_add_generic_calls) == 1
+    assert len(fake_pi.wave_add_generic_calls[0]) == 514
+
+
+def test_stepper_continuous_real_wave_batches_are_accounted(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine, relay, _uart, fake_pi = make_real_stepper_engine(monkeypatch)
+
+    result = engine.run_continuous(
+        STEPPERS["dose1"],
+        stop_event=threading.Event(),
+        steps_per_second=1000,
+        run_current_ma=500,
+        max_seconds=5.0,
+        max_steps=1200,
+    )
+
+    assert result.steps_sent == 1200
+    assert result.possible_steps == 1200
+    assert result.completed_batches == 3
+    assert result.interrupted_batch is False
+    assert result.reason == "max_steps"
+    assert [len(pulses) // 2 for pulses in fake_pi.wave_add_generic_calls] == [500, 200]
+    assert fake_pi.wave_send_once_calls == [1, 1, 2]
+    assert fake_pi.wave_delete_calls == [1, 2]
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_stop_cancels_active_waveform(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_pi = FakePigpioPi()
+    fake_pi.busy_cycles = 5
+    engine, relay, _uart, fake_pi = make_real_stepper_engine(monkeypatch, fake_pi)
+    stopped = False
+
+    def stop_during_busy(_pi: FakePigpioPi) -> None:
+        nonlocal stopped
+        if not stopped:
+            stopped = True
+            engine._stop_event.set()
+
+    fake_pi.on_busy = stop_during_busy
+
+    engine.move(STEPPERS["dose1"], steps=500, steps_per_second=1000, run_current_ma=500)
+
+    assert fake_pi.wave_tx_stop_calls >= 1
+    assert fake_pi.wave_delete_calls == [1]
+    assert fake_pi.write_calls[-1] == (STEPPERS["dose1"].step_bcm, 0)
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_wave_create_failure_disables_motor(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_pi = FakePigpioPi()
+    fake_pi.wave_create_result = -1
+    engine, relay, _uart, _fake_pi = make_real_stepper_engine(monkeypatch, fake_pi)
+
+    with pytest.raises(HardwareFault, match="wave_create"):
+        engine.move(STEPPERS["dose1"], steps=10, steps_per_second=1000, run_current_ma=500)
+
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_wave_add_failure_disables_motor(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_pi = FakePigpioPi()
+    fake_pi.wave_add_result = -1
+    engine, relay, _uart, _fake_pi = make_real_stepper_engine(monkeypatch, fake_pi)
+
+    with pytest.raises(HardwareFault, match="wave_add_generic"):
+        engine.move(STEPPERS["dose1"], steps=10, steps_per_second=1000, run_current_ma=500)
+
+    assert fake_pi.wave_send_once_calls == []
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_wave_send_failure_deletes_wave_and_disables_motor(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_pi = FakePigpioPi()
+    fake_pi.wave_send_result = -1
+    engine, relay, _uart, _fake_pi = make_real_stepper_engine(monkeypatch, fake_pi)
+
+    with pytest.raises(HardwareFault, match="wave_send_once"):
+        engine.move(STEPPERS["dose1"], steps=10, steps_per_second=1000, run_current_ma=500)
+
+    assert fake_pi.wave_delete_calls == [1]
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_uart_error_during_wave_stops_wave_and_disables_motor(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_pi = FakePigpioPi()
+    fake_pi.busy_cycles = 2
+    engine, relay, uart, _fake_pi = make_real_stepper_engine(monkeypatch, fake_pi)
+    engine.WAVE_DIAGNOSTIC_SECONDS = 0.0
+    diagnostics_calls = 0
+
+    def diagnostics(_node: int) -> dict[str, object]:
+        nonlocal diagnostics_calls
+        diagnostics_calls += 1
+        if diagnostics_calls >= 2:
+            raise HardwareFault("uart read failed")
+        return tmc_diag()
+
+    monkeypatch.setattr(uart, "diagnostics", diagnostics)
+
+    with pytest.raises(HardwareFault, match="uart read failed"):
+        engine.move(STEPPERS["dose1"], steps=500, steps_per_second=1000, run_current_ma=500)
+
+    assert fake_pi.wave_tx_stop_calls >= 1
+    assert fake_pi.wave_delete_calls == [1]
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_real_mode_rejects_disconnected_pigpiod(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_pi = FakePigpioPi()
+    fake_pi.connected = False
+    monkeypatch.setitem(
+        sys.modules,
+        "pigpio",
+        types.SimpleNamespace(OUTPUT=1, pulse=FakePigpioPulse, pi=lambda: fake_pi),
+    )
+
+    with pytest.raises(HardwareFault, match="pigpiod is not connected"):
+        StepperPulseEngine(TMC2209UART(simulation=True), MCP23017RelayBoard(simulation=True), simulation=False)
+
+
+def test_buzzer_defers_hardware_pwm_while_stepper_wave_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_pi = FakePigpioPi()
+    monkeypatch.setitem(sys.modules, "pigpio", types.SimpleNamespace(pi=lambda: fake_pi))
+    buzzer = Buzzer(simulation=False)
+    fake_pi.hardware_pwm_calls.clear()
+
+    PigpioResourceCoordinator.begin_stepper_wave("stepper:test")
+    try:
+        buzzer.sound(AlarmPriority.HIGH)
+    finally:
+        PigpioResourceCoordinator.end_stepper_wave("stepper:test")
+
+    assert fake_pi.hardware_pwm_calls == []
+
+
+def test_stepper_repeated_wave_cycles_do_not_leak_wave_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine, relay, _uart, fake_pi = make_real_stepper_engine(monkeypatch)
+
+    for _ in range(3):
+        engine.move(STEPPERS["dose1"], steps=25, steps_per_second=1000, run_current_ma=500)
+
+    assert fake_pi.wave_send_once_calls == [1, 2, 3]
+    assert fake_pi.wave_delete_calls == [1, 2, 3]
+    assert engine._wave_ids == set()
+    assert relay.shadow_a == 0xF0
+
+
+def test_stepper_interlock_rejects_second_motor_while_one_is_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    relay = MCP23017RelayBoard(simulation=True)
+    uart = TMC2209UART(simulation=True)
+    engine = StepperPulseEngine(uart, relay, simulation=True)
+    stop = threading.Event()
+    started = threading.Event()
+
+    def run_first() -> None:
+        started.set()
+        engine.run_continuous(
+            STEPPERS["dose1"],
+            stop_event=stop,
+            steps_per_second=100,
+            run_current_ma=500,
+            max_seconds=5.0,
+            max_steps=1000,
+        )
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert started.wait(1.0)
+    while engine.active_stepper != "dose1":
+        time.sleep(0.001)
+
+    with pytest.raises(RuntimeError, match="already active"):
+        engine.move(STEPPERS["dose2"], steps=1, steps_per_second=1000, run_current_ma=500)
+
+    stop.set()
+    engine.request_stop()
+    thread.join(timeout=1.0)
+    assert not thread.is_alive()
 
 
 def test_stepper_continuous_run_enables_once_and_honors_step_limit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -383,7 +659,10 @@ def test_stepper_continuous_run_enables_once_and_honors_step_limit(monkeypatch: 
         max_steps=3,
     )
 
-    assert result == StepperRunResult(3, "max_steps")
+    assert result.steps_sent == 3
+    assert result.reason == "max_steps"
+    assert result.possible_steps == 3
+    assert result.completed_batches == 1
     assert enable_calls == [True, False]
     assert relay.shadow_a == 0xF0
 
