@@ -40,11 +40,16 @@ class SensorReading:
 class SensorHealth:
     id: str
     status: str = "initializing"
+    worker_state: str = "starting"
+    data_status: str = "initializing"
     last_success_ts: float = 0.0
     last_attempt_ts: float = 0.0
+    read_duration_seconds: float = 0.0
+    next_scheduled_ts: float = 0.0
     last_error: str = ""
     consecutive_failures: int = 0
     stale_after_seconds: float = 0.0
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

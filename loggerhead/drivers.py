@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -72,7 +73,7 @@ class HydrosTripleClassifier:
         else:
             self._candidate = candidate
             self._candidate_count = 1
-        if candidate != LevelState.UNKNOWN and self._candidate_count >= self.debounce_samples:
+        if self._candidate_count >= self.debounce_samples:
             self.state = candidate
         return self.state
 
@@ -99,6 +100,12 @@ class HydrosPulseReader:
         self.pi = None
         self._callback = None
         self._last_rising_tick: int | None = None
+        self._pulse_count = 0
+        self._last_period_us: float | None = None
+        self._last_frequency_hz: float | None = None
+        self._last_edge_ts = 0.0
+        self._last_valid_edge_ts = 0.0
+        self._invalid_frequency_count = 0
         self._lock = threading.RLock()
         if not simulation:
             try:
@@ -128,15 +135,44 @@ class HydrosPulseReader:
         if level == 2:
             return
         with self._lock:
+            self._last_edge_ts = time.time()
             if self._last_rising_tick is not None:
                 period_us = self._tick_diff(self._last_rising_tick, tick)
+                self._pulse_count += 1
+                self._last_period_us = float(period_us)
+                self._last_frequency_hz = 1_000_000.0 / period_us if period_us > 0 else None
+                if self.classifier.classify_period_us(period_us) == LevelState.UNKNOWN:
+                    self._invalid_frequency_count += 1
+                else:
+                    self._last_valid_edge_ts = self._last_edge_ts
                 self.classifier.observe_period_us(period_us)
             self._last_rising_tick = tick
 
     def read_state(self) -> LevelState:
         if self.simulation:
-            return self.classifier.observe_period_us(2520)
-        return self.classifier.activity_state()
+            with self._lock:
+                self._pulse_count += 1
+                self._last_period_us = 2520.0
+                self._last_frequency_hz = 1_000_000.0 / 2520.0
+                self._last_edge_ts = time.time()
+                self._last_valid_edge_ts = self._last_edge_ts
+                return self.classifier.observe_period_us(2520)
+        with self._lock:
+            return self.classifier.activity_state()
+
+    def diagnostics(self) -> dict[str, Any]:
+        with self._lock:
+            state = self.classifier.activity_state() if not self.simulation else self.classifier.state
+            return {
+                "bcm_pin": self.bcm_pin,
+                "state": state.value,
+                "frequency_hz": self._last_frequency_hz,
+                "period_us": self._last_period_us,
+                "pulse_count": self._pulse_count,
+                "last_edge_ts": self._last_edge_ts,
+                "last_valid_edge_ts": self._last_valid_edge_ts,
+                "invalid_frequency_count": self._invalid_frequency_count,
+            }
 
     def close(self) -> None:
         callback = self._callback
@@ -401,8 +437,22 @@ class EzoPHSensor:
             return 8.1
         if not self.bus:
             raise HardwareUnavailable("EZO pH I2C bus is unavailable.")
-        self.bus.write_i2c_block_data(self.address, ord("R"), [])
+        self.request_read()
         time.sleep(0.9)
+        return self.read_response()
+
+    def request_read(self) -> None:
+        if self.simulation:
+            return
+        if not self.bus:
+            raise HardwareUnavailable("EZO pH I2C bus is unavailable.")
+        self.bus.write_i2c_block_data(self.address, ord("R"), [])
+
+    def read_response(self) -> float:
+        if self.simulation:
+            return 8.1
+        if not self.bus:
+            raise HardwareUnavailable("EZO pH I2C bus is unavailable.")
         data = bytes(self.bus.read_i2c_block_data(self.address, 0, 32))
         text = data.rstrip(b"\x00").decode("ascii", errors="ignore")
         return float(text[1:] if text and not text[0].isdigit() else text)
@@ -1729,15 +1779,24 @@ class HostHealthMonitor:
         self._last_cpu: tuple[int, int] | None = None
 
     def snapshot(self, root: Path = Path("/")) -> dict[str, float]:
+        disk_used, disk_available = self.disk_usage(root)
         return {
             "cpu_percent": self.cpu_percent(),
             "memory_total": float(self.memory()["total"]),
             "memory_active": float(self.memory()["active"]),
             "memory_available": float(self.memory()["available"]),
-            "disk_used": float(os.statvfs(root).f_blocks - os.statvfs(root).f_bavail),
-            "disk_available": float(os.statvfs(root).f_bavail),
+            "disk_used": disk_used,
+            "disk_available": disk_available,
             "uptime_seconds": self.uptime_seconds(),
         }
+
+    @staticmethod
+    def disk_usage(root: Path) -> tuple[float, float]:
+        if hasattr(os, "statvfs"):
+            stat = os.statvfs(root)
+            return float(stat.f_blocks - stat.f_bavail), float(stat.f_bavail)
+        usage = shutil.disk_usage(root)
+        return float(usage.used), float(usage.free)
 
     def cpu_percent(self) -> float:
         try:

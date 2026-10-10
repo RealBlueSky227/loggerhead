@@ -47,9 +47,9 @@ On first run, Loggerhead creates `config/loggerhead.json` with a safe default ma
 
 The dashboard Config tab writes the same JSON configuration and reloads active service state without requiring a process restart.
 
-Sensor polling is per-sensor. A failed temperature, water-level, pH, or analog read is isolated, recorded in sensor health, and shown as Initializing, Online, Read Error, Disconnected, or Stale in the dashboard. Dependent heaters/chillers/fans and ATO outputs fail off when their input sensor is unavailable or stale.
+Sensor acquisition runs through persistent per-sensor workers supervised by the service control loop. A failed or slow temperature, water-level, pH, or analog read is isolated, recorded in sensor health, and shown as Initializing, Online, Read Error, Disconnected, or Stale in the dashboard. Dependent heaters/chillers/fans and ATO outputs fail off when their input sensor is unavailable or stale.
 
-Hardware note: kernel 1-Wire is the preferred DS18B20 backend on a Pi because the kernel owns the strict timing. The bit-banged DS18B20 backend is implemented directly on the configured GPIO using pigpio-compatible pin control, but it remains more timing-sensitive under Linux load. HYDROS triple-optical sensors are read as PWM pulse periods on the sense-port GPIO; they are not routed through DS18B20/kernel 1-Wire.
+Hardware note: kernel 1-Wire is the preferred DS18B20 backend on a Pi because the kernel owns the strict timing. The bit-banged DS18B20 backend is implemented directly on the configured GPIO using pigpio-compatible pin control, but it remains more timing-sensitive under Linux load. HYDROS triple-optical sensors are read asynchronously as PWM pulse periods on the sense-port GPIO; they are not routed through DS18B20/kernel 1-Wire. Mocked tests cover worker isolation and classification, but physical DS18B20 bit-bang timing and HYDROS pulse capture still require validation on the Raspberry Pi.
 
 ## Hardware Map
 

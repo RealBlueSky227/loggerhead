@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import asdict
 
 import pytest
 
 from loggerhead.config import OneWireMode, SensePortDevice
 from loggerhead.drivers import HardwareFault, StepperRunResult
 from loggerhead.hardware import STEPPERS, AlarmPriority, DiagnosticHalt, EquipmentKind, LevelState
+from loggerhead.sensor_workers import SensorWorkerSnapshot
 from loggerhead.service import LoggerheadService
 from loggerhead.state import AlarmState, EquipmentState
 
@@ -113,6 +115,248 @@ def test_water_sensor_failure_sets_unknown_for_ato_failsafe(tmp_path, monkeypatc
 
     assert service.state.water_levels["sense_port_1_water"] == LevelState.UNKNOWN
     assert service.state.sensor_health["sense_port_1_water"].status == "read_error"
+
+
+def test_slow_sensor_worker_does_not_delay_other_sensors_or_control_loop(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    temp = service.config.sense_ports[0]
+    temp.device = SensePortDevice.DS18B20
+    temp.one_wire_mode = OneWireMode.BIT_BANG
+    temp.check_frequency = 0.05
+    analog = service.config.sense_ports[1]
+    analog.device = SensePortDevice.ANALOG
+    analog.check_frequency = 0.05
+    service._rebuild_sensor_runtime()
+    slow_started = threading.Event()
+    slow_release = threading.Event()
+    analog_reads = 0
+
+    def slow_temperature(_bcm_pin: int) -> float:
+        slow_started.set()
+        slow_release.wait(1.0)
+        return 78.0
+
+    def read_voltage(_address: int, _channel: int) -> float:
+        nonlocal analog_reads
+        analog_reads += 1
+        return 1.5
+
+    monkeypatch.setattr(service.temperature_reader, "read_bit_banged", slow_temperature)
+    monkeypatch.setattr(service.analog_reader, "read_voltage", read_voltage)
+    monkeypatch.setattr(service, "_publish_telemetry", lambda: None)
+    monkeypatch.setattr(service, "_save_state", lambda: None)
+    monkeypatch.setattr(service.store, "prune_if_critical", lambda: False)
+    monkeypatch.setattr(service.health, "snapshot", lambda: {})
+    service._start_sensor_workers()
+    try:
+        assert slow_started.wait(1.0)
+        wait_for(lambda: analog_reads >= 2, timeout=1.0)
+        started = time.monotonic()
+        service._control_loop_iteration(time.time())
+        assert time.monotonic() - started < 0.5
+        assert service.state.sensor_health["sense_port_2_analog"].status == "online"
+    finally:
+        slow_release.set()
+        service._stop_sensor_workers()
+
+
+def test_sensor_workers_honor_independent_check_frequencies(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    fast = service.config.sense_ports[0]
+    fast.device = SensePortDevice.ANALOG
+    fast.check_frequency = 0.05
+    slow = service.config.sense_ports[1]
+    slow.device = SensePortDevice.ANALOG
+    slow.check_frequency = 0.2
+    service._rebuild_sensor_runtime()
+    calls = {0: 0, 1: 0}
+
+    def read_voltage(_address: int, channel: int) -> float:
+        calls[channel] += 1
+        return float(channel + 1)
+
+    monkeypatch.setattr(service.analog_reader, "read_voltage", read_voltage)
+    service._start_sensor_workers()
+    try:
+        time.sleep(0.45)
+    finally:
+        service._stop_sensor_workers()
+
+    assert calls[0] >= 5
+    assert calls[1] <= 4
+    assert calls[0] > calls[1]
+
+
+def test_i2c_sensor_workers_serialize_shared_bus_access(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    for port in service.config.sense_ports[:3]:
+        port.device = SensePortDevice.ANALOG
+        port.check_frequency = 0.01
+    service._rebuild_sensor_runtime()
+    guard = threading.Lock()
+    active = 0
+    overlap_detected = False
+    reads = 0
+
+    def read_voltage(_address: int, channel: int) -> float:
+        nonlocal active, overlap_detected, reads
+        with guard:
+            if active:
+                overlap_detected = True
+            active += 1
+        time.sleep(0.02)
+        with guard:
+            active -= 1
+            reads += 1
+        return float(channel)
+
+    monkeypatch.setattr(service.analog_reader, "read_voltage", read_voltage)
+    service._start_sensor_workers()
+    try:
+        wait_for(lambda: reads >= 6, timeout=1.5)
+    finally:
+        service._stop_sensor_workers()
+
+    assert overlap_detected is False
+
+
+def test_worker_exception_does_not_stop_other_sensor_workers(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    temp = service.config.sense_ports[0]
+    temp.device = SensePortDevice.DS18B20
+    temp.one_wire_mode = OneWireMode.BIT_BANG
+    temp.check_frequency = 0.05
+    analog = service.config.sense_ports[1]
+    analog.device = SensePortDevice.ANALOG
+    analog.check_frequency = 0.05
+    service._rebuild_sensor_runtime()
+    monkeypatch.setattr(service.temperature_reader, "read_bit_banged", lambda _pin: (_ for _ in ()).throw(RuntimeError("bad probe")))
+    analog_reads = 0
+
+    def read_voltage(_address: int, _channel: int) -> float:
+        nonlocal analog_reads
+        analog_reads += 1
+        return 2.0
+
+    monkeypatch.setattr(service.analog_reader, "read_voltage", read_voltage)
+    service._start_sensor_workers()
+    try:
+        wait_for(lambda: analog_reads >= 2, timeout=1.0)
+        service._control_loop_iteration(time.time())
+    finally:
+        service._stop_sensor_workers()
+
+    assert service.state.sensor_health["sense_port_1_temperature"].status == "read_error"
+    assert service.state.sensor_health["sense_port_2_analog"].status == "online"
+
+
+def test_stale_worker_snapshot_forces_heater_off(tmp_path) -> None:
+    service = make_service(tmp_path)
+    port = service.config.sense_ports[0]
+    port.device = SensePortDevice.DS18B20
+    port.assigned_equipment = "ac1"
+    port.equipment_type = EquipmentKind.HEATER
+    service.state.equipment["ac1"] = EquipmentState("ac1", True)
+    snapshot = SensorWorkerSnapshot(
+        sensor_id="sense_port_1_temperature",
+        kind="temperature",
+        worker_state="reading",
+        status="stale",
+        data_status="stale",
+        error="Read in progress for 9.0s.",
+        stale_after_seconds=5.0,
+    )
+
+    service._apply_sensor_worker_snapshots_locked(
+        {"sense_port_1_temperature": snapshot},
+        time.time(),
+        equipment_commands=[],
+        value_logs=[],
+        events=[],
+        alarms=[],
+    )
+
+    commands: list[tuple[str, bool, str]] = []
+    service._apply_sensor_worker_snapshots_locked(
+        {"sense_port_1_temperature": snapshot},
+        time.time(),
+        equipment_commands=commands,
+        value_logs=[],
+        events=[],
+        alarms=[],
+    )
+
+    assert ("ac1", False, "sensor_stale") in commands
+
+
+def test_hydros_callback_cleanup_on_repeated_config_edits(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    closed = 0
+
+    class FakeHydrosReader:
+        def __init__(self, *_args, **_kwargs) -> None:
+            return
+
+        def close(self) -> None:
+            nonlocal closed
+            closed += 1
+
+        def read_state(self) -> LevelState:
+            return LevelState.NORMAL
+
+        def diagnostics(self) -> dict[str, object]:
+            return {"pulse_count": 1}
+
+    monkeypatch.setattr("loggerhead.service.HydrosPulseReader", FakeHydrosReader)
+    service = make_service(tmp_path)
+    port = service.config.sense_ports[0]
+    for _ in range(3):
+        port.device = SensePortDevice.HYDROS_TRIPLE
+        service._rebuild_sensor_runtime()
+        assert "sense_port_1_water" in service._hydros_readers
+        port.device = SensePortDevice.BINARY
+        service._rebuild_sensor_runtime()
+
+    assert closed == 3
+
+
+def test_sensor_worker_start_stop_releases_threads(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    port = service.config.sense_ports[0]
+    port.device = SensePortDevice.ANALOG
+    port.check_frequency = 0.05
+    service._rebuild_sensor_runtime()
+    monkeypatch.setattr(service.analog_reader, "read_voltage", lambda _address, _channel: 1.0)
+    service._start_sensor_workers()
+    wait_for(lambda: service._sensor_worker_snapshots()["sense_port_1_analog"].thread_alive, timeout=1.0)
+    service._stop_sensor_workers()
+
+    snapshot = service._sensor_worker_snapshots()["sense_port_1_analog"]
+    assert snapshot.thread_alive is False
+    assert snapshot.worker_state == "stopped"
+
+
+def test_invalid_config_update_does_not_replace_active_config_or_file(tmp_path) -> None:
+    service = make_service(tmp_path)
+    before_file = service.config_path.read_text(encoding="utf-8")
+    before_frequency = service.config.sense_ports[0].check_frequency
+    payload = asdict(service.config)
+    payload["sense_ports"][0]["check_frequency"] = 0
+
+    with pytest.raises(DiagnosticHalt):
+        service.update_config(payload)
+
+    assert service.config_path.read_text(encoding="utf-8") == before_file
+    assert service.config.sense_ports[0].check_frequency == before_frequency
+
+
+def test_invalid_sense_port_edit_does_not_mutate_active_config(tmp_path) -> None:
+    service = make_service(tmp_path)
+    before_frequency = service.config.sense_ports[0].check_frequency
+
+    with pytest.raises(DiagnosticHalt):
+        service.set_sense_port(1, {"check_frequency": 0})
+
+    assert service.config.sense_ports[0].check_frequency == before_frequency
 
 
 def test_manual_priming_starts_all_pumps_with_configured_speed(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

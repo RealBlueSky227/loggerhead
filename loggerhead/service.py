@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import copy
 import logging
 import signal
 import threading
@@ -17,11 +17,14 @@ from .config import (
     OneWireMode,
     SensePortDevice,
     StepperProfile,
+    apply_config_migrations,
+    from_dict,
     load_config,
     materialized_analog_sensors,
     materialized_temperature_sensors,
     materialized_water_level_sensors,
     save_config,
+    validate_config,
 )
 from .controllers import AlertEvaluator, ATOController, ThermalController
 from .database import TelemetryStore
@@ -53,7 +56,8 @@ from .hardware import (
     require_stepper,
 )
 from .notifications import HomeAssistantNotifier, MQTTHomeAssistantBridge, NotificationLimiter, TelegramNotifier
-from .state import EquipmentState, SensorHealth, SensorReading, StateStore
+from .sensor_workers import SensorReadResult, SensorWorker, SensorWorkerSnapshot, SensorWorkerSpec
+from .state import AlarmState, EquipmentState, SensorHealth, SensorReading, StateStore
 from .web import DashboardServer
 
 LOGGER = logging.getLogger(__name__)
@@ -108,6 +112,12 @@ class LoggerheadService:
         self._restart_suppressed_alarm_ids = self._active_audible_alarm_ids()
         self._level_since: dict[str, float] = {}
         self._sensor_next_due: dict[str, float] = {}
+        self._sensor_worker_lock = threading.RLock()
+        self._sensor_workers: dict[str, SensorWorker] = {}
+        self._sensor_workers_started = False
+        self._sensor_last_applied_attempt: dict[str, float] = {}
+        self._i2c_lock = threading.RLock()
+        self._gpio_lock = threading.RLock()
         self._hydros: dict[str, HydrosTripleClassifier] = {}
         self._hydros_readers: dict[str, HydrosPulseReader] = {}
         self._rebuild_sensor_runtime()
@@ -122,6 +132,7 @@ class LoggerheadService:
         LOGGER.info("Starting Loggerhead on %s:%s", host, port)
         self._notify("Loggerhead", "Loggerhead aquarium controller started.")
         server = DashboardServer(self, host=host, port=port)
+        self._start_sensor_workers()
         self._threads = [
             threading.Thread(target=self._poll_loop, name="loggerhead-poll", daemon=True),
             threading.Thread(target=server.serve_forever, name="loggerhead-web", daemon=True),
@@ -161,6 +172,7 @@ class LoggerheadService:
             for name, action in (
                 ("stepper engine", self.stepper_engine.shutdown),
                 ("stepper ENN disable", self.relay_board.disable_all_steppers),
+                ("sensor workers", self._stop_sensor_workers_checked),
                 ("sensor callbacks", self._close_sensor_readers),
                 ("buzzer", self.buzzer.stop),
             ):
@@ -196,6 +208,7 @@ class LoggerheadService:
                 "equipment": {key: asdict(value) for key, value in self.state.equipment.items()},
                 "readings": {key: asdict(value) for key, value in self.state.readings.items()},
                 "sensor_health": {key: asdict(value) for key, value in self.state.sensor_health.items()},
+                "sensor_workers": {key: asdict(value) for key, value in self._sensor_worker_snapshots().items()},
                 "water_levels": {key: value.value for key, value in self.state.water_levels.items()},
                 "alarms": {key: asdict(value) for key, value in self.state.alarms.items()},
                 "ato": {key: asdict(value) for key, value in self.state.ato.items()},
@@ -213,16 +226,24 @@ class LoggerheadService:
     def update_config(self, payload: dict[str, Any]) -> AppConfig:
         # Implements SRS 5.4.1 Dynamic Application by replacing the active config
         # after validation and rebuilding per-config helper state.
-        self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        self.config = load_config(self.config_path)
+        candidate = from_dict(AppConfig, copy.deepcopy(payload))
+        apply_config_migrations(candidate)
+        validate_config(candidate)
+        previous = self.config
+        self.config = candidate
+        try:
+            self._rebuild_sensor_runtime()
+        except Exception:
+            self.config = previous
+            raise
         save_config(self.config_path, self.config)
-        self._rebuild_sensor_runtime()
+        self.config = load_config(self.config_path)
         self.store.log_event("config", "Configuration reloaded from UI.")
         return self.config
 
     def set_sense_port(self, number: int, payload: dict[str, Any]) -> None:
-        port = next(item for item in self.config.sense_ports if item.number == number)
+        candidate = copy.deepcopy(self.config)
+        port = next(item for item in candidate.sense_ports if item.number == number)
         field_names = {field.name for field in fields(port)}
         for key, value in payload.items():
             if key == "number" or key not in field_names:
@@ -232,9 +253,17 @@ class LoggerheadService:
             elif key == "one_wire_mode":
                 value = OneWireMode(value)
             setattr(port, key, value)
+        apply_config_migrations(candidate)
+        validate_config(candidate)
+        previous = self.config
+        self.config = candidate
+        try:
+            self._rebuild_sensor_runtime()
+        except Exception:
+            self.config = previous
+            raise
         save_config(self.config_path, self.config)
         self.config = load_config(self.config_path)
-        self._rebuild_sensor_runtime()
         self.store.log_event("config", f"Sense Port {number} set to {port.device.value}.")
 
     def set_equipment(self, equipment_id: str, on: bool, *, source: str = "manual") -> None:
@@ -387,6 +416,13 @@ class LoggerheadService:
             self.state.manual_priming = {item.id: False for item in self.config.steppers}
 
     def _rebuild_sensor_runtime(self) -> None:
+        restart_workers = self._sensor_workers_started
+        stuck_workers = self._stop_sensor_workers()
+        if stuck_workers:
+            message = f"Cannot replace sensor configuration; workers did not stop: {', '.join(stuck_workers)}."
+            LOGGER.critical(message)
+            self._activate_alarm("sensor:worker-stop", message, priority="high")
+            raise HardwareFault(message)
         self._close_sensor_readers()
         self._hydros = {}
         self._hydros_readers = {}
@@ -409,10 +445,16 @@ class LoggerheadService:
                 LOGGER.warning("HYDROS reader unavailable for %s on BCM %s: %s", sensor.id, port.digital_bcm, exc)
         configured_ids = {sensor["id"] for sensor in self._configured_sensor_catalog()}
         self._sensor_next_due = {key: value for key, value in self._sensor_next_due.items() if key in configured_ids}
+        self._sensor_last_applied_attempt = {
+            key: value for key, value in self._sensor_last_applied_attempt.items() if key in configured_ids
+        }
         with self._state_lock:
             self.state.sensor_health = {
                 key: value for key, value in self.state.sensor_health.items() if key in configured_ids
             }
+        self._install_sensor_workers(self._build_sensor_worker_specs())
+        if restart_workers:
+            self._start_sensor_workers()
 
     def _close_sensor_readers(self) -> None:
         for reader in self._hydros_readers.values():
@@ -420,6 +462,176 @@ class LoggerheadService:
                 reader.close()
             except Exception as exc:
                 LOGGER.warning("HYDROS callback cleanup failed: %s", exc)
+        self._hydros_readers = {}
+
+    def _build_sensor_worker_specs(self) -> list[SensorWorkerSpec]:
+        specs: list[SensorWorkerSpec] = []
+        for sensor in materialized_temperature_sensors(self.config):
+            stale_after = self._stale_after(sensor.check_frequency)
+
+            def read_temperature(stop: threading.Event, sensor=sensor, stale_after=stale_after) -> SensorReadResult:
+                del stop, stale_after
+                value = self._read_temperature_threadsafe(sensor)
+                return SensorReadResult(sensor.id, "temperature", round(value, 3), "F")
+
+            specs.append(
+                SensorWorkerSpec(
+                    sensor.id,
+                    "temperature",
+                    sensor.check_frequency,
+                    stale_after,
+                    read_temperature,
+                    read_timeout_seconds=stale_after,
+                )
+            )
+        for sensor in self.config.ph_sensors:
+            stale_after = self._stale_after(sensor.check_frequency)
+
+            def read_ph(stop: threading.Event, sensor=sensor) -> SensorReadResult:
+                if self.simulation:
+                    value = self.ph_sensor.read_ph()
+                else:
+                    with self._i2c_lock:
+                        self.ph_sensor.request_read()
+                    if stop.wait(0.9):
+                        raise RuntimeError("pH read cancelled.")
+                    with self._i2c_lock:
+                        value = self.ph_sensor.read_response()
+                return SensorReadResult(sensor.id, "ph", round(value, 3), "pH")
+
+            specs.append(
+                SensorWorkerSpec(sensor.id, "ph", sensor.check_frequency, stale_after, read_ph, read_timeout_seconds=stale_after)
+            )
+        for sensor in materialized_analog_sensors(self.config):
+            stale_after = self._stale_after(sensor.check_frequency)
+
+            def read_analog(_stop: threading.Event, sensor=sensor) -> SensorReadResult:
+                port = SENSE_PORTS[sensor.sense_port]
+                with self._i2c_lock:
+                    raw = self.analog_reader.read_voltage(port.ads1115_address, port.analog_channel)
+                value = raw * sensor.scale + sensor.offset
+                return SensorReadResult(
+                    sensor.id,
+                    "analog",
+                    round(value, 3),
+                    sensor.unit,
+                    metadata={"raw_voltage": raw, "ads1115_address": port.ads1115_address, "analog_channel": port.analog_channel},
+                )
+
+            specs.append(
+                SensorWorkerSpec(
+                    sensor.id,
+                    "analog",
+                    sensor.check_frequency,
+                    stale_after,
+                    read_analog,
+                    read_timeout_seconds=stale_after,
+                )
+            )
+        for sensor in materialized_water_level_sensors(self.config):
+            stale_after = self._stale_after(sensor.check_frequency, sensor.activity_timeout)
+            if sensor.driver == WaterLevelDriver.BINARY:
+
+                def read_binary(_stop: threading.Event, sensor=sensor) -> SensorReadResult:
+                    port = SENSE_PORTS[sensor.sense_port]
+                    with self._gpio_lock:
+                        level = BinaryLevelSensor(port.digital_bcm, invert=sensor.invert_binary, simulation=self.simulation).read_state()
+                    return SensorReadResult(
+                        sensor.id,
+                        "water",
+                        level.value,
+                        metadata={"driver": sensor.driver.value, "bcm_pin": port.digital_bcm},
+                    )
+
+                specs.append(
+                    SensorWorkerSpec(
+                        sensor.id,
+                        "water",
+                        sensor.check_frequency,
+                        stale_after,
+                        read_binary,
+                        read_timeout_seconds=stale_after,
+                    )
+                )
+                continue
+
+            def read_hydros(_stop: threading.Event, sensor=sensor) -> SensorReadResult:
+                reader = self._hydros_readers.get(sensor.id)
+                if reader is None:
+                    raise HardwareUnavailable(f"HYDROS PWM reader is unavailable for {sensor.id}.")
+                level = reader.read_state()
+                diagnostics = reader.diagnostics()
+                if level == LevelState.INACTIVE:
+                    return SensorReadResult(
+                        sensor.id,
+                        "water",
+                        level.value,
+                        data_status="stale",
+                        error="HYDROS PWM pulses are inactive.",
+                        metadata=diagnostics,
+                    )
+                if level == LevelState.UNKNOWN:
+                    return SensorReadResult(
+                        sensor.id,
+                        "water",
+                        level.value,
+                        data_status="read_error",
+                        error="HYDROS PWM frequency is outside known windows.",
+                        metadata=diagnostics,
+                    )
+                return SensorReadResult(sensor.id, "water", level.value, metadata=diagnostics)
+
+            specs.append(
+                SensorWorkerSpec(
+                    sensor.id,
+                    "water",
+                    sensor.check_frequency,
+                    stale_after,
+                    read_hydros,
+                    read_timeout_seconds=stale_after,
+                )
+            )
+        return specs
+
+    def _install_sensor_workers(self, specs: list[SensorWorkerSpec]) -> None:
+        with self._sensor_worker_lock:
+            self._sensor_workers = {spec.sensor_id: SensorWorker(spec) for spec in specs}
+
+    def _start_sensor_workers(self) -> None:
+        with self._sensor_worker_lock:
+            self._sensor_workers_started = True
+            for worker in self._sensor_workers.values():
+                worker.start()
+
+    def _stop_sensor_workers(self) -> list[str]:
+        with self._sensor_worker_lock:
+            workers = list(self._sensor_workers.values())
+            self._sensor_workers_started = False
+        stuck: list[str] = []
+        for worker in workers:
+            if not worker.stop(timeout=2.0):
+                stuck.append(worker.sensor_id)
+        return stuck
+
+    def _stop_sensor_workers_checked(self) -> None:
+        stuck_workers = self._stop_sensor_workers()
+        if stuck_workers:
+            raise HardwareFault(f"Sensor workers did not stop: {', '.join(stuck_workers)}.")
+
+    def _sensor_worker_snapshots(self) -> dict[str, SensorWorkerSnapshot]:
+        with self._sensor_worker_lock:
+            return {key: worker.snapshot() for key, worker in self._sensor_workers.items()}
+
+    def _supervise_sensor_workers(self) -> None:
+        if not self._sensor_workers_started or self._stop.is_set():
+            return
+        with self._sensor_worker_lock:
+            workers = list(self._sensor_workers.values())
+        for worker in workers:
+            snapshot = worker.snapshot()
+            if snapshot.worker_state == "failed" and not snapshot.thread_alive:
+                LOGGER.warning("Restarting failed sensor worker %s.", snapshot.sensor_id)
+                worker.start()
 
     def _retire_manual_prime_limit_alarms(self) -> None:
         with self._state_lock:
@@ -526,6 +738,8 @@ class LoggerheadService:
     def _mark_sensor_success(self, sensor_id: str, now: float, check_frequency: float, *, stale_after: float | None = None) -> None:
         health = self.state.sensor_health.setdefault(sensor_id, SensorHealth(sensor_id))
         health.status = "online"
+        health.worker_state = "running"
+        health.data_status = "online"
         health.last_success_ts = now
         health.last_attempt_ts = now
         health.last_error = ""
@@ -538,6 +752,8 @@ class LoggerheadService:
     def _mark_sensor_failure(self, sensor_id: str, now: float, exc: Exception, check_frequency: float, *, stale_after: float | None = None) -> None:
         health = self.state.sensor_health.setdefault(sensor_id, SensorHealth(sensor_id))
         health.status = "disconnected" if isinstance(exc, HardwareUnavailable) else "read_error"
+        health.worker_state = "running"
+        health.data_status = health.status
         health.last_attempt_ts = now
         health.last_error = str(exc)
         health.consecutive_failures += 1
@@ -556,6 +772,7 @@ class LoggerheadService:
         if now - health.last_success_ts <= stale_after:
             return False
         health.status = "stale"
+        health.data_status = "stale"
         health.last_error = f"No successful reading for {now - health.last_success_ts:.1f}s."
         reading = self.state.readings.get(sensor_id)
         if reading:
@@ -584,24 +801,237 @@ class LoggerheadService:
         while not self._stop.is_set():
             now = time.time()
             try:
-                with self._state_lock:
-                    self._poll_temperature(now)
-                    self._poll_ph(now)
-                    self._poll_analog(now)
-                    self._poll_water_levels(now)
-                    self._poll_health(now)
-                    self._evaluate_ato(now)
-                    self._sound_buzzer_if_needed(now)
-                    self._publish_telemetry()
-                    if now - self._last_polled_log >= self.config.database_poll_seconds:
-                        self._last_polled_log = now
-                        self._log_poll_snapshot(now)
-                    if self.store.prune_if_critical():
-                        self._activate_alarm("storage:disk", "Primary filesystem free space is below warning threshold.", priority="high")
-                    self._save_state()
+                self._control_loop_iteration(now)
             except Exception as exc:
                 LOGGER.exception("Polling loop iteration failed but will continue: %s", exc)
             self._stop.wait(1.0)
+
+    def _control_loop_iteration(self, now: float) -> None:
+        self._supervise_sensor_workers()
+        snapshots = self._sensor_worker_snapshots()
+        equipment_commands: list[tuple[str, bool, str]] = []
+        value_logs: list[tuple[str, float | str, str, float]] = []
+        events: list[tuple[str, str, dict[str, Any] | None]] = []
+        alarms: list[Any] = []
+        ato_notifications: list[Any] = []
+        with self._state_lock:
+            self._apply_sensor_worker_snapshots_locked(
+                snapshots,
+                now,
+                equipment_commands=equipment_commands,
+                value_logs=value_logs,
+                events=events,
+                alarms=alarms,
+            )
+            self._poll_health(now)
+            self._plan_ato_locked(now, equipment_commands=equipment_commands, alarms=alarms, notifications=ato_notifications)
+        for equipment_id, on, source in equipment_commands:
+            try:
+                self.set_equipment(equipment_id, on, source=source)
+            except Exception as exc:
+                LOGGER.exception("Equipment command failed for %s from %s: %s", equipment_id, source, exc)
+                self._activate_alarm(
+                    f"equipment:{equipment_id}:{source}",
+                    f"{source} could not command {equipment_id}: {exc}",
+                    priority="high",
+                )
+        for stream, value, unit, ts in value_logs:
+            self.store.log_value(stream, value, unit=unit, ts=ts)
+        for category, message, metadata in events:
+            self.store.log_event(category, message, metadata)
+        for alarm in alarms:
+            self._register_alarm(alarm)
+        for alarm in ato_notifications:
+            self._notify("Loggerhead ATO", alarm.message)
+            self.store.log_event("ato", alarm.message)
+        self._sound_buzzer_if_needed(now)
+        self._publish_telemetry()
+        if now - self._last_polled_log >= self.config.database_poll_seconds:
+            self._last_polled_log = now
+            self._log_poll_snapshot(now)
+        if self.store.prune_if_critical():
+            self._activate_alarm("storage:disk", "Primary filesystem free space is below warning threshold.", priority="high")
+        self._save_state()
+
+    def _apply_sensor_worker_snapshots_locked(
+        self,
+        snapshots: dict[str, SensorWorkerSnapshot],
+        now: float,
+        *,
+        equipment_commands: list[tuple[str, bool, str]],
+        value_logs: list[tuple[str, float | str, str, float]],
+        events: list[tuple[str, str, dict[str, Any] | None]],
+        alarms: list[Any],
+    ) -> None:
+        for snapshot in snapshots.values():
+            self._apply_sensor_health_snapshot_locked(snapshot, now, events=events, alarms=alarms)
+        for sensor in materialized_temperature_sensors(self.config):
+            snapshot = snapshots.get(sensor.id)
+            if snapshot is None:
+                continue
+            online = snapshot.data_status == "online"
+            if not online:
+                reading = self.state.readings.get(sensor.id)
+                if reading:
+                    reading.ok = False
+                if sensor.assigned_equipment:
+                    self._plan_equipment_off_if_on_locked(
+                        sensor.assigned_equipment,
+                        "sensor_stale" if snapshot.status == "stale" else "sensor_fault",
+                        equipment_commands,
+                    )
+                continue
+            if not self._snapshot_has_new_attempt(snapshot):
+                continue
+            value = float(snapshot.value)
+            self.state.readings[sensor.id] = SensorReading(sensor.id, round(value, 3), "F", ts=snapshot.last_success_ts or now)
+            value_logs.append((f"temperature.{sensor.id}", value, "F", snapshot.last_success_ts or now))
+            alarm = AlertEvaluator.temperature_alarm(sensor, value, now)
+            if alarm:
+                alarms.append(alarm)
+            elif f"temperature:{sensor.id}" in self.state.alarms:
+                self.state.alarms[f"temperature:{sensor.id}"].active = False
+            if sensor.assigned_equipment:
+                current = self.state.equipment.get(sensor.assigned_equipment, EquipmentState(sensor.assigned_equipment, False)).on
+                desired = ThermalController.evaluate(sensor, value, current)
+                if desired != current:
+                    equipment_commands.append((sensor.assigned_equipment, desired, "thermal"))
+        for sensor in self.config.ph_sensors:
+            snapshot = snapshots.get(sensor.id)
+            if snapshot is None:
+                continue
+            if snapshot.data_status != "online":
+                reading = self.state.readings.get(sensor.id)
+                if reading:
+                    reading.ok = False
+                continue
+            if self._snapshot_has_new_attempt(snapshot):
+                value = float(snapshot.value)
+                self.state.readings[sensor.id] = SensorReading(sensor.id, round(value, 3), "pH", ts=snapshot.last_success_ts or now)
+                value_logs.append((f"ph.{sensor.id}", value, "pH", snapshot.last_success_ts or now))
+        for sensor in materialized_analog_sensors(self.config):
+            snapshot = snapshots.get(sensor.id)
+            if snapshot is None:
+                continue
+            if snapshot.data_status != "online":
+                reading = self.state.readings.get(sensor.id)
+                if reading:
+                    reading.ok = False
+                continue
+            if self._snapshot_has_new_attempt(snapshot):
+                value = float(snapshot.value)
+                self.state.readings[sensor.id] = SensorReading(sensor.id, round(value, 3), sensor.unit, ts=snapshot.last_success_ts or now)
+                value_logs.append((f"analog.{sensor.id}", value, sensor.unit, snapshot.last_success_ts or now))
+        for sensor in materialized_water_level_sensors(self.config):
+            snapshot = snapshots.get(sensor.id)
+            if snapshot is None:
+                continue
+            new_attempt = self._snapshot_has_new_attempt(snapshot)
+            if snapshot.data_status != "online":
+                previous = self.state.water_levels.get(sensor.id)
+                self.state.water_levels[sensor.id] = LevelState.UNKNOWN
+                sensor.current_state = LevelState.UNKNOWN
+                if previous != LevelState.UNKNOWN and new_attempt:
+                    self._level_since[sensor.id] = now
+                    events.append(("water_level", f"{sensor.name} read error; state set to unknown.", {"id": sensor.id}))
+                continue
+            if not new_attempt:
+                continue
+            level = LevelState(snapshot.value)
+            previous = self.state.water_levels.get(sensor.id)
+            self.state.water_levels[sensor.id] = level
+            sensor.current_state = level
+            if previous != level:
+                self._level_since[sensor.id] = now
+                events.append(("water_level", f"{sensor.name} changed to {level.value}.", {"id": sensor.id}))
+            observed_since = self._level_since.setdefault(sensor.id, now)
+            alarm = AlertEvaluator.water_alarm(sensor, observed_since, now)
+            if alarm:
+                alarms.append(alarm)
+            value_logs.append((f"water.{sensor.id}", level.value, "", snapshot.last_success_ts or now))
+
+    def _apply_sensor_health_snapshot_locked(
+        self,
+        snapshot: SensorWorkerSnapshot,
+        now: float,
+        *,
+        events: list[tuple[str, str, dict[str, Any] | None]],
+        alarms: list[Any],
+    ) -> None:
+        health = self.state.sensor_health.setdefault(snapshot.sensor_id, SensorHealth(snapshot.sensor_id))
+        previous_status = health.status
+        health.status = snapshot.status
+        health.worker_state = snapshot.worker_state
+        health.data_status = snapshot.data_status
+        health.last_attempt_ts = snapshot.last_attempt_ts
+        health.last_success_ts = snapshot.last_success_ts
+        health.read_duration_seconds = snapshot.read_duration_seconds
+        health.next_scheduled_ts = snapshot.next_scheduled_ts
+        health.last_error = snapshot.error
+        health.consecutive_failures = snapshot.consecutive_failures
+        health.stale_after_seconds = snapshot.stale_after_seconds
+        health.diagnostics = dict(snapshot.metadata)
+        alarm_id = f"sensor:{snapshot.sensor_id}"
+        if snapshot.status == "online":
+            existing = self.state.alarms.get(alarm_id)
+            if existing and existing.active:
+                existing.active = False
+                events.append(("sensor", f"{snapshot.sensor_id} recovered.", {"id": snapshot.sensor_id, "status": "online"}))
+            return
+        if snapshot.status in {"initializing", "starting"}:
+            return
+        if previous_status != snapshot.status:
+            events.append(
+                (
+                    "sensor",
+                    f"{snapshot.sensor_id} {snapshot.status}: {snapshot.error or 'no valid reading'}",
+                    {"id": snapshot.sensor_id, "status": snapshot.status},
+                )
+            )
+        existing = self.state.alarms.get(alarm_id)
+        if existing and existing.active and existing.message.endswith(snapshot.error):
+            return
+        message = f"{snapshot.sensor_id} sensor {snapshot.status}: {snapshot.error or 'no valid reading'}"
+        alarms.append(AlarmState(alarm_id, message, AlarmPriority.WARNING, first_seen=now))
+
+    def _snapshot_has_new_attempt(self, snapshot: SensorWorkerSnapshot) -> bool:
+        if not snapshot.last_attempt_ts:
+            return False
+        last_applied = self._sensor_last_applied_attempt.get(snapshot.sensor_id, 0.0)
+        if snapshot.last_attempt_ts <= last_applied:
+            return False
+        self._sensor_last_applied_attempt[snapshot.sensor_id] = snapshot.last_attempt_ts
+        return True
+
+    def _plan_equipment_off_if_on_locked(
+        self,
+        equipment_id: str,
+        source: str,
+        equipment_commands: list[tuple[str, bool, str]],
+    ) -> None:
+        current = self.state.equipment.get(equipment_id)
+        if current is not None and not current.on:
+            return
+        equipment_commands.append((equipment_id, False, source))
+
+    def _plan_ato_locked(
+        self,
+        now: float,
+        *,
+        equipment_commands: list[tuple[str, bool, str]],
+        alarms: list[Any],
+        notifications: list[Any],
+    ) -> None:
+        equipment_ids = {item.id for item in self.config.equipment}
+        for profile in self.config.ato:
+            should_run, ato_state, alarm = ATOController.evaluate(profile, self.state, now)
+            current = self.state.equipment.get(profile.assigned_actuator, EquipmentState(profile.assigned_actuator, False)).on
+            if profile.assigned_actuator in equipment_ids and should_run != current:
+                equipment_commands.append((profile.assigned_actuator, should_run, "ato"))
+            if alarm:
+                alarms.append(alarm)
+                notifications.append(alarm)
+            self.state.ato[profile.id] = ato_state
 
     def _poll_temperature(self, now: float) -> None:
         for sensor in materialized_temperature_sensors(self.config):
@@ -649,6 +1079,12 @@ class LoggerheadService:
             port = SENSE_PORTS[sensor.sense_port or 1]
             return self.temperature_reader.read_bit_banged(port.digital_bcm)
         return self.temperature_reader.read_host_cpu()
+
+    def _read_temperature_threadsafe(self, sensor) -> float:
+        if sensor.driver == TemperatureDriver.HOST_CPU:
+            return self.temperature_reader.read_host_cpu()
+        with self._gpio_lock:
+            return self._read_temperature(sensor)
 
     def _poll_ph(self, now: float) -> None:
         for sensor in self.config.ph_sensors:
@@ -918,6 +1354,11 @@ class LoggerheadService:
                 stepper_diagnostics[item.id] = {"error": str(exc)}
         return {
             "steppers": stepper_diagnostics,
+            "sensor_workers": {key: asdict(value) for key, value in self._sensor_worker_snapshots().items()},
+            "hydros_pwm": {
+                key: reader.diagnostics()
+                for key, reader in self._hydros_readers.items()
+            },
             "buzzer_alarm_enabled": self.config.buzzer.alarm_enabled,
             "mqtt_enabled": self.config.mqtt.enabled,
             "telegram_enabled": self.config.telegram.enabled,

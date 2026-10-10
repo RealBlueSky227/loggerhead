@@ -8,12 +8,13 @@ from loggerhead.config import (
     MAX_MANUAL_PRIME_STEPS_PER_SECOND,
     EquipmentProfile,
     SensePortDevice,
+    WaterLevelSensorProfile,
     default_config,
     load_config,
     save_config,
     validate_config,
 )
-from loggerhead.hardware import DiagnosticHalt, EquipmentDriver
+from loggerhead.hardware import DiagnosticHalt, EquipmentDriver, WaterLevelDriver
 
 
 def test_default_config_is_valid() -> None:
@@ -110,4 +111,15 @@ def test_rejects_invalid_sense_port_polling_and_thresholds() -> None:
     config.sense_ports[0].device = SensePortDevice.DS18B20
     config.sense_ports[0].alert_below = 90
     with pytest.raises(DiagnosticHalt, match="threshold"):
+        validate_config(config)
+
+
+def test_rejects_conflicting_digital_sensor_backends_on_same_sense_port() -> None:
+    config = default_config()
+    config.sense_ports[0].device = SensePortDevice.DS18B20
+    config.water_level_sensors.append(
+        WaterLevelSensorProfile("backup_level", "Backup Level", WaterLevelDriver.BINARY, sense_port=1)
+    )
+
+    with pytest.raises(DiagnosticHalt, match="shared by multiple sensor backends"):
         validate_config(config)

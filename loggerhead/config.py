@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -348,9 +350,38 @@ def save_config(path: Path, config: AppConfig) -> None:
     apply_config_migrations(config)
     validate_config(config)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(asdict(config), handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    tmp_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f"{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_name = handle.name
+            json.dump(asdict(config), handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+        tmp_name = ""
+        try:
+            directory = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            directory = None
+        if directory is not None:
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    finally:
+        if tmp_name:
+            try:
+                Path(tmp_name).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def apply_config_migrations(config: AppConfig) -> None:
@@ -416,6 +447,7 @@ def validate_config(config: AppConfig) -> None:
     for item in materialized_water:
         require_sense_port(item.sense_port)
         _validate_water_profile(item)
+    _validate_digital_sensor_ownership(materialized_temperature, materialized_water)
     for item in config.steppers:
         require_stepper(item.assignment)
         if item.hold_current_ma < 0:
@@ -515,6 +547,29 @@ def _validate_water_profile(item: WaterLevelSensorProfile) -> None:
         raise DiagnosticHalt(f"Water level sensor {item.id} activity timeout must be greater than zero.")
     if item.debounce_samples <= 0:
         raise DiagnosticHalt(f"Water level sensor {item.id} debounce samples must be greater than zero.")
+
+
+def _validate_digital_sensor_ownership(
+    temperature_sensors: list[TemperatureSensorProfile],
+    water_sensors: list[WaterLevelSensorProfile],
+) -> None:
+    owners: dict[int, str] = {}
+    for item in temperature_sensors:
+        if item.sense_port is None:
+            continue
+        owner = f"{item.id} ({item.driver.value})"
+        previous = owners.setdefault(item.sense_port, owner)
+        if previous != owner:
+            raise DiagnosticHalt(
+                f"Sense Port {item.sense_port} digital GPIO is shared by multiple sensor backends: {previous}, {owner}."
+            )
+    for item in water_sensors:
+        owner = f"{item.id} ({item.driver.value})"
+        previous = owners.setdefault(item.sense_port, owner)
+        if previous != owner:
+            raise DiagnosticHalt(
+                f"Sense Port {item.sense_port} digital GPIO is shared by multiple sensor backends: {previous}, {owner}."
+            )
 
 
 def materialized_temperature_sensors(config: AppConfig) -> list[TemperatureSensorProfile]:
