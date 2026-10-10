@@ -255,19 +255,18 @@ def test_kernel_one_wire_worker_recovers_after_setup_failure(tmp_path, monkeypat
     port = service.config.sense_ports[0]
     port.device = SensePortDevice.DS18B20
     port.one_wire_mode = OneWireMode.KERNEL
-    port.sensor_id = "28-000000000001"
     port.check_frequency = 0.05
     service._rebuild_sensor_runtime()
     attempts = 0
 
-    def configure(_bcm_pin: int, _sensor_id: str = "") -> None:
+    def configure(_bcm_pin: int) -> None:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise HardwareUnavailable("sudo -n dtoverlay failed")
 
     monkeypatch.setattr(service.temperature_reader, "configure_kernel_one_wire", configure)
-    monkeypatch.setattr(service.temperature_reader, "read_one_wire_bus", lambda _sensor_id, **_kwargs: 78.6)
+    monkeypatch.setattr(service.temperature_reader, "read_one_wire_gpio", lambda _bcm_pin: 78.6)
     service._start_sensor_workers()
     try:
         wait_for(lambda: attempts >= 2, timeout=1.0)

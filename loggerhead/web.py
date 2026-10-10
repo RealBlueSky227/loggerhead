@@ -421,7 +421,6 @@ INDEX_HTML = r"""<!doctype html>
       if (port.device === "ds18b20") {
         fields.push(
           selectField(port, "one_wire_mode", "DS18B20 backend", WIRE_OPTIONS),
-          textField(port, "sensor_id", "DS18B20 ID"),
           textField(port, "target_temp", "Target F", "number"),
           textField(port, "hysteresis", "Hysteresis F", "number"),
           textField(port, "alert_below", "Alert below F", "number"),

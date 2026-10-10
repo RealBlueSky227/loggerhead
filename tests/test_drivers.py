@@ -364,25 +364,55 @@ def test_hydros_missing_pulses_becomes_inactive() -> None:
     assert classifier.activity_state() == LevelState.INACTIVE
 
 
-def write_w1_sensor(root: Path, sensor_id: str, temp_milli_c: int = 25_000) -> None:
-    path = root / sensor_id
-    path.mkdir(parents=True)
-    path.joinpath("w1_slave").write_text(f"aa YES\nbb t={temp_milli_c}\n", encoding="utf-8")
+def write_w1_bus(
+    root: Path,
+    master_name: str,
+    gpio_bcm: int,
+    sensors: dict[str, int] | None = None,
+    *,
+    verified: bool = True,
+) -> Path:
+    master = root / master_name
+    master.mkdir(parents=True)
+    if verified:
+        of_node = master / "device" / "of_node"
+        of_node.mkdir(parents=True)
+        of_node.joinpath("compatible").write_bytes(b"w1-gpio\x00")
+        of_node.joinpath("gpios").write_bytes(
+            b"".join(value.to_bytes(4, "big") for value in (123, gpio_bcm, 0))
+        )
+    sensors = sensors or {}
+    master.joinpath("w1_master_slaves").write_text("\n".join(sensors) + ("\n" if sensors else ""), encoding="ascii")
+    for sensor_id, temp_milli_c in sensors.items():
+        path = master / sensor_id
+        path.mkdir()
+        path.joinpath("w1_slave").write_text(f"aa YES\nbb t={temp_milli_c}\n", encoding="utf-8")
+    return master
 
 
 def test_kernel_one_wire_existing_sensor_skips_privileged_setup(tmp_path) -> None:
     root = tmp_path / "w1"
     root.mkdir()
-    (root / "w1_bus_master1").mkdir()
-    write_w1_sensor(root, "28-000000000001")
+    write_w1_bus(root, "w1_bus_master1", 4, {"28-000000000001": 25_000})
 
     def fail_if_called(*_args, **_kwargs):
         raise AssertionError("dtoverlay should not be called when the configured sensor is already visible")
 
     reader = TemperatureReader(simulation=False, one_wire_root=root, subprocess_run=fail_if_called)
-    reader.configure_kernel_one_wire(4, "28-000000000001")
+    reader.configure_kernel_one_wire(4)
 
-    assert reader.read_one_wire_bus("28-000000000001", bcm_pin=4) == 77.0
+    assert reader.read_one_wire_gpio(4) == 77.0
+
+
+def test_kernel_one_wire_reads_only_sensor_from_verified_gpio_bus(tmp_path) -> None:
+    root = tmp_path / "w1"
+    root.mkdir()
+    write_w1_bus(root, "w1_bus_master1", 4, {"28-000000000004": 25_000})
+    write_w1_bus(root, "w1_bus_master2", 17, {"28-000000000017": 30_000})
+    reader = TemperatureReader(simulation=False, one_wire_root=root)
+
+    assert reader.read_one_wire_gpio(4) == 77.0
+    assert reader.read_one_wire_gpio(17) == 86.0
 
 
 def test_kernel_one_wire_uses_narrow_privileged_overlay_setup(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -396,7 +426,7 @@ def test_kernel_one_wire_uses_narrow_privileged_overlay_setup(tmp_path, monkeypa
         if command == ["dtoverlay", "-l"]:
             return types.SimpleNamespace(returncode=0, stdout="No overlays loaded\n", stderr="")
         if command == ["sudo", "-n", "dtoverlay", "w1-gpio", "gpiopin=4"]:
-            (root / "w1_bus_master1").mkdir()
+            write_w1_bus(root, "w1_bus_master1", 4)
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError(f"unexpected command {command}")
 
@@ -455,23 +485,54 @@ def test_kernel_one_wire_does_not_duplicate_loaded_overlay(tmp_path) -> None:
     assert calls == [["dtoverlay", "-l"]]
 
 
-def test_kernel_one_wire_requires_unambiguous_sensor_id(tmp_path) -> None:
+def test_kernel_one_wire_requires_single_sensor_on_verified_gpio_bus(tmp_path) -> None:
     root = tmp_path / "w1"
     root.mkdir()
-    write_w1_sensor(root, "28-000000000001")
-    write_w1_sensor(root, "28-000000000002")
+    write_w1_bus(root, "w1_bus_master1", 4, {"28-000000000001": 25_000, "28-000000000002": 26_000})
     reader = TemperatureReader(simulation=False, one_wire_root=root)
 
     with pytest.raises(HardwareUnavailable, match="Multiple DS18B20 sensors"):
-        reader.read_one_wire_bus()
+        reader.read_one_wire_gpio(4)
 
-    assert reader.read_one_wire_bus("28-000000000002") == 77.0
+
+def test_kernel_one_wire_refuses_ambiguous_gpio_bus_ownership(tmp_path) -> None:
+    root = tmp_path / "w1"
+    root.mkdir()
+    write_w1_bus(root, "w1_bus_master1", 4, {"28-000000000001": 25_000})
+    write_w1_bus(root, "w1_bus_master2", 4, {"28-000000000002": 26_000})
+    reader = TemperatureReader(simulation=False, one_wire_root=root)
+
+    with pytest.raises(HardwareUnavailable, match="Ambiguous kernel 1-Wire ownership"):
+        reader.read_one_wire_gpio(4)
+
+
+def test_kernel_one_wire_never_uses_global_sensor_without_verified_gpio_bus(tmp_path) -> None:
+    root = tmp_path / "w1"
+    root.mkdir()
+    global_sensor = root / "28-000000000001"
+    global_sensor.mkdir()
+    global_sensor.joinpath("w1_slave").write_text("aa YES\nbb t=25000\n", encoding="utf-8")
+    write_w1_bus(root, "w1_bus_master1", 17, {"28-000000000017": 30_000})
+    reader = TemperatureReader(simulation=False, one_wire_root=root)
+
+    with pytest.raises(HardwareUnavailable, match="No verified kernel 1-Wire bus is owned by BCM GPIO 4"):
+        reader.read_one_wire_gpio(4)
+
+
+def test_kernel_one_wire_rejects_rom_id_reads(tmp_path) -> None:
+    root = tmp_path / "w1"
+    root.mkdir()
+    write_w1_bus(root, "w1_bus_master1", 4, {"28-000000000001": 25_000})
+    reader = TemperatureReader(simulation=False, one_wire_root=root)
+
+    with pytest.raises(HardwareUnavailable, match="ROM IDs are not user-configurable"):
+        reader.read_one_wire_bus("28-000000000001")
 
 
 def test_kernel_one_wire_missing_sensor_is_not_simulated_on_real_hardware() -> None:
     reader = TemperatureReader(simulation=False)
-    with pytest.raises(HardwareUnavailable, match="not found|not present|No DS18B20"):
-        reader.read_one_wire_bus("28-000000000000")
+    with pytest.raises(HardwareUnavailable, match="Kernel 1-Wire reads require a sense-port BCM GPIO"):
+        reader.read_one_wire_bus()
 
 
 def test_bit_banged_ds18b20_decodes_scratchpad_with_mocked_gpio(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -88,4 +88,5 @@ def test_dashboard_sensor_editor_preserves_drafts_between_refreshes() -> None:
     assert "if (!force && (sensorEditorDirty || focused" in INDEX_HTML
     assert "saveSensePorts" in INDEX_HTML
     assert "one_wire_mode" in INDEX_HTML
+    assert "DS18B20 ID" not in INDEX_HTML
 

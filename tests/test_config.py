@@ -8,13 +8,15 @@ from loggerhead.config import (
     MAX_MANUAL_PRIME_STEPS_PER_SECOND,
     EquipmentProfile,
     SensePortDevice,
+    TemperatureSensorProfile,
     WaterLevelSensorProfile,
     default_config,
     load_config,
+    materialized_temperature_sensors,
     save_config,
     validate_config,
 )
-from loggerhead.hardware import DiagnosticHalt, EquipmentDriver, WaterLevelDriver
+from loggerhead.hardware import DiagnosticHalt, EquipmentDriver, TemperatureDriver, WaterLevelDriver
 
 
 def test_default_config_is_valid() -> None:
@@ -84,6 +86,56 @@ def test_stepper_safety_fields_keep_backward_compatible_defaults(tmp_path) -> No
     assert loaded.steppers[0].manual_max_seconds == 60.0
     assert loaded.steppers[0].manual_max_steps == 300_000
     assert loaded.steppers[0].direction_high is True
+
+
+def test_migrates_legacy_ds18b20_sense_ports_away_from_rom_ids(tmp_path) -> None:
+    path = tmp_path / "loggerhead.json"
+    config = default_config()
+    config.sense_ports[0].device = SensePortDevice.DS18B20
+    config.sense_ports[0].sensor_id = "28-000000000001"
+    config.temperature_sensors.append(
+        TemperatureSensorProfile(
+            "legacy_kernel",
+            "Legacy Kernel DS18B20",
+            TemperatureDriver.ONE_WIRE_BUS,
+            sensor_id="28-000000000002",
+            sense_port=2,
+        )
+    )
+    save_config(path, config)
+
+    loaded = load_config(path)
+    materialized = [sensor for sensor in materialized_temperature_sensors(loaded) if sensor.sense_port == 1]
+    legacy_kernel = next(sensor for sensor in loaded.temperature_sensors if sensor.id == "legacy_kernel")
+
+    assert loaded.sense_ports[0].sensor_id == ""
+    assert legacy_kernel.sensor_id == ""
+    assert len(materialized) == 1
+    assert materialized[0].sensor_id == ""
+
+
+def test_rejects_ds18b20_temperature_without_fixed_sense_port() -> None:
+    config = default_config()
+    config.temperature_sensors.append(TemperatureSensorProfile("tank", "Tank", TemperatureDriver.ONE_WIRE_BUS))
+
+    with pytest.raises(DiagnosticHalt, match="fixed sense port GPIO"):
+        validate_config(config)
+
+
+def test_rejects_ds18b20_rom_ids_without_migration() -> None:
+    config = default_config()
+    config.temperature_sensors.append(
+        TemperatureSensorProfile(
+            "tank",
+            "Tank",
+            TemperatureDriver.ONE_WIRE_BUS,
+            sensor_id="28-000000000001",
+            sense_port=1,
+        )
+    )
+
+    with pytest.raises(DiagnosticHalt, match="must not configure a DS18B20 ROM ID"):
+        validate_config(config)
 
 
 def test_rejects_invalid_stepper_microsteps() -> None:

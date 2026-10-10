@@ -387,7 +387,12 @@ def save_config(path: Path, config: AppConfig) -> None:
 def apply_config_migrations(config: AppConfig) -> None:
     if not config.sense_ports:
         config.sense_ports = [SensePortProfile(index) for index in range(1, 11)]
+    for port in config.sense_ports:
+        if port.device == SensePortDevice.DS18B20:
+            port.sensor_id = ""
     for sensor in config.temperature_sensors:
+        if sensor.driver in {TemperatureDriver.ONE_WIRE_BUS, TemperatureDriver.BIT_BANGED_ONE_WIRE}:
+            sensor.sensor_id = ""
         if sensor.driver == TemperatureDriver.HOST_CPU and sensor.alert_above <= 100:
             sensor.target_temp = 140.0
             sensor.hysteresis = 10.0
@@ -529,6 +534,13 @@ def _validate_sense_port_profile(item: SensePortProfile, equipment_ids: set[str]
 
 def _validate_temperature_profile(item: TemperatureSensorProfile, equipment_ids: set[str]) -> None:
     _validate_positive_frequency(item.check_frequency, f"Temperature sensor {item.id}")
+    if item.driver in {TemperatureDriver.ONE_WIRE_BUS, TemperatureDriver.BIT_BANGED_ONE_WIRE}:
+        if item.sensor_id:
+            raise DiagnosticHalt(
+                f"Temperature sensor {item.id} must not configure a DS18B20 ROM ID; assign it to a fixed sense port GPIO."
+            )
+        if item.sense_port is None:
+            raise DiagnosticHalt(f"Temperature sensor {item.id} must be assigned to a fixed sense port GPIO.")
     if item.emergency_below > item.alert_below or item.alert_below >= item.alert_above or item.alert_above >= item.emergency_above:
         raise DiagnosticHalt(f"Temperature sensor {item.id} thresholds must be ordered.")
     if item.assigned_equipment and item.assigned_equipment not in equipment_ids:
@@ -596,7 +608,6 @@ def materialized_temperature_sensors(config: AppConfig) -> list[TemperatureSenso
                 emergency_below=port.emergency_below,
                 assigned_equipment=port.assigned_equipment,
                 equipment_type=port.equipment_type,
-                sensor_id=port.sensor_id,
                 sense_port=port.number,
             )
         )

@@ -508,6 +508,13 @@ class ADS1115AnalogReader:
         return round(value * 4.096 / 32768, 5)
 
 
+@dataclass(frozen=True)
+class KernelOneWireBus:
+    master: Path
+    gpio_bcm: int
+    evidence: tuple[str, ...]
+
+
 class TemperatureReader:
     """Temperature sensor readers for 1-Wire bus, bit-banged GPIO, and host CPU.
 
@@ -530,30 +537,49 @@ class TemperatureReader:
         self._sudo_command = sudo_command
         self._subprocess_run = subprocess_run
 
-    def configure_kernel_one_wire(self, bcm_pin: int, sensor_id: str = "") -> None:
+    def configure_kernel_one_wire(self, bcm_pin: int) -> None:
         if self.simulation:
             return
         bcm_pin = int(bcm_pin)
-        if sensor_id and self._kernel_sensor_visible(sensor_id):
-            self._configured_kernel_pins.add(bcm_pin)
+        if bcm_pin in self._configured_kernel_pins and self._kernel_bus_for_gpio(bcm_pin, required=False) is not None:
             return
-        if bcm_pin in self._configured_kernel_pins and self._one_wire_bus_masters():
+        if self._kernel_bus_for_gpio(bcm_pin, required=False) is not None:
+            self._configured_kernel_pins.add(bcm_pin)
             return
         if self._overlay_loaded_for_pin(bcm_pin):
             self._configured_kernel_pins.add(bcm_pin)
             return
         self._load_kernel_overlay_privileged(bcm_pin)
         self._configured_kernel_pins.add(bcm_pin)
-        self._wait_for_kernel_one_wire(bcm_pin, sensor_id=sensor_id)
+        self._wait_for_kernel_one_wire(bcm_pin)
 
     def read_one_wire_bus(self, sensor_id: str = "", *, bcm_pin: int | None = None) -> float:
+        if sensor_id:
+            raise HardwareUnavailable("DS18B20 ROM IDs are not user-configurable; read by sense-port GPIO instead.")
+        if bcm_pin is None:
+            raise HardwareUnavailable("Kernel 1-Wire reads require a sense-port BCM GPIO.")
+        return self.read_one_wire_gpio(bcm_pin)
+
+    def read_one_wire_gpio(self, bcm_pin: int) -> float:
         if self.simulation:
             return 78.0
-        resolved_id = self._resolve_one_wire_sensor_id(sensor_id)
-        path = self.one_wire_root / resolved_id / "w1_slave"
+        bus = self._kernel_bus_for_gpio(int(bcm_pin))
+        sensor_ids = self._one_wire_sensor_ids_for_bus(bus)
+        if not sensor_ids:
+            raise HardwareUnavailable(
+                f"No DS18B20 sensors were found on the verified kernel 1-Wire bus for BCM {bcm_pin}. "
+                f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
+            )
+        if len(sensor_ids) > 1:
+            raise HardwareUnavailable(
+                f"Multiple DS18B20 sensors are attached to the verified kernel 1-Wire bus for BCM {bcm_pin}: {sensor_ids}. "
+                "Attach exactly one DS18B20 per sense port."
+            )
+        resolved_id = sensor_ids[0]
+        path = self._one_wire_slave_path(bus, resolved_id)
         if not path.exists():
             raise HardwareUnavailable(
-                f"1-Wire sensor {resolved_id} is not present at {path}. "
+                f"1-Wire sensor {resolved_id} from BCM {bcm_pin} bus is not readable at {path}. "
                 f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
             )
         text = path.read_text(encoding="utf-8")
@@ -564,32 +590,151 @@ class TemperatureReader:
             raise ValueError(f"1-Wire sensor {resolved_id} returned no temperature marker.")
         return int(text.split(marker, 1)[1].strip()) / 1000 * 9 / 5 + 32
 
-    def _resolve_one_wire_sensor_id(self, sensor_id: str = "") -> str:
-        sensors = self._one_wire_sensor_ids()
-        if sensor_id:
-            if sensor_id in sensors:
-                return sensor_id
-            raise HardwareUnavailable(
-                f"Configured DS18B20 sensor ID {sensor_id!r} was not found on the kernel 1-Wire bus. "
-                f"{self._one_wire_diagnostics()}"
-            )
-        if len(sensors) == 1:
-            return sensors[0]
-        if not sensors:
-            raise HardwareUnavailable(f"No DS18B20 sensors were found on the kernel 1-Wire bus. {self._one_wire_diagnostics()}")
-        raise HardwareUnavailable(
-            "Multiple DS18B20 sensors were found; set the sense port sensor_id to the actual probe ID. "
-            f"{self._one_wire_diagnostics()}"
-        )
-
-    def _one_wire_sensor_ids(self) -> list[str]:
-        return sorted(path.name for path in self.one_wire_root.glob("28-*"))
-
     def _one_wire_bus_masters(self) -> list[Path]:
         return sorted(path for path in self.one_wire_root.glob("w1_bus_master*") if path.is_dir())
 
-    def _kernel_sensor_visible(self, sensor_id: str) -> bool:
-        return bool(sensor_id) and (self.one_wire_root / sensor_id / "w1_slave").exists()
+    def _kernel_bus_for_gpio(self, bcm_pin: int, *, required: bool = True) -> KernelOneWireBus | None:
+        matches: list[KernelOneWireBus] = []
+        for master in self._one_wire_bus_masters():
+            bus = self._kernel_bus_from_master(master)
+            if bus is not None and bus.gpio_bcm == bcm_pin:
+                matches.append(bus)
+        if len(matches) == 1:
+            return matches[0]
+        if not required:
+            return None
+        if not matches:
+            raise HardwareUnavailable(
+                f"No verified kernel 1-Wire bus is owned by BCM GPIO {bcm_pin}. "
+                f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
+            )
+        details = "; ".join(f"{item.master.name}: {', '.join(item.evidence)}" for item in matches)
+        raise HardwareUnavailable(f"Ambiguous kernel 1-Wire ownership for BCM GPIO {bcm_pin}: {details}.")
+
+    def _kernel_bus_from_master(self, master: Path) -> KernelOneWireBus | None:
+        driver_ok = False
+        compatible_ok = False
+        gpio_values: list[int] = []
+        evidence: list[str] = []
+        for candidate in self._kernel_bus_evidence_paths(master):
+            driver = self._driver_name(candidate)
+            if driver and driver.replace("_", "-") == "w1-gpio":
+                driver_ok = True
+                evidence.append(f"driver={driver}")
+            for of_node in self._of_node_paths(candidate):
+                compatible = self._read_of_node_compatible(of_node)
+                if any("w1-gpio" in item.replace("_", "-") for item in compatible):
+                    compatible_ok = True
+                    evidence.append(f"compatible={compatible}")
+                gpiopin = self._read_gpio_pin_property(of_node)
+                if gpiopin is not None:
+                    gpio_values.append(gpiopin)
+                    evidence.append(f"gpiopin={gpiopin}")
+                gpio_cells = self._read_gpio_cells(of_node / "gpios")
+                if gpio_cells:
+                    gpio_values.extend(gpio_cells)
+                    evidence.append(f"gpios={gpio_cells}")
+        verified = driver_ok or compatible_ok
+        unique_gpios = sorted(set(gpio_values))
+        if verified and len(unique_gpios) == 1:
+            return KernelOneWireBus(master, unique_gpios[0], tuple(dict.fromkeys(evidence)))
+        return None
+
+    def _kernel_bus_evidence_paths(self, master: Path) -> list[Path]:
+        paths: list[Path] = []
+        for path in (master, master / "device", master.resolve(strict=False), (master / "device").resolve(strict=False)):
+            for candidate in (path, *path.parents[:4]):
+                if candidate not in paths:
+                    paths.append(candidate)
+        return paths
+
+    @staticmethod
+    def _driver_name(path: Path) -> str:
+        driver = path / "driver"
+        if not driver.exists():
+            return ""
+        try:
+            return driver.resolve(strict=False).name
+        except OSError:
+            return driver.name
+
+    @staticmethod
+    def _of_node_paths(path: Path) -> list[Path]:
+        if path.name == "of_node" and path.exists():
+            return [path]
+        of_node = path / "of_node"
+        return [of_node] if of_node.exists() else []
+
+    @staticmethod
+    def _read_of_node_compatible(of_node: Path) -> list[str]:
+        path = of_node / "compatible"
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return []
+        return [item.decode("ascii", errors="ignore") for item in raw.split(b"\x00") if item]
+
+    def _read_gpio_pin_property(self, of_node: Path) -> int | None:
+        for name in ("gpiopin", "gpio-pin"):
+            path = of_node / name
+            if not path.exists():
+                continue
+            text_value = self._read_int_text(path)
+            if text_value is not None:
+                return text_value
+            cells = self._read_u32_cells(path)
+            if len(cells) == 1:
+                return cells[0]
+        return None
+
+    def _read_gpio_cells(self, path: Path) -> list[int]:
+        cells = self._read_u32_cells(path)
+        if len(cells) >= 3:
+            return cells[1::3]
+        if len(cells) == 1:
+            return cells
+        return []
+
+    @staticmethod
+    def _read_int_text(path: Path) -> int | None:
+        try:
+            text = path.read_text(encoding="ascii", errors="ignore").strip("\x00\r\n\t ")
+        except (OSError, UnicodeDecodeError):
+            return None
+        if not text or not re.fullmatch(r"0x[0-9a-fA-F]+|\d+", text):
+            return None
+        return int(text, 0)
+
+    @staticmethod
+    def _read_u32_cells(path: Path) -> list[int]:
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return []
+        if len(raw) < 4 or len(raw) % 4:
+            return []
+        return [int.from_bytes(raw[index : index + 4], "big") for index in range(0, len(raw), 4)]
+
+    def _one_wire_sensor_ids_for_bus(self, bus: KernelOneWireBus) -> list[str]:
+        slave_list = bus.master / "w1_master_slaves"
+        if slave_list.exists():
+            try:
+                return sorted(
+                    line.strip()
+                    for line in slave_list.read_text(encoding="ascii", errors="ignore").splitlines()
+                    if line.strip().startswith("28-")
+                )
+            except OSError:
+                pass
+        return sorted(path.name for path in bus.master.glob("28-*"))
+
+    def _one_wire_slave_path(self, bus: KernelOneWireBus, sensor_id: str) -> Path:
+        bus_path = bus.master / sensor_id / "w1_slave"
+        if bus_path.exists():
+            return bus_path
+        # The ID comes from the verified bus master, so this is only a sysfs
+        # layout fallback for kernels that expose slave directories at bus root.
+        return self.one_wire_root / sensor_id / "w1_slave"
 
     def _overlay_loaded_for_pin(self, bcm_pin: int) -> bool:
         dtoverlay = self._dtoverlay_path()
@@ -641,12 +786,10 @@ class TemperatureReader:
                 f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
             )
 
-    def _wait_for_kernel_one_wire(self, bcm_pin: int, *, sensor_id: str = "") -> None:
+    def _wait_for_kernel_one_wire(self, bcm_pin: int) -> None:
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
-            if sensor_id and self._kernel_sensor_visible(sensor_id):
-                return
-            if not sensor_id and self._one_wire_bus_masters():
+            if self._kernel_bus_for_gpio(bcm_pin, required=False) is not None:
                 return
             time.sleep(0.1)
         LOGGER.warning("Kernel 1-Wire overlay on BCM %s loaded but no expected DS18B20 appeared yet.", bcm_pin)
@@ -658,10 +801,16 @@ class TemperatureReader:
         return self._sudo_command or shutil.which("sudo") or "/usr/bin/sudo"
 
     def _one_wire_diagnostics(self, *, bcm_pin: int | None = None) -> str:
-        sensors = self._one_wire_sensor_ids()
-        buses = [path.name for path in self._one_wire_bus_masters()]
+        bus_details = []
+        for master in self._one_wire_bus_masters():
+            bus = self._kernel_bus_from_master(master)
+            if bus is None:
+                bus_details.append(f"{master.name}:unverified")
+            else:
+                sensors = self._one_wire_sensor_ids_for_bus(bus)
+                bus_details.append(f"{master.name}:gpio={bus.gpio_bcm}:sensors={sensors or 'none'}")
         target = f"target BCM GPIO {bcm_pin}; " if bcm_pin is not None else ""
-        return f"{target}visible DS18B20 IDs={sensors or 'none'}; bus masters={buses or 'none'}."
+        return f"{target}verified bus masters={bus_details or 'none'}."
 
     def read_bit_banged(self, bcm_pin: int) -> float:
         if self.simulation:
