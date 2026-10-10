@@ -5,10 +5,11 @@ import time
 
 import pytest
 
+from loggerhead.config import OneWireMode, SensePortDevice
 from loggerhead.drivers import HardwareFault, StepperRunResult
-from loggerhead.hardware import STEPPERS, AlarmPriority, DiagnosticHalt
+from loggerhead.hardware import STEPPERS, AlarmPriority, DiagnosticHalt, EquipmentKind, LevelState
 from loggerhead.service import LoggerheadService
-from loggerhead.state import AlarmState
+from loggerhead.state import AlarmState, EquipmentState
 
 
 def make_service(tmp_path) -> LoggerheadService:
@@ -22,6 +23,96 @@ def wait_for(predicate, timeout: float = 1.0) -> None:
             return
         time.sleep(0.01)
     raise AssertionError("condition was not reached before timeout")
+
+
+def test_sensor_polling_isolates_failures_and_recovers(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    port = service.config.sense_ports[0]
+    port.device = SensePortDevice.DS18B20
+    port.one_wire_mode = OneWireMode.BIT_BANG
+    port.check_frequency = 1.0
+    analog = service.config.sense_ports[1]
+    analog.device = SensePortDevice.ANALOG
+    analog.check_frequency = 1.0
+    reads = {"temperature": 0, "analog": 0}
+
+    def fail_then_recover(_bcm_pin: int) -> float:
+        reads["temperature"] += 1
+        if reads["temperature"] == 1:
+            raise RuntimeError("probe failed")
+        return 79.2
+
+    monkeypatch.setattr(service.temperature_reader, "read_bit_banged", fail_then_recover)
+
+    def read_voltage(_address: int, _channel: int) -> float:
+        reads["analog"] += 1
+        return 1.23
+
+    monkeypatch.setattr(service.analog_reader, "read_voltage", read_voltage)
+
+    service._poll_temperature(100.0)
+    service._poll_analog(100.0)
+
+    assert service.state.sensor_health["sense_port_1_temperature"].status == "read_error"
+    assert service.state.sensor_health["sense_port_2_analog"].status == "online"
+    assert service.state.readings["sense_port_2_analog"].value == 1.23
+
+    service._poll_temperature(101.1)
+
+    assert service.state.sensor_health["sense_port_1_temperature"].status == "online"
+    assert service.state.readings["sense_port_1_temperature"].value == 79.2
+
+
+def test_sensor_check_frequency_is_enforced(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    port = service.config.sense_ports[0]
+    port.device = SensePortDevice.DS18B20
+    port.one_wire_mode = OneWireMode.BIT_BANG
+    port.check_frequency = 30.0
+    calls = 0
+
+    def read_temperature(_bcm_pin: int) -> float:
+        nonlocal calls
+        calls += 1
+        return 78.0 + calls
+
+    monkeypatch.setattr(service.temperature_reader, "read_bit_banged", read_temperature)
+
+    service._poll_temperature(100.0)
+    service._poll_temperature(101.0)
+    service._poll_temperature(130.1)
+
+    assert calls == 2
+    assert service.state.readings["sense_port_1_temperature"].value == 80.0
+
+
+def test_temperature_sensor_failure_turns_dependent_heater_off(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    port = service.config.sense_ports[0]
+    port.device = SensePortDevice.DS18B20
+    port.one_wire_mode = OneWireMode.BIT_BANG
+    port.assigned_equipment = "ac1"
+    port.equipment_type = EquipmentKind.HEATER
+    service.state.equipment["ac1"] = EquipmentState("ac1", True)
+    monkeypatch.setattr(service.temperature_reader, "read_bit_banged", lambda _pin: (_ for _ in ()).throw(RuntimeError("lost bus")))
+
+    service._poll_temperature(100.0)
+
+    assert service.state.equipment["ac1"].on is False
+    assert service.state.sensor_health["sense_port_1_temperature"].status == "read_error"
+
+
+def test_water_sensor_failure_sets_unknown_for_ato_failsafe(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    port = service.config.sense_ports[0]
+    port.device = SensePortDevice.BINARY
+    service.state.water_levels["sense_port_1_water"] = LevelState.DRY
+    monkeypatch.setattr("loggerhead.service.BinaryLevelSensor.read_state", lambda _self: (_ for _ in ()).throw(RuntimeError("gpio failed")))
+
+    service._poll_water_levels(100.0)
+
+    assert service.state.water_levels["sense_port_1_water"] == LevelState.UNKNOWN
+    assert service.state.sensor_health["sense_port_1_water"].status == "read_error"
 
 
 def test_manual_priming_starts_all_pumps_with_configured_speed(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -40,3 +40,16 @@ def test_ato_locks_out_after_max_runtime() -> None:
     assert should_run is False
     assert ato_state.faulted is True
     assert alarm is not None
+
+
+def test_ato_fails_safe_when_any_level_sensor_unknown() -> None:
+    profile = ATOProfile("ato", "ATO", "primary", "backup", "mcp_relay", "pump", max_run_time=10)
+    state = RuntimeState()
+    state.water_levels["primary"] = LevelState.DRY
+    state.water_levels["backup"] = LevelState.UNKNOWN
+
+    should_run, ato_state, alarm = ATOController.evaluate(profile, state, now=100)
+
+    assert should_run is False
+    assert ato_state.running is False
+    assert alarm is None

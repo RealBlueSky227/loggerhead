@@ -5,7 +5,7 @@ import logging
 import signal
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +32,9 @@ from .drivers import (
     Buzzer,
     EzoPHSensor,
     HardwareFault,
+    HardwareUnavailable,
     HostHealthMonitor,
+    HydrosPulseReader,
     HydrosTripleClassifier,
     KasaHS300Client,
     MCP23017RelayBoard,
@@ -45,12 +47,13 @@ from .hardware import (
     AlarmPriority,
     DiagnosticHalt,
     EquipmentDriver,
+    LevelState,
     TemperatureDriver,
     WaterLevelDriver,
     require_stepper,
 )
 from .notifications import HomeAssistantNotifier, MQTTHomeAssistantBridge, NotificationLimiter, TelegramNotifier
-from .state import EquipmentState, SensorReading, StateStore
+from .state import EquipmentState, SensorHealth, SensorReading, StateStore
 from .web import DashboardServer
 
 LOGGER = logging.getLogger(__name__)
@@ -104,14 +107,10 @@ class LoggerheadService:
         self._prime_threads: dict[str, threading.Thread] = {}
         self._restart_suppressed_alarm_ids = self._active_audible_alarm_ids()
         self._level_since: dict[str, float] = {}
-        self._hydros: dict[str, HydrosTripleClassifier] = {
-            sensor.id: HydrosTripleClassifier(
-                debounce_samples=sensor.debounce_samples,
-                activity_timeout=sensor.activity_timeout,
-            )
-            for sensor in materialized_water_level_sensors(self.config)
-            if sensor.driver == WaterLevelDriver.HYDROS_TRIPLE
-        }
+        self._sensor_next_due: dict[str, float] = {}
+        self._hydros: dict[str, HydrosTripleClassifier] = {}
+        self._hydros_readers: dict[str, HydrosPulseReader] = {}
+        self._rebuild_sensor_runtime()
         self._last_polled_log = 0.0
         self._clear_transient_stepper_state()
         self._retire_manual_prime_limit_alarms()
@@ -162,6 +161,7 @@ class LoggerheadService:
             for name, action in (
                 ("stepper engine", self.stepper_engine.shutdown),
                 ("stepper ENN disable", self.relay_board.disable_all_steppers),
+                ("sensor callbacks", self._close_sensor_readers),
                 ("buzzer", self.buzzer.stop),
             ):
                 LOGGER.info("Shutdown phase: %s.", name)
@@ -195,6 +195,7 @@ class LoggerheadService:
                 "steppers": [asdict(item) for item in self.config.steppers],
                 "equipment": {key: asdict(value) for key, value in self.state.equipment.items()},
                 "readings": {key: asdict(value) for key, value in self.state.readings.items()},
+                "sensor_health": {key: asdict(value) for key, value in self.state.sensor_health.items()},
                 "water_levels": {key: value.value for key, value in self.state.water_levels.items()},
                 "alarms": {key: asdict(value) for key, value in self.state.alarms.items()},
                 "ato": {key: asdict(value) for key, value in self.state.ato.items()},
@@ -216,35 +217,24 @@ class LoggerheadService:
         self.config_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         self.config = load_config(self.config_path)
         save_config(self.config_path, self.config)
-        self._hydros = {
-            sensor.id: HydrosTripleClassifier(
-                debounce_samples=sensor.debounce_samples,
-                activity_timeout=sensor.activity_timeout,
-            )
-            for sensor in materialized_water_level_sensors(self.config)
-            if sensor.driver == WaterLevelDriver.HYDROS_TRIPLE
-        }
+        self._rebuild_sensor_runtime()
         self.store.log_event("config", "Configuration reloaded from UI.")
         return self.config
 
     def set_sense_port(self, number: int, payload: dict[str, Any]) -> None:
         port = next(item for item in self.config.sense_ports if item.number == number)
-        if "device" in payload:
-            port.device = SensePortDevice(payload["device"])
-        if "name" in payload:
-            port.name = str(payload["name"])
-        if "one_wire_mode" in payload:
-            port.one_wire_mode = OneWireMode(payload["one_wire_mode"])
+        field_names = {field.name for field in fields(port)}
+        for key, value in payload.items():
+            if key == "number" or key not in field_names:
+                continue
+            if key == "device":
+                value = SensePortDevice(value)
+            elif key == "one_wire_mode":
+                value = OneWireMode(value)
+            setattr(port, key, value)
         save_config(self.config_path, self.config)
         self.config = load_config(self.config_path)
-        self._hydros = {
-            sensor.id: HydrosTripleClassifier(
-                debounce_samples=sensor.debounce_samples,
-                activity_timeout=sensor.activity_timeout,
-            )
-            for sensor in materialized_water_level_sensors(self.config)
-            if sensor.driver == WaterLevelDriver.HYDROS_TRIPLE
-        }
+        self._rebuild_sensor_runtime()
         self.store.log_event("config", f"Sense Port {number} set to {port.device.value}.")
 
     def set_equipment(self, equipment_id: str, on: bool, *, source: str = "manual") -> None:
@@ -396,6 +386,41 @@ class LoggerheadService:
             self.state.stepper_active = None
             self.state.manual_priming = {item.id: False for item in self.config.steppers}
 
+    def _rebuild_sensor_runtime(self) -> None:
+        self._close_sensor_readers()
+        self._hydros = {}
+        self._hydros_readers = {}
+        for sensor in materialized_water_level_sensors(self.config):
+            if sensor.driver != WaterLevelDriver.HYDROS_TRIPLE:
+                continue
+            classifier = HydrosTripleClassifier(
+                debounce_samples=sensor.debounce_samples,
+                activity_timeout=sensor.activity_timeout,
+            )
+            self._hydros[sensor.id] = classifier
+            port = SENSE_PORTS[sensor.sense_port]
+            try:
+                self._hydros_readers[sensor.id] = HydrosPulseReader(
+                    port.digital_bcm,
+                    classifier,
+                    simulation=self.simulation,
+                )
+            except Exception as exc:
+                LOGGER.warning("HYDROS reader unavailable for %s on BCM %s: %s", sensor.id, port.digital_bcm, exc)
+        configured_ids = {sensor["id"] for sensor in self._configured_sensor_catalog()}
+        self._sensor_next_due = {key: value for key, value in self._sensor_next_due.items() if key in configured_ids}
+        with self._state_lock:
+            self.state.sensor_health = {
+                key: value for key, value in self.state.sensor_health.items() if key in configured_ids
+            }
+
+    def _close_sensor_readers(self) -> None:
+        for reader in self._hydros_readers.values():
+            try:
+                reader.close()
+            except Exception as exc:
+                LOGGER.warning("HYDROS callback cleanup failed: %s", exc)
+
     def _retire_manual_prime_limit_alarms(self) -> None:
         with self._state_lock:
             for alarm in self.state.alarms.values():
@@ -433,30 +458,167 @@ class LoggerheadService:
     def _save_state(self) -> None:
         self.state_store.save(self.state)
 
+    def _configured_sensor_catalog(self) -> list[dict[str, Any]]:
+        catalog: list[dict[str, Any]] = []
+        for item in materialized_water_level_sensors(self.config):
+            catalog.append(
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "kind": "water",
+                    "check_frequency": item.check_frequency,
+                    "stale_after": self._stale_after(item.check_frequency, item.activity_timeout),
+                }
+            )
+        for item in materialized_temperature_sensors(self.config):
+            catalog.append(
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "kind": "temperature",
+                    "check_frequency": item.check_frequency,
+                    "stale_after": self._stale_after(item.check_frequency),
+                }
+            )
+        for item in self.config.ph_sensors:
+            catalog.append(
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "kind": "ph",
+                    "check_frequency": item.check_frequency,
+                    "stale_after": self._stale_after(item.check_frequency),
+                }
+            )
+        for item in materialized_analog_sensors(self.config):
+            catalog.append(
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "kind": "analog",
+                    "check_frequency": item.check_frequency,
+                    "stale_after": self._stale_after(item.check_frequency),
+                }
+            )
+        return catalog
+
+    @staticmethod
+    def _stale_after(check_frequency: float, activity_timeout: float | None = None) -> float:
+        base = max(float(check_frequency) * 3, float(check_frequency) + 5.0, 5.0)
+        if activity_timeout is not None:
+            base = max(base, float(activity_timeout) * 2)
+        return base
+
+    def _sensor_due(self, sensor_id: str, check_frequency: float, now: float, *, stale_after: float | None = None) -> bool:
+        self._mark_sensor_stale_if_needed(sensor_id, now)
+        due_at = self._sensor_next_due.get(sensor_id, 0.0)
+        if now < due_at:
+            return False
+        frequency = max(0.1, float(check_frequency))
+        self._sensor_next_due[sensor_id] = now + frequency
+        health = self.state.sensor_health.setdefault(sensor_id, SensorHealth(sensor_id))
+        health.last_attempt_ts = now
+        health.stale_after_seconds = stale_after if stale_after is not None else self._stale_after(frequency)
+        if health.status == "initializing":
+            health.status = "initializing"
+        return True
+
+    def _mark_sensor_success(self, sensor_id: str, now: float, check_frequency: float, *, stale_after: float | None = None) -> None:
+        health = self.state.sensor_health.setdefault(sensor_id, SensorHealth(sensor_id))
+        health.status = "online"
+        health.last_success_ts = now
+        health.last_attempt_ts = now
+        health.last_error = ""
+        health.consecutive_failures = 0
+        health.stale_after_seconds = stale_after if stale_after is not None else self._stale_after(check_frequency)
+        reading = self.state.readings.get(sensor_id)
+        if reading:
+            reading.ok = True
+
+    def _mark_sensor_failure(self, sensor_id: str, now: float, exc: Exception, check_frequency: float, *, stale_after: float | None = None) -> None:
+        health = self.state.sensor_health.setdefault(sensor_id, SensorHealth(sensor_id))
+        health.status = "disconnected" if isinstance(exc, HardwareUnavailable) else "read_error"
+        health.last_attempt_ts = now
+        health.last_error = str(exc)
+        health.consecutive_failures += 1
+        health.stale_after_seconds = stale_after if stale_after is not None else self._stale_after(check_frequency)
+        reading = self.state.readings.get(sensor_id)
+        if reading:
+            reading.ok = False
+        LOGGER.warning("Sensor %s poll failed: %s", sensor_id, exc)
+        self.store.log_event("sensor", f"{sensor_id} {health.status}: {exc}", {"id": sensor_id, "status": health.status})
+
+    def _mark_sensor_stale_if_needed(self, sensor_id: str, now: float) -> bool:
+        health = self.state.sensor_health.get(sensor_id)
+        if not health or not health.last_success_ts or health.status in {"read_error", "disconnected"}:
+            return False
+        stale_after = health.stale_after_seconds or 30.0
+        if now - health.last_success_ts <= stale_after:
+            return False
+        health.status = "stale"
+        health.last_error = f"No successful reading for {now - health.last_success_ts:.1f}s."
+        reading = self.state.readings.get(sensor_id)
+        if reading:
+            reading.ok = False
+        return True
+
+    def _sensor_status(self, sensor_id: str, now: float) -> str:
+        self._mark_sensor_stale_if_needed(sensor_id, now)
+        return self.state.sensor_health.get(sensor_id, SensorHealth(sensor_id)).status
+
+    def _turn_off_equipment_if_on(self, equipment_id: str, *, source: str) -> None:
+        current = self.state.equipment.get(equipment_id)
+        if current is not None and not current.on:
+            return
+        try:
+            self.set_equipment(equipment_id, False, source=source)
+        except Exception as exc:
+            LOGGER.critical("Could not fail-safe equipment %s OFF after sensor fault: %s", equipment_id, exc)
+            self._activate_alarm(
+                f"equipment:{equipment_id}:failsafe",
+                f"Could not turn {equipment_id} off after sensor fault: {exc}",
+                priority="high",
+            )
+
     def _poll_loop(self) -> None:
         while not self._stop.is_set():
             now = time.time()
-            with self._state_lock:
-                self._poll_temperature(now)
-                self._poll_ph(now)
-                self._poll_analog(now)
-                self._poll_water_levels(now)
-                self._poll_health(now)
-                self._evaluate_ato(now)
-                self._sound_buzzer_if_needed(now)
-                self._publish_telemetry()
-                if now - self._last_polled_log >= self.config.database_poll_seconds:
-                    self._last_polled_log = now
-                    self._log_poll_snapshot(now)
-                if self.store.prune_if_critical():
-                    self._activate_alarm("storage:disk", "Primary filesystem free space is below warning threshold.", priority="high")
-                self._save_state()
+            try:
+                with self._state_lock:
+                    self._poll_temperature(now)
+                    self._poll_ph(now)
+                    self._poll_analog(now)
+                    self._poll_water_levels(now)
+                    self._poll_health(now)
+                    self._evaluate_ato(now)
+                    self._sound_buzzer_if_needed(now)
+                    self._publish_telemetry()
+                    if now - self._last_polled_log >= self.config.database_poll_seconds:
+                        self._last_polled_log = now
+                        self._log_poll_snapshot(now)
+                    if self.store.prune_if_critical():
+                        self._activate_alarm("storage:disk", "Primary filesystem free space is below warning threshold.", priority="high")
+                    self._save_state()
+            except Exception as exc:
+                LOGGER.exception("Polling loop iteration failed but will continue: %s", exc)
             self._stop.wait(1.0)
 
     def _poll_temperature(self, now: float) -> None:
         for sensor in materialized_temperature_sensors(self.config):
-            value = self._read_temperature(sensor)
+            stale_after = self._stale_after(sensor.check_frequency)
+            if not self._sensor_due(sensor.id, sensor.check_frequency, now, stale_after=stale_after):
+                if sensor.assigned_equipment and self._sensor_status(sensor.id, now) == "stale":
+                    self._turn_off_equipment_if_on(sensor.assigned_equipment, source="sensor_stale")
+                continue
+            try:
+                value = self._read_temperature(sensor)
+            except Exception as exc:
+                self._mark_sensor_failure(sensor.id, now, exc, sensor.check_frequency, stale_after=stale_after)
+                if sensor.assigned_equipment:
+                    self._turn_off_equipment_if_on(sensor.assigned_equipment, source="sensor_fault")
+                continue
             self.state.readings[sensor.id] = SensorReading(sensor.id, round(value, 3), "F", ts=now)
+            self._mark_sensor_success(sensor.id, now, sensor.check_frequency, stale_after=stale_after)
             self.store.log_value(f"temperature.{sensor.id}", value, unit="F", ts=now)
             alarm = AlertEvaluator.temperature_alarm(sensor, value, now)
             if alarm:
@@ -467,7 +629,15 @@ class LoggerheadService:
                 current = self.state.equipment.get(sensor.assigned_equipment, EquipmentState(sensor.assigned_equipment, False)).on
                 desired = ThermalController.evaluate(sensor, value, current)
                 if desired != current:
-                    self.set_equipment(sensor.assigned_equipment, desired, source="thermal")
+                    try:
+                        self.set_equipment(sensor.assigned_equipment, desired, source="thermal")
+                    except Exception as exc:
+                        LOGGER.exception("Thermal equipment command failed for %s: %s", sensor.assigned_equipment, exc)
+                        self._activate_alarm(
+                            f"equipment:{sensor.assigned_equipment}:thermal",
+                            f"Thermal control could not command {sensor.assigned_equipment}: {exc}",
+                            priority="high",
+                        )
 
     def _read_temperature(self, sensor) -> float:
         if sensor.driver == TemperatureDriver.ONE_WIRE_BUS:
@@ -482,22 +652,47 @@ class LoggerheadService:
 
     def _poll_ph(self, now: float) -> None:
         for sensor in self.config.ph_sensors:
-            value = self.ph_sensor.read_ph()
+            stale_after = self._stale_after(sensor.check_frequency)
+            if not self._sensor_due(sensor.id, sensor.check_frequency, now, stale_after=stale_after):
+                continue
+            try:
+                value = self.ph_sensor.read_ph()
+            except Exception as exc:
+                self._mark_sensor_failure(sensor.id, now, exc, sensor.check_frequency, stale_after=stale_after)
+                continue
             self.state.readings[sensor.id] = SensorReading(sensor.id, round(value, 3), "pH", ts=now)
+            self._mark_sensor_success(sensor.id, now, sensor.check_frequency, stale_after=stale_after)
             self.store.log_value(f"ph.{sensor.id}", value, unit="pH", ts=now)
 
     def _poll_water_levels(self, now: float) -> None:
         for sensor in materialized_water_level_sensors(self.config):
-            if sensor.driver == WaterLevelDriver.BINARY:
-                port = SENSE_PORTS[sensor.sense_port]
-                level = BinaryLevelSensor(port.digital_bcm, invert=sensor.invert_binary, simulation=self.simulation).read_state()
-            else:
-                classifier = self._hydros[sensor.id]
-                # Real edge capture is attached through pigpio callbacks on a Pi. Simulation exposes stable Normal.
-                level = classifier.observe_period_us(2520) if self.simulation else classifier.activity_state()
+            stale_after = self._stale_after(sensor.check_frequency, sensor.activity_timeout)
+            if not self._sensor_due(sensor.id, sensor.check_frequency, now, stale_after=stale_after):
+                if self._sensor_status(sensor.id, now) == "stale":
+                    self.state.water_levels[sensor.id] = LevelState.UNKNOWN
+                continue
+            try:
+                if sensor.driver == WaterLevelDriver.BINARY:
+                    port = SENSE_PORTS[sensor.sense_port]
+                    level = BinaryLevelSensor(port.digital_bcm, invert=sensor.invert_binary, simulation=self.simulation).read_state()
+                else:
+                    reader = self._hydros_readers.get(sensor.id)
+                    if reader is None:
+                        raise HardwareUnavailable(f"HYDROS PWM reader is unavailable for {sensor.id}.")
+                    level = reader.read_state()
+            except Exception as exc:
+                self._mark_sensor_failure(sensor.id, now, exc, sensor.check_frequency, stale_after=stale_after)
+                previous = self.state.water_levels.get(sensor.id)
+                self.state.water_levels[sensor.id] = LevelState.UNKNOWN
+                sensor.current_state = LevelState.UNKNOWN
+                if previous != LevelState.UNKNOWN:
+                    self._level_since[sensor.id] = now
+                    self.store.log_event("water_level", f"{sensor.name} read error; state set to unknown.", {"id": sensor.id})
+                continue
             previous = self.state.water_levels.get(sensor.id)
             self.state.water_levels[sensor.id] = level
             sensor.current_state = level
+            self._mark_sensor_success(sensor.id, now, sensor.check_frequency, stale_after=stale_after)
             if previous != level:
                 self._level_since[sensor.id] = now
                 self.store.log_event("water_level", f"{sensor.name} changed to {level.value}.", {"id": sensor.id})
@@ -517,7 +712,15 @@ class LoggerheadService:
             should_run, ato_state, alarm = ATOController.evaluate(profile, self.state, now)
             current = self.state.equipment.get(profile.assigned_actuator, EquipmentState(profile.assigned_actuator, False)).on
             if profile.assigned_actuator in {item.id for item in self.config.equipment} and should_run != current:
-                self.set_equipment(profile.assigned_actuator, should_run, source="ato")
+                try:
+                    self.set_equipment(profile.assigned_actuator, should_run, source="ato")
+                except Exception as exc:
+                    LOGGER.exception("ATO equipment command failed for %s: %s", profile.assigned_actuator, exc)
+                    self._activate_alarm(
+                        f"equipment:{profile.assigned_actuator}:ato",
+                        f"ATO could not command {profile.assigned_actuator}: {exc}",
+                        priority="high",
+                    )
             if alarm:
                 self._register_alarm(alarm)
                 self._notify("Loggerhead ATO", alarm.message)
@@ -618,10 +821,18 @@ class LoggerheadService:
 
     def _poll_analog(self, now: float) -> None:
         for sensor in materialized_analog_sensors(self.config):
-            port = SENSE_PORTS[sensor.sense_port]
-            raw = self.analog_reader.read_voltage(port.ads1115_address, port.analog_channel)
-            value = raw * sensor.scale + sensor.offset
+            stale_after = self._stale_after(sensor.check_frequency)
+            if not self._sensor_due(sensor.id, sensor.check_frequency, now, stale_after=stale_after):
+                continue
+            try:
+                port = SENSE_PORTS[sensor.sense_port]
+                raw = self.analog_reader.read_voltage(port.ads1115_address, port.analog_channel)
+                value = raw * sensor.scale + sensor.offset
+            except Exception as exc:
+                self._mark_sensor_failure(sensor.id, now, exc, sensor.check_frequency, stale_after=stale_after)
+                continue
             self.state.readings[sensor.id] = SensorReading(sensor.id, round(value, 3), sensor.unit, ts=now)
+            self._mark_sensor_success(sensor.id, now, sensor.check_frequency, stale_after=stale_after)
             self.store.log_value(f"analog.{sensor.id}", value, unit=sensor.unit, ts=now)
 
     def _publish_telemetry(self) -> None:
@@ -649,13 +860,50 @@ class LoggerheadService:
     def _sensor_catalog(self) -> list[dict[str, Any]]:
         catalog = []
         for item in materialized_water_level_sensors(self.config):
-            catalog.append({"id": item.id, "name": item.name, "kind": "water", "main": True, "desired": item.desired_state.value})
+            catalog.append(
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "kind": "water",
+                    "main": True,
+                    "desired": item.desired_state.value,
+                    "check_frequency": item.check_frequency,
+                    "stale_after": self._stale_after(item.check_frequency, item.activity_timeout),
+                }
+            )
         for item in materialized_temperature_sensors(self.config):
-            catalog.append({"id": item.id, "name": item.name, "kind": "temperature", "main": item.driver != TemperatureDriver.HOST_CPU})
+            catalog.append(
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "kind": "temperature",
+                    "main": item.driver != TemperatureDriver.HOST_CPU,
+                    "check_frequency": item.check_frequency,
+                    "stale_after": self._stale_after(item.check_frequency),
+                }
+            )
         for item in self.config.ph_sensors:
-            catalog.append({"id": item.id, "name": item.name, "kind": "ph", "main": True})
+            catalog.append(
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "kind": "ph",
+                    "main": True,
+                    "check_frequency": item.check_frequency,
+                    "stale_after": self._stale_after(item.check_frequency),
+                }
+            )
         for item in materialized_analog_sensors(self.config):
-            catalog.append({"id": item.id, "name": item.name, "kind": "analog", "main": True})
+            catalog.append(
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "kind": "analog",
+                    "main": True,
+                    "check_frequency": item.check_frequency,
+                    "stale_after": self._stale_after(item.check_frequency),
+                }
+            )
         return catalog
 
     def _diagnostics(self) -> dict[str, Any]:

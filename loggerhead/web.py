@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -53,7 +54,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True})
             elif parsed.path == "/api/config":
                 config = self.server.service.update_config(payload)
-                self._send_json({"ok": True, "config": config})
+                self._send_json({"ok": True, "config": asdict(config)})
             elif parsed.path == "/api/sense-port":
                 self.server.service.set_sense_port(int(payload["number"]), payload)
                 self._send_json({"ok": True})
@@ -134,6 +135,7 @@ INDEX_HTML = r"""<!doctype html>
     h1 { font-size: 20px; margin: 0; letter-spacing: 0; }
     nav { display: flex; gap: 8px; }
     button, select, input { background: #0d1419; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 9px 11px; font: inherit; }
+    input[type="checkbox"] { width: 18px; height: 18px; }
     button { cursor: pointer; min-width: 40px; }
     button.active, .filled { background: var(--ok); color: #031008; border-color: var(--ok); font-weight: 700; }
     button.danger { background: var(--hot); color: #fff; border-color: var(--hot); font-weight: 700; }
@@ -160,6 +162,14 @@ INDEX_HTML = r"""<!doctype html>
     textarea { width: 100%; min-height: 360px; background: #080d11; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
     .alarm { border-color: var(--warn); }
     .diag { border-color: #31505a; }
+    .field-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-top: 10px; }
+    .field-grid label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+    .field-grid label span { color: var(--muted); }
+    .message { min-height: 24px; color: var(--muted); }
+    .message.error { color: var(--hot); }
+    .message.ok { color: var(--ok); }
+    .status-line { color: var(--muted); font-size: 12px; margin-top: 8px; }
+    .value.warn { color: var(--warn); }
     @media (max-width: 640px) { header { align-items: flex-start; flex-direction: column; gap: 12px; } .clock { font-size: 24px; } main { padding: 12px; } }
   </style>
 </head>
@@ -212,16 +222,41 @@ INDEX_HTML = r"""<!doctype html>
     </section>
     <section id="config" hidden>
       <h2>Sense Ports</h2>
+      <div class="toolbar">
+        <button id="saveSensePorts">Save Sensors</button>
+        <button id="cancelSensePorts" class="hollow">Cancel</button>
+        <span id="sensePortMessage" class="message"></span>
+      </div>
       <div id="sensePorts" class="grid"></div>
       <h2>Raw Config</h2>
       <textarea id="configText"></textarea>
-      <div class="toolbar"><button id="saveConfig">Save Config</button></div>
+      <div class="toolbar">
+        <button id="saveConfig">Save Config</button>
+        <button id="cancelConfig" class="hollow">Cancel</button>
+        <span id="configMessage" class="message"></span>
+      </div>
     </section>
   </main>
   <script>
     let status = {};
     let lastStatusAt = 0;
+    let rawConfigDirty = false;
+    let sensorEditorDirty = false;
+    let sensorDrafts = [];
+    let lastSensePortHash = "";
     const $ = (id) => document.getElementById(id);
+    const clone = (value) => JSON.parse(JSON.stringify(value));
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+    const DEVICE_OPTIONS = [
+      ["empty", "Empty"],
+      ["hydros_triple", "HYDROS triple optical PWM"],
+      ["binary", "Binary float/switch"],
+      ["ds18b20", "DS18B20 temperature"],
+      ["analog", "Analog voltage"],
+    ];
+    const WIRE_OPTIONS = [["bit_bang", "GPIO bit-bang"], ["kernel", "Kernel 1-Wire"]];
+    const LEVEL_OPTIONS = [["dry", "Dry"], ["low", "Low"], ["normal", "Normal"], ["high", "High"], ["submerged", "Submerged"], ["wet", "Wet"]];
+    const EQUIPMENT_TYPES = [["heater", "Heater"], ["chiller", "Chiller"], ["fan", "Fan"], ["generic", "Generic"]];
     document.querySelectorAll("[data-tab]").forEach(btn => btn.onclick = () => {
       document.querySelectorAll("[data-tab]").forEach(b => b.classList.toggle("active", b === btn));
       ["dash","plots","diagnostics","config"].forEach(id => $(id).hidden = id !== btn.dataset.tab);
@@ -232,20 +267,75 @@ INDEX_HTML = r"""<!doctype html>
       await fetch("/api/alarm/enabled", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({enabled: !status.config.buzzer.alarm_enabled})});
       await refresh();
     };
+    $("configText").oninput = () => { rawConfigDirty = true; setMessage("configMessage", "Unsaved raw config changes."); };
     $("saveConfig").onclick = async () => {
-      await fetch("/api/config", {method:"POST", headers:{"Content-Type":"application/json"}, body:$("configText").value});
-      await refresh();
+      try {
+        const payload = JSON.parse($("configText").value);
+        const result = await apiPost("/api/config", payload);
+        status.config = result.config;
+        rawConfigDirty = false;
+        sensorEditorDirty = false;
+        setMessage("configMessage", "Config saved.", "ok");
+        await refresh();
+      } catch (error) {
+        setMessage("configMessage", error.message, "error");
+      }
+    };
+    $("cancelConfig").onclick = () => {
+      rawConfigDirty = false;
+      $("configText").value = JSON.stringify(status.config, null, 2);
+      setMessage("configMessage", "Raw config changes canceled.");
+    };
+    $("saveSensePorts").onclick = saveSensePorts;
+    $("cancelSensePorts").onclick = () => {
+      sensorEditorDirty = false;
+      loadSensePortDrafts(true);
+      setMessage("sensePortMessage", "Sensor changes canceled.");
     };
     $("loadPlot").onclick = loadPlot;
-    function card(label, value, cls="") { return `<div class="card ${cls}"><div class="label">${label}</div><div class="value ${cls}">${value}</div></div>`; }
+    async function apiPost(path, payload) {
+      const response = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok || body.ok === false) throw new Error(body.message || `${response.status} ${response.statusText}`);
+      return body;
+    }
+    function setMessage(id, text, cls="") {
+      const el = $(id);
+      el.textContent = text || "";
+      el.className = `message ${cls}`;
+    }
+    function card(label, value, cls="", detail="") {
+      return `<div class="card ${cls}"><div class="label">${esc(label)}</div><div class="value ${cls}">${esc(value)}</div>${detail ? `<div class="status-line">${esc(detail)}</div>` : ""}</div>`;
+    }
+    function healthFor(id) {
+      return status.sensor_health?.[id] || {status: "initializing", last_error: ""};
+    }
+    function statusLabel(health) {
+      return {
+        initializing: "Initializing",
+        online: "Online",
+        read_error: "Read Error",
+        disconnected: "Disconnected",
+        stale: "Stale",
+      }[health.status] || "Initializing";
+    }
+    function statusClass(health) {
+      if (health.status === "online") return "";
+      if (health.status === "initializing") return "off";
+      if (health.status === "stale") return "warn";
+      return "hot";
+    }
     function readingFor(sensor) {
+      const health = healthFor(sensor.id);
+      const detail = health.last_error || statusLabel(health);
       if (sensor.kind === "water") {
-        const value = status.water_levels[sensor.id] || "waiting";
+        if (health.status !== "online") return card(sensor.name, statusLabel(health), statusClass(health), detail);
+        const value = status.water_levels[sensor.id] || "initializing";
         const cls = value === sensor.desired ? "" : "hot";
         return card(sensor.name, value.replaceAll("_", " "), cls);
       }
       const reading = status.readings[sensor.id];
-      if (!reading) return card(sensor.name, "waiting", "off");
+      if (!reading || health.status !== "online") return card(sensor.name, statusLabel(health), statusClass(health), detail);
       let cls = "";
       if (sensor.kind === "temperature" && typeof reading.value === "number") {
         if (reading.value > 82 && sensor.main) cls = "hot";
@@ -267,19 +357,8 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       $("clock").textContent = new Date(status.time * 1000).toLocaleString();
-      $("configText").value = JSON.stringify(status.config, null, 2);
-      $("sensePorts").innerHTML = status.sense_ports.map(port => `
-        <div class="card">
-          <div class="label">Sense Port ${port.number}</div>
-          <input value="${port.name || ""}" placeholder="Name" onchange="updateSensePort(${port.number}, {name:this.value})">
-          <select onchange="updateSensePort(${port.number}, {device:this.value})">
-            ${["empty","hydros_triple","binary","ds18b20","analog"].map(v => `<option value="${v}" ${port.device === v ? "selected" : ""}>${v.replaceAll("_", " ")}</option>`).join("")}
-          </select>
-          <select onchange="updateSensePort(${port.number}, {one_wire_mode:this.value})">
-            ${["bit_bang","kernel"].map(v => `<option value="${v}" ${port.one_wire_mode === v ? "selected" : ""}>${v.replaceAll("_", " ")}</option>`).join("")}
-          </select>
-        </div>
-      `).join("");
+      if (!rawConfigDirty && document.activeElement !== $("configText")) $("configText").value = JSON.stringify(status.config, null, 2);
+      loadSensePortDrafts(false);
       $("alarmToggle").textContent = status.config.buzzer.alarm_enabled ? "Alarm Enabled" : "Alarm Disabled";
       $("alarmToggle").className = status.config.buzzer.alarm_enabled ? "filled" : "danger";
       $("readings").innerHTML = status.sensor_catalog.filter(s => s.main).map(readingFor).join("");
@@ -306,9 +385,107 @@ INDEX_HTML = r"""<!doctype html>
       await fetch("/api/prime", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id, on})});
       await refresh();
     }
-    async function updateSensePort(number, patch) {
-      await fetch("/api/sense-port", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({number, ...patch})});
-      await refresh();
+    function loadSensePortDrafts(force) {
+      const hash = JSON.stringify(status.sense_ports || []);
+      const focused = $("sensePorts").contains(document.activeElement);
+      if (!force && (sensorEditorDirty || focused || hash === lastSensePortHash)) return;
+      sensorDrafts = clone(status.sense_ports || []);
+      lastSensePortHash = hash;
+      renderSensePorts();
+    }
+    function renderSensePorts() {
+      $("sensePorts").innerHTML = sensorDrafts.map(renderSensePort).join("");
+    }
+    function optionList(options, current) {
+      return options.map(([value, label]) => `<option value="${value}" ${current === value ? "selected" : ""}>${esc(label)}</option>`).join("");
+    }
+    function equipmentOptions(current) {
+      const items = [["", "None"], ...(status.config?.equipment || []).map(item => [item.id, item.name || item.id])];
+      return optionList(items, current || "");
+    }
+    function textField(port, key, label, type="text") {
+      return `<label><span>${esc(label)}</span><input type="${type}" value="${esc(port[key] ?? "")}" oninput="updatePortDraft(${port.number}, '${key}', this.value)"></label>`;
+    }
+    function selectField(port, key, label, options) {
+      return `<label><span>${esc(label)}</span><select onchange="updatePortDraft(${port.number}, '${key}', this.value)">${optionList(options, port[key])}</select></label>`;
+    }
+    function checkboxField(port, key, label) {
+      return `<label><span>${esc(label)}</span><input type="checkbox" ${port[key] ? "checked" : ""} onchange="updatePortDraft(${port.number}, '${key}', this.checked)"></label>`;
+    }
+    function renderSensePort(port) {
+      const fields = [
+        textField(port, "name", "Name"),
+        selectField(port, "device", "Device", DEVICE_OPTIONS),
+        textField(port, "check_frequency", "Check seconds", "number"),
+      ];
+      if (port.device === "ds18b20") {
+        fields.push(
+          selectField(port, "one_wire_mode", "DS18B20 backend", WIRE_OPTIONS),
+          textField(port, "sensor_id", "DS18B20 ID"),
+          textField(port, "target_temp", "Target F", "number"),
+          textField(port, "hysteresis", "Hysteresis F", "number"),
+          textField(port, "alert_below", "Alert below F", "number"),
+          textField(port, "alert_above", "Alert above F", "number"),
+          textField(port, "emergency_below", "Emergency below F", "number"),
+          textField(port, "emergency_above", "Emergency above F", "number"),
+          `<label><span>Assigned equipment</span><select onchange="updatePortDraft(${port.number}, 'assigned_equipment', this.value)">${equipmentOptions(port.assigned_equipment)}</select></label>`,
+          selectField(port, "equipment_type", "Equipment type", EQUIPMENT_TYPES),
+        );
+      }
+      if (port.device === "hydros_triple" || port.device === "binary") {
+        fields.push(
+          selectField(port, "desired_state", "Desired state", LEVEL_OPTIONS),
+          textField(port, "alert_wait", "Alert delay seconds", "number"),
+          textField(port, "alert_frequency", "Alert repeat seconds", "number"),
+        );
+      }
+      if (port.device === "hydros_triple") {
+        fields.push(
+          textField(port, "activity_timeout", "Activity timeout seconds", "number"),
+          textField(port, "debounce_samples", "Debounce samples", "number"),
+        );
+      }
+      if (port.device === "binary") fields.push(checkboxField(port, "invert_binary", "Invert input"));
+      if (port.device === "analog") {
+        fields.push(
+          textField(port, "analog_unit", "Unit"),
+          textField(port, "analog_scale", "Scale", "number"),
+          textField(port, "analog_offset", "Offset", "number"),
+        );
+      }
+      const mode = port.device === "ds18b20" ? `DS18B20 ${port.one_wire_mode.replaceAll("_", " ")}` : port.device.replaceAll("_", " ");
+      return `<div class="card"><div class="label">Sense Port ${port.number}</div><div class="status-line">${esc(mode)}</div><div class="field-grid">${fields.join("")}</div></div>`;
+    }
+    function updatePortDraft(number, key, value) {
+      const port = sensorDrafts.find(item => item.number === number);
+      if (!port) return;
+      port[key] = value;
+      sensorEditorDirty = true;
+      setMessage("sensePortMessage", "Unsaved sensor changes.");
+      if (key === "device") renderSensePorts();
+    }
+    function portForSave(port) {
+      const next = clone(port);
+      const numeric = ["check_frequency","alert_wait","alert_frequency","activity_timeout","target_temp","hysteresis","alert_above","alert_below","emergency_above","emergency_below","analog_scale","analog_offset"];
+      numeric.forEach(key => { if (key in next) next[key] = Number(next[key]); });
+      if ("debounce_samples" in next) next.debounce_samples = Number.parseInt(next.debounce_samples, 10);
+      next.invert_binary = !!next.invert_binary;
+      return next;
+    }
+    async function saveSensePorts() {
+      try {
+        const next = clone(status.config);
+        next.sense_ports = sensorDrafts.map(portForSave);
+        const result = await apiPost("/api/config", next);
+        status.config = result.config;
+        status.sense_ports = result.config.sense_ports;
+        sensorEditorDirty = false;
+        setMessage("sensePortMessage", "Sensors saved.", "ok");
+        loadSensePortDrafts(true);
+        await refresh();
+      } catch (error) {
+        setMessage("sensePortMessage", error.message, "error");
+      }
     }
     async function loadPlot() {
       const selected = [...$("plotStream").selectedOptions].map(o => `stream=${encodeURIComponent(o.value)}`).join("&");

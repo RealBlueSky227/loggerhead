@@ -397,20 +397,25 @@ def validate_config(config: AppConfig) -> None:
     for item in config.ph_sensors:
         if item.i2c_address != PH_EZO_I2C_ADDRESS:
             raise DiagnosticHalt("The pH interface is fixed to EZO address 0x63.")
+        _validate_positive_frequency(item.check_frequency, f"pH sensor {item.id}")
     port_numbers = {item.number for item in config.sense_ports}
     if len(port_numbers) != len(config.sense_ports):
         raise DiagnosticHalt("Sense port entries must be unique.")
     for item in config.sense_ports:
         require_sense_port(item.number)
+        _validate_sense_port_profile(item, equipment_ids)
     for item in materialized_analog:
         require_sense_port(item.sense_port)
+        _validate_positive_frequency(item.check_frequency, f"Analog sensor {item.id}")
     for item in materialized_temperature:
         if item.sense_port is not None:
             require_sense_port(item.sense_port)
+        _validate_temperature_profile(item, equipment_ids)
         if item.assigned_equipment and item.assigned_equipment not in equipment_ids:
             raise DiagnosticHalt(f"Temperature sensor {item.id} references unknown equipment {item.assigned_equipment}.")
     for item in materialized_water:
         require_sense_port(item.sense_port)
+        _validate_water_profile(item)
     for item in config.steppers:
         require_stepper(item.assignment)
         if item.hold_current_ma < 0:
@@ -459,6 +464,57 @@ def validate_config(config: AppConfig) -> None:
             raise DiagnosticHalt(f"ATO {item.id} references unknown backup sensor {item.backup_failsafe_sensor}.")
         if item.assigned_actuator not in equipment_ids and item.assigned_actuator not in stepper_ids:
             raise DiagnosticHalt(f"ATO {item.id} references unknown actuator {item.assigned_actuator}.")
+
+
+def _validate_positive_frequency(value: float, name: str) -> None:
+    try:
+        frequency = float(value)
+    except (TypeError, ValueError) as exc:
+        raise DiagnosticHalt(f"{name} check frequency must be numeric.") from exc
+    if frequency <= 0:
+        raise DiagnosticHalt(f"{name} check frequency must be greater than zero seconds.")
+
+
+def _validate_sense_port_profile(item: SensePortProfile, equipment_ids: set[str]) -> None:
+    _validate_positive_frequency(item.check_frequency, f"Sense Port {item.number}")
+    item.alert_wait = float(item.alert_wait)
+    item.alert_frequency = float(item.alert_frequency)
+    item.activity_timeout = float(item.activity_timeout)
+    item.debounce_samples = int(item.debounce_samples)
+    item.analog_scale = float(item.analog_scale)
+    item.analog_offset = float(item.analog_offset)
+    if item.alert_wait < 0 or item.alert_frequency <= 0:
+        raise DiagnosticHalt("Sense port alert delay must be non-negative and alert frequency must be positive.")
+    if item.activity_timeout <= 0:
+        raise DiagnosticHalt("HYDROS activity timeout must be greater than zero.")
+    if item.debounce_samples <= 0:
+        raise DiagnosticHalt("HYDROS debounce samples must be greater than zero.")
+    if item.emergency_below > item.alert_below or item.alert_below >= item.alert_above or item.alert_above >= item.emergency_above:
+        raise DiagnosticHalt("Temperature alert thresholds must be ordered emergency_low < alert_low < alert_high < emergency_high.")
+    if item.assigned_equipment and item.assigned_equipment not in equipment_ids:
+        raise DiagnosticHalt(f"Sense Port {item.number} references unknown equipment {item.assigned_equipment}.")
+
+
+def _validate_temperature_profile(item: TemperatureSensorProfile, equipment_ids: set[str]) -> None:
+    _validate_positive_frequency(item.check_frequency, f"Temperature sensor {item.id}")
+    if item.emergency_below > item.alert_below or item.alert_below >= item.alert_above or item.alert_above >= item.emergency_above:
+        raise DiagnosticHalt(f"Temperature sensor {item.id} thresholds must be ordered.")
+    if item.assigned_equipment and item.assigned_equipment not in equipment_ids:
+        raise DiagnosticHalt(f"Temperature sensor {item.id} references unknown equipment {item.assigned_equipment}.")
+
+
+def _validate_water_profile(item: WaterLevelSensorProfile) -> None:
+    _validate_positive_frequency(item.check_frequency, f"Water level sensor {item.id}")
+    item.alert_wait = float(item.alert_wait)
+    item.alert_frequency = float(item.alert_frequency)
+    item.activity_timeout = float(item.activity_timeout)
+    item.debounce_samples = int(item.debounce_samples)
+    if item.alert_wait < 0 or item.alert_frequency <= 0:
+        raise DiagnosticHalt(f"Water level sensor {item.id} alert delay must be non-negative and alert frequency must be positive.")
+    if item.activity_timeout <= 0:
+        raise DiagnosticHalt(f"Water level sensor {item.id} activity timeout must be greater than zero.")
+    if item.debounce_samples <= 0:
+        raise DiagnosticHalt(f"Water level sensor {item.id} debounce samples must be greater than zero.")
 
 
 def materialized_temperature_sensors(config: AppConfig) -> list[TemperatureSensorProfile]:

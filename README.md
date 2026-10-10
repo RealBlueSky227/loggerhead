@@ -8,9 +8,9 @@ The runtime is intentionally safe to import and test on non-Pi systems. Hardware
 
 ## What it does
 
-- Temperature sensing through kernel 1-Wire, bit-banged 1-Wire hooks, and host CPU thermal files.
+- Temperature sensing through kernel 1-Wire, GPIO bit-banged DS18B20 reads, and host CPU thermal files.
 - EZO pH readings over I2C address `0x63`.
-- Binary level sensors and Hydros Triple PWM period classification with debouncing and inactivity faults.
+- Binary level sensors and Hydros Triple PWM pulse capture with debouncing and inactivity faults.
 - MCP23017 relay control with normally-open/normally-closed polarity mapping.
 - Kasa HS300 LAN control using TP-Link XOR framing on TCP port `9999`.
 - Heater, chiller, and fan hysteresis automation.
@@ -46,6 +46,10 @@ Open `http://127.0.0.1:8080`.
 On first run, Loggerhead creates `config/loggerhead.json` with a safe default map matching the SRS hardware layout. Any attempt to configure pins, relay names, pH address, Kasa outlet indexes, stepper assignments, or buzzer pins outside the fixed map raises a diagnostic halt before hardware initialization.
 
 The dashboard Config tab writes the same JSON configuration and reloads active service state without requiring a process restart.
+
+Sensor polling is per-sensor. A failed temperature, water-level, pH, or analog read is isolated, recorded in sensor health, and shown as Initializing, Online, Read Error, Disconnected, or Stale in the dashboard. Dependent heaters/chillers/fans and ATO outputs fail off when their input sensor is unavailable or stale.
+
+Hardware note: kernel 1-Wire is the preferred DS18B20 backend on a Pi because the kernel owns the strict timing. The bit-banged DS18B20 backend is implemented directly on the configured GPIO using pigpio-compatible pin control, but it remains more timing-sensitive under Linux load. HYDROS triple-optical sensors are read as PWM pulse periods on the sense-port GPIO; they are not routed through DS18B20/kernel 1-Wire.
 
 ## Hardware Map
 

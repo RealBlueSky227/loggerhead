@@ -92,6 +92,10 @@ class ATOController:
 
         primary = state.water_levels.get(profile.primary_level_sensor, LevelState.UNKNOWN)
         backup = state.water_levels.get(profile.backup_failsafe_sensor, LevelState.UNKNOWN)
+        if primary in {LevelState.UNKNOWN, LevelState.INACTIVE} or backup in {LevelState.UNKNOWN, LevelState.INACTIVE}:
+            ato_state.running = False
+            ato_state.started_at = None
+            return False, ato_state, None
         backup_wet = backup in {LevelState.WET, LevelState.SUBMERGED, LevelState.NORMAL, LevelState.HIGH}
 
         if backup_wet:

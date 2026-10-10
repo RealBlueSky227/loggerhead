@@ -82,6 +82,69 @@ class HydrosTripleClassifier:
         return self.state
 
 
+class HydrosPulseReader:
+    """Reads HYDROS triple-optical PWM periods with pigpio edge callbacks."""
+
+    def __init__(
+        self,
+        bcm_pin: int,
+        classifier: HydrosTripleClassifier,
+        *,
+        simulation: bool = False,
+        pigpio_module: Any | None = None,
+    ) -> None:
+        self.bcm_pin = bcm_pin
+        self.classifier = classifier
+        self.simulation = simulation
+        self.pi = None
+        self._callback = None
+        self._last_rising_tick: int | None = None
+        self._lock = threading.RLock()
+        if not simulation:
+            try:
+                pigpio = pigpio_module
+                if pigpio is None:
+                    import pigpio as pigpio_import  # type: ignore
+
+                    pigpio = pigpio_import
+                self.pi = pigpio.pi()
+                if not self.pi.connected:
+                    raise HardwareUnavailable("pigpiod is not connected.")
+                self.pi.set_mode(self.bcm_pin, getattr(pigpio, "INPUT", 0))
+                if hasattr(self.pi, "set_pull_up_down") and hasattr(pigpio, "PUD_UP"):
+                    self.pi.set_pull_up_down(self.bcm_pin, pigpio.PUD_UP)
+                edge = getattr(pigpio, "RISING_EDGE", 1)
+                self._callback = self.pi.callback(self.bcm_pin, edge, self._on_edge)
+            except Exception as exc:
+                raise HardwareUnavailable(f"HYDROS PWM capture unavailable on BCM {self.bcm_pin}: {exc}") from exc
+
+    @staticmethod
+    def _tick_diff(previous: int, current: int) -> int:
+        return (current - previous) & 0xFFFFFFFF
+
+    def _on_edge(self, _gpio: int, level: int, tick: int) -> None:
+        if level not in {1, 2}:  # 2 is pigpio watchdog timeout; ignore it for period capture.
+            return
+        if level == 2:
+            return
+        with self._lock:
+            if self._last_rising_tick is not None:
+                period_us = self._tick_diff(self._last_rising_tick, tick)
+                self.classifier.observe_period_us(period_us)
+            self._last_rising_tick = tick
+
+    def read_state(self) -> LevelState:
+        if self.simulation:
+            return self.classifier.observe_period_us(2520)
+        return self.classifier.activity_state()
+
+    def close(self) -> None:
+        callback = self._callback
+        self._callback = None
+        if callback is not None and hasattr(callback, "cancel"):
+            callback.cancel()
+
+
 class KasaHS300Client:
     """TP-Link Kasa HS300 local TCP client.
 
@@ -331,12 +394,13 @@ class EzoPHSensor:
 
                 self.bus = SMBus(bus_id)
             except Exception as exc:
-                LOGGER.warning("EZO pH I2C unavailable, falling back to simulation: %s", exc)
-                self.simulation = True
+                LOGGER.warning("EZO pH I2C unavailable: %s", exc)
 
     def read_ph(self) -> float:
-        if self.simulation or not self.bus:
+        if self.simulation:
             return 8.1
+        if not self.bus:
+            raise HardwareUnavailable("EZO pH I2C bus is unavailable.")
         self.bus.write_i2c_block_data(self.address, ord("R"), [])
         time.sleep(0.9)
         data = bytes(self.bus.read_i2c_block_data(self.address, 0, 32))
@@ -362,14 +426,15 @@ class ADS1115AnalogReader:
 
                 self.bus = SMBus(bus_id)
             except Exception as exc:
-                LOGGER.warning("ADS1115 I2C unavailable, falling back to simulation: %s", exc)
-                self.simulation = True
+                LOGGER.warning("ADS1115 I2C unavailable: %s", exc)
 
     def read_voltage(self, address: int, channel: int) -> float:
         if channel < 0 or channel > 3:
             raise DiagnosticHalt(f"ADS1115 channel {channel} is outside AIN0-AIN3.")
-        if self.simulation or not self.bus:
+        if self.simulation:
             return round(1.0 + channel * 0.25, 3)
+        if not self.bus:
+            raise HardwareUnavailable("ADS1115 I2C bus is unavailable.")
         mux = 0x04 + channel
         config = 0x8000 | (mux << 12) | 0x0200 | 0x0100 | 0x0080 | 0x0003
         self.bus.write_i2c_block_data(address, self.CONFIG_REGISTER, [(config >> 8) & 0xFF, config & 0xFF])
@@ -406,11 +471,15 @@ class TemperatureReader:
         time.sleep(1.0)
 
     def read_one_wire_bus(self, sensor_id: str = "") -> float:
+        if self.simulation:
+            return 78.0
         resolved_id = sensor_id or self._first_one_wire_sensor_id()
         path = Path("/sys/bus/w1/devices") / resolved_id / "w1_slave"
-        if self.simulation or not path.exists():
-            return 78.0
+        if not path.exists():
+            raise HardwareUnavailable(f"1-Wire sensor {resolved_id} is not present at {path}.")
         text = path.read_text(encoding="utf-8")
+        if "YES" not in text.splitlines()[0]:
+            raise HardwareUnavailable(f"1-Wire sensor {resolved_id} CRC check failed.")
         marker = "t="
         if marker not in text:
             raise ValueError(f"1-Wire sensor {resolved_id} returned no temperature marker.")
@@ -424,17 +493,122 @@ class TemperatureReader:
         return devices[0].name
 
     def read_bit_banged(self, bcm_pin: int) -> float:
-        # The exact DS18B20 timing is delegated to pigpio wave captures on hardware.
-        # Implements SRS 2.1.2 while staying importable on non-Pi hosts.
         if self.simulation:
             return 78.0
-        raise HardwareUnavailable(f"Bit-banged 1-Wire on BCM {bcm_pin} requires a Pi pigpio runtime.")
+        try:
+            import pigpio  # type: ignore
+
+            pi = pigpio.pi()
+            if not pi.connected:
+                raise HardwareUnavailable("pigpiod is not connected.")
+            if hasattr(pi, "set_pull_up_down") and hasattr(pigpio, "PUD_UP"):
+                pi.set_pull_up_down(bcm_pin, pigpio.PUD_UP)
+            scratchpad = self._read_ds18b20_scratchpad_bit_banged(pi, bcm_pin)
+            return self._decode_ds18b20_scratchpad(scratchpad)
+        except HardwareUnavailable:
+            raise
+        except Exception as exc:
+            raise HardwareUnavailable(f"Bit-banged DS18B20 read failed on BCM {bcm_pin}: {exc}") from exc
+
+    def _read_ds18b20_scratchpad_bit_banged(self, pi: Any, bcm_pin: int) -> bytes:
+        self._one_wire_reset(pi, bcm_pin)
+        self._one_wire_write_byte(pi, bcm_pin, 0xCC)  # Skip ROM; each sense port is expected to have one DS18B20.
+        self._one_wire_write_byte(pi, bcm_pin, 0x44)  # Convert T.
+        deadline = time.monotonic() + 0.8
+        while time.monotonic() < deadline:
+            if self._one_wire_read_bit(pi, bcm_pin):
+                break
+            time.sleep(0.01)
+        else:
+            raise HardwareUnavailable(f"DS18B20 conversion timed out on BCM {bcm_pin}.")
+        self._one_wire_reset(pi, bcm_pin)
+        self._one_wire_write_byte(pi, bcm_pin, 0xCC)
+        self._one_wire_write_byte(pi, bcm_pin, 0xBE)  # Read scratchpad.
+        scratchpad = bytes(self._one_wire_read_byte(pi, bcm_pin) for _ in range(9))
+        if self._crc8_maxim(scratchpad[:8]) != scratchpad[8]:
+            raise HardwareUnavailable("DS18B20 scratchpad CRC check failed.")
+        return scratchpad
+
+    def _one_wire_reset(self, pi: Any, bcm_pin: int) -> None:
+        self._drive_low(pi, bcm_pin)
+        self._sleep_us(480)
+        self._release_line(pi, bcm_pin)
+        self._sleep_us(70)
+        presence = pi.read(bcm_pin) == 0
+        self._sleep_us(410)
+        if not presence:
+            raise HardwareUnavailable(f"No DS18B20 presence pulse detected on BCM {bcm_pin}.")
+
+    def _one_wire_write_byte(self, pi: Any, bcm_pin: int, value: int) -> None:
+        for bit in range(8):
+            self._one_wire_write_bit(pi, bcm_pin, bool(value & (1 << bit)))
+
+    def _one_wire_read_byte(self, pi: Any, bcm_pin: int) -> int:
+        value = 0
+        for bit in range(8):
+            if self._one_wire_read_bit(pi, bcm_pin):
+                value |= 1 << bit
+        return value
+
+    def _one_wire_write_bit(self, pi: Any, bcm_pin: int, value: bool) -> None:
+        self._drive_low(pi, bcm_pin)
+        self._sleep_us(6 if value else 60)
+        self._release_line(pi, bcm_pin)
+        self._sleep_us(64 if value else 10)
+
+    def _one_wire_read_bit(self, pi: Any, bcm_pin: int) -> int:
+        self._drive_low(pi, bcm_pin)
+        self._sleep_us(6)
+        self._release_line(pi, bcm_pin)
+        self._sleep_us(9)
+        value = 1 if pi.read(bcm_pin) else 0
+        self._sleep_us(55)
+        return value
+
+    @staticmethod
+    def _drive_low(pi: Any, bcm_pin: int) -> None:
+        pi.set_mode(bcm_pin, 1)
+        pi.write(bcm_pin, 0)
+
+    @staticmethod
+    def _release_line(pi: Any, bcm_pin: int) -> None:
+        pi.set_mode(bcm_pin, 0)
+
+    @staticmethod
+    def _sleep_us(microseconds: int) -> None:
+        target = time.monotonic_ns() + microseconds * 1000
+        while time.monotonic_ns() < target:
+            pass
+
+    @staticmethod
+    def _decode_ds18b20_scratchpad(scratchpad: bytes) -> float:
+        if len(scratchpad) < 2:
+            raise HardwareUnavailable("DS18B20 scratchpad was incomplete.")
+        raw = scratchpad[0] | (scratchpad[1] << 8)
+        if raw & 0x8000:
+            raw -= 0x10000
+        celsius = raw / 16.0
+        return celsius * 9 / 5 + 32
+
+    @staticmethod
+    def _crc8_maxim(data: bytes) -> int:
+        crc = 0
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                if crc & 0x01:
+                    crc = (crc >> 1) ^ 0x8C
+                else:
+                    crc >>= 1
+        return crc & 0xFF
 
     def read_host_cpu(self) -> float:
         for path in (Path("/sys/class/thermal/thermal_zone0/temp"), Path("/sys/devices/virtual/thermal/thermal_zone0/temp")):
             if path.exists():
                 return int(path.read_text(encoding="utf-8").strip()) / 1000 * 9 / 5 + 32
-        return 0.0 if not self.simulation else 115.0
+        if self.simulation:
+            return 115.0
+        raise HardwareUnavailable("No Raspberry Pi CPU thermal file was found.")
 
 
 class BinaryLevelSensor:

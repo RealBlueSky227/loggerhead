@@ -12,11 +12,13 @@ from loggerhead.drivers import (
     Buzzer,
     HardwareFault,
     HardwareUnavailable,
+    HydrosPulseReader,
     HydrosTripleClassifier,
     KasaHS300Client,
     MCP23017RelayBoard,
     PigpioResourceCoordinator,
     StepperPulseEngine,
+    TemperatureReader,
 )
 from loggerhead.hardware import RELAYS, STEPPERS, AlarmPriority, DiagnosticHalt, LevelState
 
@@ -206,6 +208,44 @@ class FakePigpioPi:
         self.deleted_waves.add(wave_id)
 
 
+class FakePigpioCallback:
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class FakeHydrosPigpioPi:
+    connected = True
+
+    def __init__(self) -> None:
+        self.callback_func = None
+        self.callback_obj = FakePigpioCallback()
+
+    def set_mode(self, _bcm_pin: int, _mode: int) -> None:
+        return
+
+    def set_pull_up_down(self, _bcm_pin: int, _pull: int) -> None:
+        return
+
+    def callback(self, _bcm_pin: int, _edge: int, func) -> FakePigpioCallback:
+        self.callback_func = func
+        return self.callback_obj
+
+
+class FakeHydrosPigpioModule:
+    INPUT = 0
+    PUD_UP = 2
+    RISING_EDGE = 1
+
+    def __init__(self, pi: FakeHydrosPigpioPi) -> None:
+        self._pi = pi
+
+    def pi(self) -> FakeHydrosPigpioPi:
+        return self._pi
+
+
 def tmc_diag(**overrides: object) -> dict[str, object]:
     data: dict[str, object] = {
         "drv_status": 0,
@@ -262,6 +302,49 @@ def test_hydros_debounce_requires_stable_samples() -> None:
     classifier = HydrosTripleClassifier(debounce_samples=2)
     assert classifier.observe_period_us(2520) == LevelState.UNKNOWN
     assert classifier.observe_period_us(2520) == LevelState.NORMAL
+
+
+def test_hydros_pulse_reader_uses_rising_edge_periods() -> None:
+    fake_pi = FakeHydrosPigpioPi()
+    classifier = HydrosTripleClassifier(debounce_samples=2, activity_timeout=10.0)
+    reader = HydrosPulseReader(17, classifier, pigpio_module=FakeHydrosPigpioModule(fake_pi))
+
+    assert fake_pi.callback_func is not None
+    fake_pi.callback_func(17, 1, 1_000)
+    fake_pi.callback_func(17, 1, 3_520)
+    assert reader.read_state() == LevelState.UNKNOWN
+    fake_pi.callback_func(17, 1, 6_040)
+    assert reader.read_state() == LevelState.NORMAL
+    reader.close()
+    assert fake_pi.callback_obj.cancelled is True
+
+
+def test_kernel_one_wire_missing_sensor_is_not_simulated_on_real_hardware() -> None:
+    reader = TemperatureReader(simulation=False)
+    with pytest.raises(HardwareUnavailable, match="not present|No DS18B20"):
+        reader.read_one_wire_bus("28-000000000000")
+
+
+def test_bit_banged_ds18b20_decodes_scratchpad_with_mocked_gpio(monkeypatch: pytest.MonkeyPatch) -> None:
+    reader = TemperatureReader(simulation=False)
+    raw = int(25 * 16)
+    scratchpad = bytearray([raw & 0xFF, (raw >> 8) & 0xFF, 0, 0, 0, 0, 0, 0, 0])
+    scratchpad[8] = reader._crc8_maxim(bytes(scratchpad[:8]))
+
+    class FakeOneWirePi:
+        connected = True
+
+        def set_pull_up_down(self, _pin: int, _pull: int) -> None:
+            return
+
+    monkeypatch.setitem(
+        sys.modules,
+        "pigpio",
+        types.SimpleNamespace(PUD_UP=2, pi=lambda: FakeOneWirePi()),
+    )
+    monkeypatch.setattr(reader, "_read_ds18b20_scratchpad_bit_banged", lambda _pi, _pin: bytes(scratchpad))
+
+    assert reader.read_bit_banged(4) == 77.0
 
 
 def test_hs300_xor_round_trip() -> None:

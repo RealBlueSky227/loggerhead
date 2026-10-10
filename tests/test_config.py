@@ -7,6 +7,7 @@ import pytest
 from loggerhead.config import (
     MAX_MANUAL_PRIME_STEPS_PER_SECOND,
     EquipmentProfile,
+    SensePortDevice,
     default_config,
     load_config,
     save_config,
@@ -95,4 +96,18 @@ def test_rejects_duplicate_stepper_assignments() -> None:
     config = default_config()
     config.steppers[1].assignment = config.steppers[0].assignment
     with pytest.raises(DiagnosticHalt):
+        validate_config(config)
+
+
+def test_rejects_invalid_sense_port_polling_and_thresholds() -> None:
+    config = default_config()
+    config.sense_ports[0].device = SensePortDevice.DS18B20
+    config.sense_ports[0].check_frequency = 0
+    with pytest.raises(DiagnosticHalt, match="check frequency"):
+        validate_config(config)
+
+    config = default_config()
+    config.sense_ports[0].device = SensePortDevice.DS18B20
+    config.sense_ports[0].alert_below = 90
+    with pytest.raises(DiagnosticHalt, match="threshold"):
         validate_config(config)

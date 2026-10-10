@@ -5,6 +5,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,17 @@ class SensorReading:
 
 
 @dataclass
+class SensorHealth:
+    id: str
+    status: str = "initializing"
+    last_success_ts: float = 0.0
+    last_attempt_ts: float = 0.0
+    last_error: str = ""
+    consecutive_failures: int = 0
+    stale_after_seconds: float = 0.0
+
+
+@dataclass
 class AlarmState:
     id: str
     message: str
@@ -62,6 +74,7 @@ class RuntimeState:
 
     equipment: dict[str, EquipmentState] = field(default_factory=dict)
     readings: dict[str, SensorReading] = field(default_factory=dict)
+    sensor_health: dict[str, SensorHealth] = field(default_factory=dict)
     water_levels: dict[str, LevelState] = field(default_factory=dict)
     alarms: dict[str, AlarmState] = field(default_factory=dict)
     ato: dict[str, ATOState] = field(default_factory=dict)
@@ -88,6 +101,9 @@ class StateStore:
         }
         state.readings = {
             key: SensorReading(**value) for key, value in data.get("readings", {}).items()
+        }
+        state.sensor_health = {
+            key: SensorHealth(**value) for key, value in data.get("sensor_health", {}).items()
         }
         state.water_levels = {
             key: LevelState(value) for key, value in data.get("water_levels", {}).items()
@@ -145,12 +161,21 @@ class StateStore:
 
 
 def _state_dict(state: RuntimeState) -> dict[str, Any]:
-    data = asdict(state)
-    data["water_levels"] = {key: value.value for key, value in state.water_levels.items()}
-    data["alarms"] = {
-        key: {**asdict(value), "priority": value.priority.value} for key, value in state.alarms.items()
-    }
-    return data
+    last_error: RuntimeError | None = None
+    for _ in range(10):
+        try:
+            data = asdict(state)
+            data["water_levels"] = {key: value.value for key, value in state.water_levels.items()}
+            data["alarms"] = {
+                key: {**asdict(value), "priority": value.priority.value} for key, value in state.alarms.items()
+            }
+            return data
+        except RuntimeError as exc:
+            if "dictionary changed size during iteration" not in str(exc):
+                raise
+            last_error = exc
+            time.sleep(0.001)
+    raise last_error or RuntimeError("Runtime state changed while it was being serialized.")
 
 
 def _fsync_directory(path: Path) -> None:
