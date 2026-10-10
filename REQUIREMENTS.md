@@ -10,11 +10,11 @@ This file maps the pasted Aquarium Controller SRS to the implementation. Source 
 ## 2.0 Sensing and Monitoring
 
 - Temperature: `drivers.TemperatureReader` supports kernel 1-Wire, GPIO bit-banged DS18B20 reads, and host CPU thermal files.
-- HYDROS triple-optical water sensors use GPIO PWM period capture with debouncing and activity timeout handling; they are not DS18B20/kernel 1-Wire devices.
+- HYDROS triple-optical water sensors use GPIO rising-edge PWM period capture with debouncing and activity timeout handling; they are not DS18B20/kernel 1-Wire devices.
 - Sensor acquisition uses persistent, supervised per-sensor workers for blocking reads while the service control loop centrally enforces freshness, heater safety, ATO safety, alarms, and telemetry. Health tracks worker state, data validity, last attempts, last successes, stale state, read duration, diagnostics, and read errors. Dependent heaters/chillers/fans and ATO actuators fail off when required sensor data is unavailable.
 - pH: `drivers.EzoPHSensor` reads the fixed EZO pH I2C address `0x63`.
 - Water level: `drivers.BinaryLevelSensor` and `drivers.HydrosTripleClassifier` implement binary and Hydros Triple modes.
-- Hydros classification windows match the SRS: High `1000-1500 us`, Normal `2000-3000 us`, Low `4000-6000 us`, Dry `20000-30000 us`.
+- Hydros classification windows are full rising-edge periods: High `2000-3000 us`, Normal `4000-6000 us`, Low `8000-12000 us`, Dry `40000-60000 us`.
 - Host health: `drivers.HostHealthMonitor` reads CPU utilization, memory, disk, and uptime from Linux interfaces.
 
 ## 3.0 Equipment Control and Actuation

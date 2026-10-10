@@ -1073,7 +1073,8 @@ class LoggerheadService:
         if sensor.driver == TemperatureDriver.ONE_WIRE_BUS:
             if sensor.sense_port is not None:
                 port = SENSE_PORTS[sensor.sense_port]
-                self.temperature_reader.configure_kernel_one_wire(port.digital_bcm)
+                self.temperature_reader.configure_kernel_one_wire(port.digital_bcm, sensor.sensor_id)
+                return self.temperature_reader.read_one_wire_bus(sensor.sensor_id, bcm_pin=port.digital_bcm)
             return self.temperature_reader.read_one_wire_bus(sensor.sensor_id)
         if sensor.driver == TemperatureDriver.BIT_BANGED_ONE_WIRE:
             port = SENSE_PORTS[sensor.sense_port or 1]

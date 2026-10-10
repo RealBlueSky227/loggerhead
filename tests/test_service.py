@@ -6,8 +6,8 @@ from dataclasses import asdict
 
 import pytest
 
-from loggerhead.config import OneWireMode, SensePortDevice
-from loggerhead.drivers import HardwareFault, StepperRunResult
+from loggerhead.config import ATOProfile, OneWireMode, SensePortDevice
+from loggerhead.drivers import HardwareFault, HardwareUnavailable, StepperRunResult
 from loggerhead.hardware import STEPPERS, AlarmPriority, DiagnosticHalt, EquipmentKind, LevelState
 from loggerhead.sensor_workers import SensorWorkerSnapshot
 from loggerhead.service import LoggerheadService
@@ -248,6 +248,97 @@ def test_worker_exception_does_not_stop_other_sensor_workers(tmp_path, monkeypat
 
     assert service.state.sensor_health["sense_port_1_temperature"].status == "read_error"
     assert service.state.sensor_health["sense_port_2_analog"].status == "online"
+
+
+def test_kernel_one_wire_worker_recovers_after_setup_failure(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    port = service.config.sense_ports[0]
+    port.device = SensePortDevice.DS18B20
+    port.one_wire_mode = OneWireMode.KERNEL
+    port.sensor_id = "28-000000000001"
+    port.check_frequency = 0.05
+    service._rebuild_sensor_runtime()
+    attempts = 0
+
+    def configure(_bcm_pin: int, _sensor_id: str = "") -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise HardwareUnavailable("sudo -n dtoverlay failed")
+
+    monkeypatch.setattr(service.temperature_reader, "configure_kernel_one_wire", configure)
+    monkeypatch.setattr(service.temperature_reader, "read_one_wire_bus", lambda _sensor_id, **_kwargs: 78.6)
+    service._start_sensor_workers()
+    try:
+        wait_for(lambda: attempts >= 2, timeout=1.0)
+        wait_for(lambda: service._sensor_worker_snapshots()["sense_port_1_temperature"].status == "online", timeout=1.0)
+        service._control_loop_iteration(time.time())
+    finally:
+        service._stop_sensor_workers()
+
+    assert service.state.sensor_health["sense_port_1_temperature"].status == "online"
+    assert service.state.readings["sense_port_1_temperature"].value == 78.6
+
+
+@pytest.mark.parametrize(
+    ("status", "value"),
+    [("read_error", LevelState.UNKNOWN.value), ("stale", LevelState.INACTIVE.value)],
+)
+def test_invalid_hydros_worker_snapshot_prevents_ato(tmp_path, status: str, value: str) -> None:
+    service = make_service(tmp_path)
+    primary = service.config.sense_ports[0]
+    primary.device = SensePortDevice.HYDROS_TRIPLE
+    backup = service.config.sense_ports[1]
+    backup.device = SensePortDevice.HYDROS_TRIPLE
+    service.config.ato.append(
+        ATOProfile(
+            "ato",
+            "ATO",
+            "sense_port_1_water",
+            "sense_port_2_water",
+            "mcp_relay",
+            "ac1",
+        )
+    )
+    service.state.equipment["ac1"] = EquipmentState("ac1", True)
+    snapshots = {
+        "sense_port_1_water": SensorWorkerSnapshot(
+            sensor_id="sense_port_1_water",
+            kind="water",
+            worker_state="running",
+            status=status,
+            data_status=status,
+            value=value,
+            error="HYDROS invalid",
+            last_attempt_ts=time.time(),
+        ),
+        "sense_port_2_water": SensorWorkerSnapshot(
+            sensor_id="sense_port_2_water",
+            kind="water",
+            worker_state="running",
+            status="online",
+            data_status="online",
+            value=LevelState.DRY.value,
+            last_attempt_ts=time.time(),
+            last_success_ts=time.time(),
+        ),
+    }
+    commands: list[tuple[str, bool, str]] = []
+    alarms: list[object] = []
+    notifications: list[object] = []
+
+    service._apply_sensor_worker_snapshots_locked(
+        snapshots,
+        time.time(),
+        equipment_commands=commands,
+        value_logs=[],
+        events=[],
+        alarms=[],
+    )
+    service._plan_ato_locked(time.time(), equipment_commands=commands, alarms=alarms, notifications=notifications)
+
+    assert service.state.water_levels["sense_port_1_water"] == LevelState.UNKNOWN
+    assert ("ac1", False, "ato") in commands
 
 
 def test_stale_worker_snapshot_forces_heater_off(tmp_path) -> None:

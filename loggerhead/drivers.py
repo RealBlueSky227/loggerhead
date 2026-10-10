@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import struct
@@ -43,11 +44,15 @@ class HydrosTripleClassifier:
     Implements SRS 2.3.2.1 through 2.3.2.4.
     """
 
+    # HYDROS PWM is captured on rising edges only, so these windows are full
+    # rising-to-rising periods. Older SRS values represented half-cycle edge
+    # intervals and would misclassify a measured dry period near 50 ms.
+    MEASUREMENT_METHOD = "rising_to_rising_period_us"
     WINDOWS: tuple[tuple[LevelState, int, int], ...] = (
-        (LevelState.HIGH, 1000, 1500),
-        (LevelState.NORMAL, 2000, 3000),
-        (LevelState.LOW, 4000, 6000),
-        (LevelState.DRY, 20000, 30000),
+        (LevelState.HIGH, 2000, 3000),
+        (LevelState.NORMAL, 4000, 6000),
+        (LevelState.LOW, 8000, 12000),
+        (LevelState.DRY, 40000, 60000),
     )
 
     def __init__(self, *, debounce_samples: int = 3, activity_timeout: float = 2.0) -> None:
@@ -172,6 +177,10 @@ class HydrosPulseReader:
                 "last_edge_ts": self._last_edge_ts,
                 "last_valid_edge_ts": self._last_valid_edge_ts,
                 "invalid_frequency_count": self._invalid_frequency_count,
+                "measurement_method": self.classifier.MEASUREMENT_METHOD,
+                "classification_windows_us": {
+                    state.value: [low, high] for state, low, high in self.classifier.WINDOWS
+                },
             }
 
     def close(self) -> None:
@@ -179,6 +188,9 @@ class HydrosPulseReader:
         self._callback = None
         if callback is not None and hasattr(callback, "cancel"):
             callback.cancel()
+        if self.pi is not None and hasattr(self.pi, "stop"):
+            self.pi.stop()
+        self.pi = None
 
 
 class KasaHS300Client:
@@ -502,31 +514,48 @@ class TemperatureReader:
     Implements SRS 2.1.1 through 2.1.3.
     """
 
-    def __init__(self, *, simulation: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        simulation: bool = False,
+        one_wire_root: Path | None = None,
+        dtoverlay_command: str | None = None,
+        sudo_command: str | None = None,
+        subprocess_run: Callable[..., Any] = subprocess.run,
+    ) -> None:
         self.simulation = simulation
         self._configured_kernel_pins: set[int] = set()
+        self.one_wire_root = one_wire_root or Path("/sys/bus/w1/devices")
+        self._dtoverlay_command = dtoverlay_command
+        self._sudo_command = sudo_command
+        self._subprocess_run = subprocess_run
 
-    def configure_kernel_one_wire(self, bcm_pin: int) -> None:
-        if self.simulation or bcm_pin in self._configured_kernel_pins:
+    def configure_kernel_one_wire(self, bcm_pin: int, sensor_id: str = "") -> None:
+        if self.simulation:
             return
-        result = subprocess.run(
-            ["dtoverlay", "w1-gpio", f"gpiopin={bcm_pin}"],
-            capture_output=True,
-            check=False,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise HardwareUnavailable(f"Could not enable kernel 1-Wire on BCM {bcm_pin}: {result.stderr.strip()}")
+        bcm_pin = int(bcm_pin)
+        if sensor_id and self._kernel_sensor_visible(sensor_id):
+            self._configured_kernel_pins.add(bcm_pin)
+            return
+        if bcm_pin in self._configured_kernel_pins and self._one_wire_bus_masters():
+            return
+        if self._overlay_loaded_for_pin(bcm_pin):
+            self._configured_kernel_pins.add(bcm_pin)
+            return
+        self._load_kernel_overlay_privileged(bcm_pin)
         self._configured_kernel_pins.add(bcm_pin)
-        time.sleep(1.0)
+        self._wait_for_kernel_one_wire(bcm_pin, sensor_id=sensor_id)
 
-    def read_one_wire_bus(self, sensor_id: str = "") -> float:
+    def read_one_wire_bus(self, sensor_id: str = "", *, bcm_pin: int | None = None) -> float:
         if self.simulation:
             return 78.0
-        resolved_id = sensor_id or self._first_one_wire_sensor_id()
-        path = Path("/sys/bus/w1/devices") / resolved_id / "w1_slave"
+        resolved_id = self._resolve_one_wire_sensor_id(sensor_id)
+        path = self.one_wire_root / resolved_id / "w1_slave"
         if not path.exists():
-            raise HardwareUnavailable(f"1-Wire sensor {resolved_id} is not present at {path}.")
+            raise HardwareUnavailable(
+                f"1-Wire sensor {resolved_id} is not present at {path}. "
+                f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
+            )
         text = path.read_text(encoding="utf-8")
         if "YES" not in text.splitlines()[0]:
             raise HardwareUnavailable(f"1-Wire sensor {resolved_id} CRC check failed.")
@@ -535,12 +564,104 @@ class TemperatureReader:
             raise ValueError(f"1-Wire sensor {resolved_id} returned no temperature marker.")
         return int(text.split(marker, 1)[1].strip()) / 1000 * 9 / 5 + 32
 
-    @staticmethod
-    def _first_one_wire_sensor_id() -> str:
-        devices = sorted(Path("/sys/bus/w1/devices").glob("28-*"))
-        if not devices:
-            raise HardwareUnavailable("No DS18B20 sensors were found on the kernel 1-Wire bus.")
-        return devices[0].name
+    def _resolve_one_wire_sensor_id(self, sensor_id: str = "") -> str:
+        sensors = self._one_wire_sensor_ids()
+        if sensor_id:
+            if sensor_id in sensors:
+                return sensor_id
+            raise HardwareUnavailable(
+                f"Configured DS18B20 sensor ID {sensor_id!r} was not found on the kernel 1-Wire bus. "
+                f"{self._one_wire_diagnostics()}"
+            )
+        if len(sensors) == 1:
+            return sensors[0]
+        if not sensors:
+            raise HardwareUnavailable(f"No DS18B20 sensors were found on the kernel 1-Wire bus. {self._one_wire_diagnostics()}")
+        raise HardwareUnavailable(
+            "Multiple DS18B20 sensors were found; set the sense port sensor_id to the actual probe ID. "
+            f"{self._one_wire_diagnostics()}"
+        )
+
+    def _one_wire_sensor_ids(self) -> list[str]:
+        return sorted(path.name for path in self.one_wire_root.glob("28-*"))
+
+    def _one_wire_bus_masters(self) -> list[Path]:
+        return sorted(path for path in self.one_wire_root.glob("w1_bus_master*") if path.is_dir())
+
+    def _kernel_sensor_visible(self, sensor_id: str) -> bool:
+        return bool(sensor_id) and (self.one_wire_root / sensor_id / "w1_slave").exists()
+
+    def _overlay_loaded_for_pin(self, bcm_pin: int) -> bool:
+        dtoverlay = self._dtoverlay_path()
+        if not dtoverlay:
+            return False
+        try:
+            result = self._subprocess_run([dtoverlay, "-l"], capture_output=True, check=False, text=True)
+        except Exception:
+            return False
+        if result.returncode != 0:
+            return False
+        for line in str(result.stdout).splitlines():
+            if "w1-gpio" not in line:
+                continue
+            if f"gpiopin={bcm_pin}" in line:
+                return True
+            if bcm_pin == 4 and not re.search(r"gpiopin\s*=", line):
+                return True
+        return False
+
+    def _load_kernel_overlay_privileged(self, bcm_pin: int) -> None:
+        dtoverlay = self._dtoverlay_path()
+        sudo = self._sudo_path()
+        if not dtoverlay or not sudo:
+            raise HardwareUnavailable(
+                f"Could not enable kernel 1-Wire on BCM {bcm_pin}: dtoverlay/sudo is unavailable. "
+                f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
+            )
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            raise HardwareUnavailable(
+                f"Refusing to enable kernel 1-Wire on BCM {bcm_pin} from a root Loggerhead process. "
+                "Run Loggerhead as the unprivileged reef user and allow only the dtoverlay setup command via sudo. "
+                f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
+            )
+        command = [sudo, "-n", dtoverlay, "w1-gpio", f"gpiopin={bcm_pin}"]
+        try:
+            result = self._subprocess_run(command, capture_output=True, check=False, text=True)
+        except Exception as exc:
+            raise HardwareUnavailable(
+                f"Could not enable kernel 1-Wire on BCM {bcm_pin}: {exc}. "
+                f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
+            ) from exc
+        if result.returncode != 0:
+            stderr = str(result.stderr).strip() or str(result.stdout).strip() or f"exit code {result.returncode}"
+            raise HardwareUnavailable(
+                f"Could not enable kernel 1-Wire on BCM {bcm_pin} using narrow privileged setup: {stderr}. "
+                f"Run the controller as an unprivileged user and allow passwordless sudo only for: "
+                f"{sudo} -n {dtoverlay} w1-gpio gpiopin={bcm_pin}. "
+                f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
+            )
+
+    def _wait_for_kernel_one_wire(self, bcm_pin: int, *, sensor_id: str = "") -> None:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if sensor_id and self._kernel_sensor_visible(sensor_id):
+                return
+            if not sensor_id and self._one_wire_bus_masters():
+                return
+            time.sleep(0.1)
+        LOGGER.warning("Kernel 1-Wire overlay on BCM %s loaded but no expected DS18B20 appeared yet.", bcm_pin)
+
+    def _dtoverlay_path(self) -> str:
+        return self._dtoverlay_command or shutil.which("dtoverlay") or "/usr/bin/dtoverlay"
+
+    def _sudo_path(self) -> str:
+        return self._sudo_command or shutil.which("sudo") or "/usr/bin/sudo"
+
+    def _one_wire_diagnostics(self, *, bcm_pin: int | None = None) -> str:
+        sensors = self._one_wire_sensor_ids()
+        buses = [path.name for path in self._one_wire_bus_masters()]
+        target = f"target BCM GPIO {bcm_pin}; " if bcm_pin is not None else ""
+        return f"{target}visible DS18B20 IDs={sensors or 'none'}; bus masters={buses or 'none'}."
 
     def read_bit_banged(self, bcm_pin: int) -> float:
         if self.simulation:

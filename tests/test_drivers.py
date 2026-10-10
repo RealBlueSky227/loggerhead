@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -222,6 +223,7 @@ class FakeHydrosPigpioPi:
     def __init__(self) -> None:
         self.callback_func = None
         self.callback_obj = FakePigpioCallback()
+        self.stopped = False
 
     def set_mode(self, _bcm_pin: int, _mode: int) -> None:
         return
@@ -232,6 +234,9 @@ class FakeHydrosPigpioPi:
     def callback(self, _bcm_pin: int, _edge: int, func) -> FakePigpioCallback:
         self.callback_func = func
         return self.callback_obj
+
+    def stop(self) -> None:
+        self.stopped = True
 
 
 class FakeHydrosPigpioModule:
@@ -287,11 +292,11 @@ def reset_pigpio_resource_coordinator() -> None:
 @pytest.mark.parametrize(
     ("period", "state"),
     [
-        (1260, LevelState.HIGH),
-        (2520, LevelState.NORMAL),
-        (5040, LevelState.LOW),
-        (25200, LevelState.DRY),
-        (9000, LevelState.UNKNOWN),
+        (2520, LevelState.HIGH),
+        (5040, LevelState.NORMAL),
+        (10080, LevelState.LOW),
+        (50394, LevelState.DRY),
+        (18000, LevelState.UNKNOWN),
     ],
 )
 def test_hydros_period_classification(period: int, state: LevelState) -> None:
@@ -300,8 +305,36 @@ def test_hydros_period_classification(period: int, state: LevelState) -> None:
 
 def test_hydros_debounce_requires_stable_samples() -> None:
     classifier = HydrosTripleClassifier(debounce_samples=2)
-    assert classifier.observe_period_us(2520) == LevelState.UNKNOWN
-    assert classifier.observe_period_us(2520) == LevelState.NORMAL
+    assert classifier.observe_period_us(5040) == LevelState.UNKNOWN
+    assert classifier.observe_period_us(5040) == LevelState.NORMAL
+
+
+@pytest.mark.parametrize(
+    ("period", "state"),
+    [
+        (2520, LevelState.HIGH),
+        (5040, LevelState.NORMAL),
+        (10080, LevelState.LOW),
+        (50394, LevelState.DRY),
+    ],
+)
+def test_hydros_rising_edge_sequences_classify_all_states(period: int, state: LevelState) -> None:
+    classifier = HydrosTripleClassifier(debounce_samples=3, activity_timeout=10.0)
+    ticks = [1_000, 1_000 + period, 1_000 + period * 2, 1_000 + period * 3]
+
+    observed = LevelState.UNKNOWN
+    for previous, current in zip(ticks, ticks[1:], strict=False):
+        observed = classifier.observe_period_us(HydrosPulseReader._tick_diff(previous, current))
+
+    assert observed == state
+
+
+def test_hydros_invalid_frequency_debounces_to_unknown() -> None:
+    classifier = HydrosTripleClassifier(debounce_samples=2)
+    classifier.observe_period_us(5040)
+    assert classifier.observe_period_us(5040) == LevelState.NORMAL
+    assert classifier.observe_period_us(18000) == LevelState.NORMAL
+    assert classifier.observe_period_us(18000) == LevelState.UNKNOWN
 
 
 def test_hydros_pulse_reader_uses_rising_edge_periods() -> None:
@@ -311,17 +344,133 @@ def test_hydros_pulse_reader_uses_rising_edge_periods() -> None:
 
     assert fake_pi.callback_func is not None
     fake_pi.callback_func(17, 1, 1_000)
-    fake_pi.callback_func(17, 1, 3_520)
-    assert reader.read_state() == LevelState.UNKNOWN
     fake_pi.callback_func(17, 1, 6_040)
+    assert reader.read_state() == LevelState.UNKNOWN
+    fake_pi.callback_func(17, 1, 11_080)
     assert reader.read_state() == LevelState.NORMAL
+    diagnostics = reader.diagnostics()
+    assert diagnostics["period_us"] == 5040.0
+    assert diagnostics["measurement_method"] == "rising_to_rising_period_us"
     reader.close()
     assert fake_pi.callback_obj.cancelled is True
+    assert fake_pi.stopped is True
+
+
+def test_hydros_missing_pulses_becomes_inactive() -> None:
+    classifier = HydrosTripleClassifier(debounce_samples=1, activity_timeout=0.01)
+    classifier.observe_period_us(5040)
+    time.sleep(0.02)
+
+    assert classifier.activity_state() == LevelState.INACTIVE
+
+
+def write_w1_sensor(root: Path, sensor_id: str, temp_milli_c: int = 25_000) -> None:
+    path = root / sensor_id
+    path.mkdir(parents=True)
+    path.joinpath("w1_slave").write_text(f"aa YES\nbb t={temp_milli_c}\n", encoding="utf-8")
+
+
+def test_kernel_one_wire_existing_sensor_skips_privileged_setup(tmp_path) -> None:
+    root = tmp_path / "w1"
+    root.mkdir()
+    (root / "w1_bus_master1").mkdir()
+    write_w1_sensor(root, "28-000000000001")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("dtoverlay should not be called when the configured sensor is already visible")
+
+    reader = TemperatureReader(simulation=False, one_wire_root=root, subprocess_run=fail_if_called)
+    reader.configure_kernel_one_wire(4, "28-000000000001")
+
+    assert reader.read_one_wire_bus("28-000000000001", bcm_pin=4) == 77.0
+
+
+def test_kernel_one_wire_uses_narrow_privileged_overlay_setup(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "w1"
+    root.mkdir()
+    calls: list[list[str]] = []
+    monkeypatch.setattr("loggerhead.drivers.os.geteuid", lambda: 1000, raising=False)
+
+    def fake_run(command, **_kwargs):
+        calls.append(list(command))
+        if command == ["dtoverlay", "-l"]:
+            return types.SimpleNamespace(returncode=0, stdout="No overlays loaded\n", stderr="")
+        if command == ["sudo", "-n", "dtoverlay", "w1-gpio", "gpiopin=4"]:
+            (root / "w1_bus_master1").mkdir()
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected command {command}")
+
+    reader = TemperatureReader(
+        simulation=False,
+        one_wire_root=root,
+        dtoverlay_command="dtoverlay",
+        sudo_command="sudo",
+        subprocess_run=fake_run,
+    )
+    reader.configure_kernel_one_wire(4)
+
+    assert ["sudo", "-n", "dtoverlay", "w1-gpio", "gpiopin=4"] in calls
+
+
+def test_kernel_one_wire_refuses_runtime_setup_when_process_is_root(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "w1"
+    root.mkdir()
+    monkeypatch.setattr("loggerhead.drivers.os.geteuid", lambda: 0, raising=False)
+
+    def fake_run(command, **_kwargs):
+        if command == ["dtoverlay", "-l"]:
+            return types.SimpleNamespace(returncode=0, stdout="No overlays loaded\n", stderr="")
+        raise AssertionError("privileged setup should not be attempted from a root process")
+
+    reader = TemperatureReader(
+        simulation=False,
+        one_wire_root=root,
+        dtoverlay_command="dtoverlay",
+        sudo_command="sudo",
+        subprocess_run=fake_run,
+    )
+
+    with pytest.raises(HardwareUnavailable, match="root Loggerhead process"):
+        reader.configure_kernel_one_wire(4)
+
+
+def test_kernel_one_wire_does_not_duplicate_loaded_overlay(tmp_path) -> None:
+    root = tmp_path / "w1"
+    root.mkdir()
+    calls: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(list(command))
+        return types.SimpleNamespace(returncode=0, stdout="0: w1-gpio  gpiopin=4\n", stderr="")
+
+    reader = TemperatureReader(
+        simulation=False,
+        one_wire_root=root,
+        dtoverlay_command="dtoverlay",
+        sudo_command="sudo",
+        subprocess_run=fake_run,
+    )
+    reader.configure_kernel_one_wire(4)
+
+    assert calls == [["dtoverlay", "-l"]]
+
+
+def test_kernel_one_wire_requires_unambiguous_sensor_id(tmp_path) -> None:
+    root = tmp_path / "w1"
+    root.mkdir()
+    write_w1_sensor(root, "28-000000000001")
+    write_w1_sensor(root, "28-000000000002")
+    reader = TemperatureReader(simulation=False, one_wire_root=root)
+
+    with pytest.raises(HardwareUnavailable, match="Multiple DS18B20 sensors"):
+        reader.read_one_wire_bus()
+
+    assert reader.read_one_wire_bus("28-000000000002") == 77.0
 
 
 def test_kernel_one_wire_missing_sensor_is_not_simulated_on_real_hardware() -> None:
     reader = TemperatureReader(simulation=False)
-    with pytest.raises(HardwareUnavailable, match="not present|No DS18B20"):
+    with pytest.raises(HardwareUnavailable, match="not found|not present|No DS18B20"):
         reader.read_one_wire_bus("28-000000000000")
 
 
