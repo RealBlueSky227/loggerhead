@@ -391,6 +391,17 @@ def write_w1_bus(
     return master
 
 
+def write_trixie_w1_platform(platform_root: Path, name: str, gpio_bcm: int) -> Path:
+    platform = platform_root / name
+    of_node = platform / "of_node"
+    of_node.mkdir(parents=True)
+    of_node.joinpath("compatible").write_bytes(b"w1-gpio\x00")
+    of_node.joinpath("gpios").write_bytes(
+        b"".join(value.to_bytes(4, "big") for value in (7, gpio_bcm, 0))
+    )
+    return platform
+
+
 class FakeOverlayClient:
     def __init__(self, root: Path | None = None, *, create_bus: bool = False) -> None:
         self.root = root
@@ -437,6 +448,87 @@ def test_kernel_one_wire_reads_only_sensor_from_verified_gpio_bus(tmp_path) -> N
 
     assert reader.read_one_wire_gpio(4) == 77.0
     assert reader.read_one_wire_gpio(17) == 86.0
+
+
+def test_kernel_one_wire_maps_captured_runtime_bus_on_trixie_detached_topology(tmp_path) -> None:
+    root = tmp_path / "w1"
+    platform_root = tmp_path / "platform"
+    root.mkdir()
+    platform_root.mkdir()
+    for index, gpio in enumerate((4, 5, 6, 9, 10, 11, 22, 26, 27), start=1):
+        write_w1_bus(root, f"w1_bus_master{index}", gpio, verified=False)
+        write_trixie_w1_platform(platform_root, f"onewire@{gpio:x}", gpio)
+    write_w1_bus(root, "w1_bus_master10", 17, {"28-00000ff27476": 24_750}, verified=False)
+    write_trixie_w1_platform(platform_root, "onewire@11", 17)
+
+    def fake_run(command, **_kwargs):
+        if command[:4] == ["gpioinfo", "-c", "gpiochip0", "17"]:
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout='gpiochip0 17 "GPIO17" output drive=open-drain consumer="onewire@11"\n',
+                stderr="",
+            )
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    reader = TemperatureReader(
+        simulation=False,
+        one_wire_root=root,
+        platform_root=platform_root,
+        gpioinfo_command="gpioinfo",
+        subprocess_run=fake_run,
+    )
+    reader._runtime_kernel_bus_names[17] = "w1_bus_master10"
+
+    reading = reader.read_one_wire_gpio_detailed(17)
+
+    assert reading.sensor_id == "28-00000ff27476"
+    assert reading.bus_master == "w1_bus_master10"
+    assert reading.celsius == 24.75
+    assert reading.fahrenheit == pytest.approx(76.55)
+
+
+def test_kernel_one_wire_refuses_detached_boot_masters_without_captured_mapping(tmp_path) -> None:
+    root = tmp_path / "w1"
+    platform_root = tmp_path / "platform"
+    root.mkdir()
+    platform_root.mkdir()
+    for index, gpio in enumerate((4, 5, 6, 9, 10, 11, 17, 22, 26, 27), start=1):
+        write_w1_bus(root, f"w1_bus_master{index}", gpio, {f"28-{index:012d}": 24_000 + index}, verified=False)
+        write_trixie_w1_platform(platform_root, f"onewire@{gpio:x}", gpio)
+    reader = TemperatureReader(simulation=False, one_wire_root=root, platform_root=platform_root)
+
+    with pytest.raises(HardwareUnavailable, match="No verified kernel 1-Wire bus is owned by BCM GPIO 17"):
+        reader.read_one_wire_gpio(17)
+
+
+def test_kernel_one_wire_configure_uses_helper_captured_bus_master_for_detached_runtime_overlay(tmp_path) -> None:
+    root = tmp_path / "w1"
+    platform_root = tmp_path / "platform"
+    root.mkdir()
+    platform_root.mkdir()
+
+    class TrixieOverlayClient:
+        def activate(self, gpio: int) -> OneWireOverlayResult:
+            write_w1_bus(root, "w1_bus_master10", gpio, {"28-00000ff27476": 24_750}, verified=False)
+            write_trixie_w1_platform(platform_root, "onewire@11", gpio)
+            return OneWireOverlayResult("activate", gpio, created=True, owned=True, bus_master="w1_bus_master10")
+
+        def release(self, gpio: int) -> OneWireOverlayResult:
+            return OneWireOverlayResult("release", gpio, owned=True, safe_input=True)
+
+        def status(self) -> OneWireOverlayResult:
+            return OneWireOverlayResult("status", -1)
+
+    reader = TemperatureReader(
+        simulation=False,
+        one_wire_root=root,
+        platform_root=platform_root,
+        overlay_client=TrixieOverlayClient(),
+    )
+
+    reader.configure_kernel_one_wire(17)
+
+    assert reader.read_one_wire_gpio_detailed(17).bus_master == "w1_bus_master10"
 
 
 def test_kernel_one_wire_uses_privileged_helper_overlay_client(tmp_path) -> None:

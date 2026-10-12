@@ -65,6 +65,8 @@ sudo systemctl restart loggerhead
 
 Loggerhead uses the Raspberry Pi kernel `w1-gpio` driver for DS18B20 timing. The web UI identifies probes by physical SensePort only; ROM IDs are diagnostics, not configuration.
 
+On Raspberry Pi OS Trixie with kernel `6.18.34+rpt-rpi-v6`, `/sys/bus/w1/devices/w1_bus_master*` may be exposed as detached `/sys/devices/w1_bus_master*` nodes with no `device/of_node` link back to `onewire@...`. Loggerhead will not infer a physical SensePort by bus-master number, enumeration order, or DS18B20 ROM ID. For dynamically activated overlays, the helper records the newly created `w1_bus_master*` name and Loggerhead verifies that the requested GPIO is owned by a matching `w1-gpio` platform device such as `onewire@11`. Preexisting boot-time overlays that only expose detached masters are treated as unmappable and fail closed until migrated.
+
 The runtime helper is installed as:
 
 ```bash
@@ -98,7 +100,8 @@ Migration from boot-time overlays:
 3. Comment out the boot-time Loggerhead SensePort `w1-gpio` overlays.
 4. Reboot once.
 5. Confirm `dtoverlay -l` does not list those boot overlays and that SensePort GPIOs are not already owned by another driver.
-6. Start Loggerhead and use the dashboard to assign DS18B20 sensors by SensePort.
+6. Start Loggerhead and use the dashboard to assign DS18B20 sensors by SensePort. Loggerhead will activate one runtime overlay per configured SensePort and record the created bus master.
+7. Validate each configured DS18B20 with `gpioinfo -c gpiochip0 <BCM>`, `sudo -n /usr/local/sbin/loggerhead-onewire-helper status`, and the dashboard diagnostics before enabling dependent heaters/chillers.
 
 Rollback is the reverse: stop Loggerhead, restore the backed-up `config.txt`, reboot, and remove `/etc/sudoers.d/loggerhead-onewire-helper` if dynamic management is no longer wanted.
 

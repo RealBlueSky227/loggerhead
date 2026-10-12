@@ -75,6 +75,8 @@ class OneWireOverlayResult:
     message: str = ""
     overlays: tuple[RuntimeOverlay, ...] = ()
     owned_gpios: tuple[int, ...] = ()
+    bus_master: str = ""
+    owned_bus_masters: dict[int, str] = field(default_factory=dict)
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> OneWireOverlayResult:
@@ -98,6 +100,8 @@ class OneWireOverlayResult:
             message=str(payload.get("message", "")),
             overlays=overlays,
             owned_gpios=tuple(int(item) for item in payload.get("owned_gpios", [])),
+            bus_master=str(payload.get("bus_master", "")),
+            owned_bus_masters={int(key): str(value) for key, value in dict(payload.get("owned_bus_masters", {})).items()},
         )
 
 

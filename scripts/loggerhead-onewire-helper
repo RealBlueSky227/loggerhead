@@ -15,6 +15,7 @@ ALLOWED_GPIOS = {4, 5, 6, 9, 10, 11, 17, 22, 26, 27}
 STATE_DIR = Path("/run/loggerhead-onewire")
 STATE_PATH = STATE_DIR / "owned.json"
 LOCK_PATH = STATE_DIR / "lock"
+W1_ROOT = Path("/sys/bus/w1/devices")
 DTOVERLAY = shutil.which("dtoverlay") or "/usr/bin/dtoverlay"
 PINCTRL = shutil.which("pinctrl") or "/usr/bin/pinctrl"
 RASPI_GPIO = shutil.which("raspi-gpio") or "/usr/bin/raspi-gpio"
@@ -92,23 +93,39 @@ def activate(gpio: int) -> dict[str, Any]:
         if entry and not owned:
             state["owned_gpios"].pop(str(gpio), None)
             save_state(state)
+        bus_master = str(entry.get("bus_master", "")) if owned and isinstance(entry, dict) else ""
         return payload(
             "activate",
             gpio,
             created=False,
             owned=owned,
             already_active=True,
+            bus_master=bus_master,
             overlays=overlays,
             message="Runtime w1-gpio overlay already active." if owned else "w1-gpio overlay is active but not owned by Loggerhead.",
         )
+    before_masters = list_w1_master_names()
     run([DTOVERLAY, "w1-gpio", f"gpiopin={gpio}"], timeout=8.0)
     overlays = list_overlays()
     created = overlay_for_gpio(overlays, gpio)
     if created is None:
         raise HelperError(f"dtoverlay reported success but no runtime w1-gpio overlay appeared for BCM GPIO {gpio}.")
-    state["owned_gpios"][str(gpio)] = {"activated_at": time.time(), "overlay": overlay_identity(created)}
+    bus_master = wait_for_new_w1_master(before_masters)
+    state["owned_gpios"][str(gpio)] = {
+        "activated_at": time.time(),
+        "overlay": overlay_identity(created),
+        "bus_master": bus_master,
+    }
     save_state(state)
-    return payload("activate", gpio, created=True, owned=True, overlays=overlays, message="Runtime w1-gpio overlay activated.")
+    return payload(
+        "activate",
+        gpio,
+        created=True,
+        owned=True,
+        bus_master=bus_master,
+        overlays=overlays,
+        message="Runtime w1-gpio overlay activated.",
+    )
 
 
 def release(gpio: int) -> dict[str, Any]:
@@ -178,11 +195,17 @@ def release(gpio: int) -> dict[str, Any]:
 
 def status() -> dict[str, Any]:
     state = load_state()
+    owned_bus_masters = {
+        str(gpio): str(entry["bus_master"])
+        for gpio, entry in state["owned_gpios"].items()
+        if isinstance(entry, dict) and entry.get("bus_master")
+    }
     return {
         "ok": True,
         "action": "status",
         "gpio": -1,
         "owned_gpios": sorted(int(item) for item in state["owned_gpios"]),
+        "owned_bus_masters": owned_bus_masters,
         "allowed_gpios": sorted(ALLOWED_GPIOS),
         "overlays": list_overlays(),
     }
@@ -198,6 +221,7 @@ def payload(
     already_active: bool = False,
     affected_gpios: tuple[int, ...] = (),
     safe_input: bool | None = None,
+    bus_master: str = "",
     overlays: list[dict[str, Any]] | None = None,
     message: str = "",
 ) -> dict[str, Any]:
@@ -210,6 +234,7 @@ def payload(
         "already_active": already_active,
         "affected_gpios": list(affected_gpios),
         "safe_input": safe_input,
+        "bus_master": bus_master,
         "overlays": overlays or [],
         "message": message,
     }
@@ -284,6 +309,22 @@ def overlay_matches(entry: dict[str, Any], item: dict[str, Any]) -> bool:
     if not isinstance(recorded, dict):
         return False
     return recorded == overlay_identity(item)
+
+
+def list_w1_master_names() -> set[str]:
+    return {path.name for path in W1_ROOT.glob("w1_bus_master*") if path.is_dir()}
+
+
+def wait_for_new_w1_master(before: set[str]) -> str:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        created = sorted(list_w1_master_names() - before)
+        if len(created) == 1:
+            return created[0]
+        if len(created) > 1:
+            return ""
+        time.sleep(0.1)
+    return ""
 
 
 def set_gpio_input(gpio: int) -> bool:

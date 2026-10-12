@@ -54,7 +54,17 @@ def test_helper_client_parses_json_result(monkeypatch: pytest.MonkeyPatch) -> No
         assert command[-2:] == ["activate", "17"]
         return types.SimpleNamespace(
             returncode=0,
-            stdout=json.dumps({"ok": True, "action": "activate", "gpio": 17, "created": True, "owned": True}),
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "action": "activate",
+                    "gpio": 17,
+                    "created": True,
+                    "owned": True,
+                    "bus_master": "w1_bus_master10",
+                    "owned_bus_masters": {"17": "w1_bus_master10"},
+                }
+            ),
             stderr="",
         )
 
@@ -64,6 +74,37 @@ def test_helper_client_parses_json_result(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert result.created is True
     assert result.owned is True
+    assert result.bus_master == "w1_bus_master10"
+    assert result.owned_bus_masters == {17: "w1_bus_master10"}
+
+
+def test_helper_activate_records_new_w1_bus_master(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    helper = load_helper_module()
+    helper.STATE_DIR = tmp_path
+    helper.STATE_PATH = tmp_path / "owned.json"
+    overlays = {"active": False}
+    calls = {"masters": 0}
+
+    def list_overlays():
+        return [{"index": 0, "name": "w1-gpio", "params": {"gpiopin": "17"}}] if overlays["active"] else []
+
+    def activate_overlay(_command, **_kwargs):
+        overlays["active"] = True
+
+    monkeypatch.setattr(helper, "list_overlays", list_overlays)
+    monkeypatch.setattr(helper, "run", activate_overlay)
+
+    def list_masters() -> set[str]:
+        calls["masters"] += 1
+        return set() if calls["masters"] == 1 else {"w1_bus_master10"}
+
+    monkeypatch.setattr(helper, "list_w1_master_names", list_masters)
+
+    result = helper.activate(17)
+    status = helper.status()
+
+    assert result["bus_master"] == "w1_bus_master10"
+    assert status["owned_bus_masters"] == {"17": "w1_bus_master10"}
 
 
 def test_helper_release_refuses_unowned_active_overlay(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

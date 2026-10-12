@@ -522,6 +522,14 @@ class KernelOneWireBus:
     evidence: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class KernelOneWirePlatform:
+    name: str
+    path: Path
+    gpio_bcm: int
+    evidence: tuple[str, ...]
+
+
 class TemperatureReader:
     """Temperature sensor readers for kernel 1-Wire and host CPU.
 
@@ -533,7 +541,9 @@ class TemperatureReader:
         *,
         simulation: bool = False,
         one_wire_root: Path | None = None,
+        platform_root: Path | None = None,
         dtoverlay_command: str | None = None,
+        gpioinfo_command: str | None = None,
         sudo_command: str | None = None,
         overlay_client: OneWireOverlayClient | None = None,
         subprocess_run: Callable[..., Any] = subprocess.run,
@@ -541,9 +551,12 @@ class TemperatureReader:
         self.simulation = simulation
         self._configured_kernel_pins: set[int] = set()
         self._runtime_kernel_pins: set[int] = set()
+        self._runtime_kernel_bus_names: dict[int, str] = {}
         self._last_valid_kernel_celsius: dict[int, float] = {}
         self.one_wire_root = one_wire_root or Path("/sys/bus/w1/devices")
+        self.platform_root = platform_root or Path("/sys/bus/platform/devices")
         self._dtoverlay_command = dtoverlay_command
+        self._gpioinfo_command = gpioinfo_command
         self._sudo_command = sudo_command
         self._subprocess_run = subprocess_run
         if overlay_client is not None:
@@ -557,6 +570,7 @@ class TemperatureReader:
         if self.simulation:
             return
         bcm_pin = int(bcm_pin)
+        self._sync_runtime_overlay_status()
         if bcm_pin in self._configured_kernel_pins and self._kernel_bus_for_gpio(bcm_pin, required=False) is not None:
             return
         if self._kernel_bus_for_gpio(bcm_pin, required=False) is not None:
@@ -566,9 +580,13 @@ class TemperatureReader:
             self._configured_kernel_pins.add(bcm_pin)
             self._wait_for_kernel_one_wire(bcm_pin)
             return
+        before_masters = self._one_wire_bus_master_names()
         result = self._overlay_client.activate(bcm_pin)
         if result.created or result.owned:
             self._runtime_kernel_pins.add(bcm_pin)
+        self._record_runtime_bus_from_overlay_result(bcm_pin, result)
+        if result.created and int(bcm_pin) not in self._runtime_kernel_bus_names:
+            self._capture_runtime_bus_after_activation(bcm_pin, before_masters)
         self._configured_kernel_pins.add(bcm_pin)
         self._wait_for_kernel_one_wire(bcm_pin)
 
@@ -576,6 +594,7 @@ class TemperatureReader:
         bcm_pin = int(bcm_pin)
         self._configured_kernel_pins.discard(bcm_pin)
         self._last_valid_kernel_celsius.pop(bcm_pin, None)
+        self._runtime_kernel_bus_names.pop(bcm_pin, None)
         if self.simulation:
             return self._overlay_client.release(bcm_pin)
         result = self._overlay_client.release(bcm_pin)
@@ -587,6 +606,7 @@ class TemperatureReader:
         if self.simulation:
             return set()
         result = self._overlay_client.status()
+        self._record_runtime_bus_from_overlay_result(None, result)
         return set(result.owned_gpios)
 
     def read_one_wire_bus(self, sensor_id: str = "", *, bcm_pin: int | None = None) -> float:
@@ -678,14 +698,20 @@ class TemperatureReader:
     def _one_wire_bus_masters(self) -> list[Path]:
         return sorted(path for path in self.one_wire_root.glob("w1_bus_master*") if path.is_dir())
 
+    def _one_wire_bus_master_names(self) -> set[str]:
+        return {path.name for path in self._one_wire_bus_masters()}
+
     def _kernel_bus_for_gpio(self, bcm_pin: int, *, required: bool = True) -> KernelOneWireBus | None:
-        matches: list[KernelOneWireBus] = []
+        matches: dict[str, KernelOneWireBus] = {}
         for master in self._one_wire_bus_masters():
             bus = self._kernel_bus_from_master(master)
             if bus is not None and bus.gpio_bcm == bcm_pin:
-                matches.append(bus)
+                matches[bus.master.name] = bus
+        recorded = self._kernel_bus_from_recorded_runtime_master(bcm_pin)
+        if recorded is not None:
+            matches[recorded.master.name] = recorded
         if len(matches) == 1:
-            return matches[0]
+            return next(iter(matches.values()))
         if not required:
             return None
         if not matches:
@@ -693,7 +719,7 @@ class TemperatureReader:
                 f"No verified kernel 1-Wire bus is owned by BCM GPIO {bcm_pin}. "
                 f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
             )
-        details = "; ".join(f"{item.master.name}: {', '.join(item.evidence)}" for item in matches)
+        details = "; ".join(f"{item.master.name}: {', '.join(item.evidence)}" for item in matches.values())
         raise HardwareUnavailable(f"Ambiguous kernel 1-Wire ownership for BCM GPIO {bcm_pin}: {details}.")
 
     def _kernel_bus_from_master(self, master: Path) -> KernelOneWireBus | None:
@@ -724,6 +750,119 @@ class TemperatureReader:
         if verified and len(unique_gpios) == 1:
             return KernelOneWireBus(master, unique_gpios[0], tuple(dict.fromkeys(evidence)))
         return None
+
+    def _kernel_bus_from_recorded_runtime_master(self, bcm_pin: int) -> KernelOneWireBus | None:
+        master_name = self._runtime_kernel_bus_names.get(int(bcm_pin))
+        if not master_name or not re.fullmatch(r"w1_bus_master\d+", master_name):
+            return None
+        master = self.one_wire_root / master_name
+        if not master.is_dir():
+            return None
+        platform = self._verified_w1_gpio_platform_for_gpio(int(bcm_pin))
+        if platform is None:
+            return None
+        evidence = (f"captured_bus_master={master_name}", f"platform={platform.name}", *platform.evidence)
+        return KernelOneWireBus(master, int(bcm_pin), tuple(dict.fromkeys(evidence)))
+
+    def _sync_runtime_overlay_status(self) -> None:
+        try:
+            result = self._overlay_client.status()
+        except Exception as exc:
+            LOGGER.debug("Could not sync runtime 1-Wire overlay status: %s", exc)
+            return
+        self._record_runtime_bus_from_overlay_result(None, result)
+
+    def _record_runtime_bus_from_overlay_result(self, bcm_pin: int | None, result: OneWireOverlayResult) -> None:
+        for gpio, bus_master in result.owned_bus_masters.items():
+            if bus_master:
+                self._runtime_kernel_bus_names[int(gpio)] = bus_master
+        if bcm_pin is not None and result.bus_master:
+            self._runtime_kernel_bus_names[int(bcm_pin)] = result.bus_master
+
+    def _capture_runtime_bus_after_activation(self, bcm_pin: int, before_masters: set[str]) -> None:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            created = sorted(self._one_wire_bus_master_names() - before_masters)
+            if len(created) == 1:
+                self._runtime_kernel_bus_names[int(bcm_pin)] = created[0]
+                return
+            if len(created) > 1:
+                LOGGER.warning(
+                    "Runtime w1-gpio activation on BCM %s created multiple bus masters %s; refusing to infer ownership.",
+                    bcm_pin,
+                    created,
+                )
+                return
+            time.sleep(0.1)
+
+    def _verified_w1_gpio_platform_for_gpio(self, bcm_pin: int) -> KernelOneWirePlatform | None:
+        matches = [platform for platform in self._w1_gpio_platforms() if platform.gpio_bcm == int(bcm_pin)]
+        consumer = self._gpioinfo_consumer_for_gpio(int(bcm_pin))
+        if consumer:
+            matches = [platform for platform in matches if platform.name == consumer]
+        if len(matches) == 1:
+            evidence = list(matches[0].evidence)
+            if consumer:
+                evidence.append(f"gpioinfo_consumer={consumer}")
+            return KernelOneWirePlatform(matches[0].name, matches[0].path, matches[0].gpio_bcm, tuple(evidence))
+        return None
+
+    def _w1_gpio_platforms(self) -> list[KernelOneWirePlatform]:
+        platforms: list[KernelOneWirePlatform] = []
+        for path in sorted(self.platform_root.glob("*")):
+            if not path.is_dir():
+                continue
+            driver = self._driver_name(path)
+            driver_ok = bool(driver and driver.replace("_", "-") == "w1-gpio")
+            compatible_ok = False
+            gpio_values: list[int] = []
+            evidence: list[str] = []
+            if driver_ok:
+                evidence.append(f"driver={driver}")
+            for of_node in self._of_node_paths(path):
+                compatible = self._read_of_node_compatible(of_node)
+                if any("w1-gpio" in item.replace("_", "-") for item in compatible):
+                    compatible_ok = True
+                    evidence.append(f"compatible={compatible}")
+                gpiopin = self._read_gpio_pin_property(of_node)
+                if gpiopin is not None:
+                    gpio_values.append(gpiopin)
+                    evidence.append(f"gpiopin={gpiopin}")
+                gpio_cells = self._read_gpio_cells(of_node / "gpios")
+                if gpio_cells:
+                    gpio_values.extend(gpio_cells)
+                    evidence.append(f"gpios={gpio_cells}")
+            unique_gpios = sorted(set(gpio_values))
+            if (driver_ok or compatible_ok) and len(unique_gpios) == 1:
+                platforms.append(KernelOneWirePlatform(path.name, path, unique_gpios[0], tuple(dict.fromkeys(evidence))))
+        return platforms
+
+    def _gpioinfo_consumer_for_gpio(self, bcm_pin: int) -> str:
+        command = self._gpioinfo_path()
+        if not command:
+            return ""
+        for args in ([command, "-c", "gpiochip0", str(bcm_pin)], [command, "gpiochip0"]):
+            try:
+                result = self._subprocess_run(args, capture_output=True, check=False, text=True, timeout=3.0)
+            except Exception:
+                continue
+            if result.returncode != 0:
+                continue
+            consumer = self._parse_gpioinfo_consumer(str(result.stdout), int(bcm_pin))
+            if consumer:
+                return consumer
+        return ""
+
+    @staticmethod
+    def _parse_gpioinfo_consumer(text: str, bcm_pin: int) -> str:
+        for line in text.splitlines():
+            lowered = line.lower()
+            if f" {bcm_pin} " not in f" {line} " and f"line {bcm_pin}:" not in lowered:
+                continue
+            match = re.search(r'consumer="?([^"\s]+)"?', line)
+            if match:
+                return match.group(1)
+        return ""
 
     def _kernel_bus_evidence_paths(self, master: Path) -> list[Path]:
         paths: list[Path] = []
@@ -859,10 +998,16 @@ class TemperatureReader:
             if self._kernel_bus_for_gpio(bcm_pin, required=False) is not None:
                 return
             time.sleep(0.1)
-        LOGGER.warning("Kernel 1-Wire overlay on BCM %s loaded but no expected DS18B20 appeared yet.", bcm_pin)
+        raise HardwareUnavailable(
+            f"Kernel 1-Wire overlay on BCM {bcm_pin} loaded, but no verifiable GPIO-to-w1-bus mapping appeared. "
+            f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
+        )
 
     def _dtoverlay_path(self) -> str:
         return self._dtoverlay_command or shutil.which("dtoverlay") or "/usr/bin/dtoverlay"
+
+    def _gpioinfo_path(self) -> str:
+        return self._gpioinfo_command or shutil.which("gpioinfo") or ""
 
     def _one_wire_diagnostics(self, *, bcm_pin: int | None = None) -> str:
         bus_details = []
@@ -873,8 +1018,16 @@ class TemperatureReader:
             else:
                 sensors = self._one_wire_sensor_ids_for_bus(bus)
                 bus_details.append(f"{master.name}:gpio={bus.gpio_bcm}:sensors={sensors or 'none'}")
+        platform_details = [
+            f"{platform.name}:gpio={platform.gpio_bcm}:evidence={list(platform.evidence)}"
+            for platform in self._w1_gpio_platforms()
+        ]
+        runtime_details = {gpio: bus for gpio, bus in sorted(self._runtime_kernel_bus_names.items())}
         target = f"target BCM GPIO {bcm_pin}; " if bcm_pin is not None else ""
-        return f"{target}verified bus masters={bus_details or 'none'}."
+        return (
+            f"{target}verified bus masters={bus_details or 'none'}; "
+            f"w1-gpio platform devices={platform_details or 'none'}; captured runtime buses={runtime_details or 'none'}."
+        )
 
     def read_host_cpu(self) -> float:
         for path in (Path("/sys/class/thermal/thermal_zone0/temp"), Path("/sys/devices/virtual/thermal/thermal_zone0/temp")):
