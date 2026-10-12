@@ -409,7 +409,7 @@ class FakeOverlayClient:
         return OneWireOverlayResult("release", gpio, owned=True, safe_input=True)
 
     def status(self) -> OneWireOverlayResult:
-        return OneWireOverlayResult("status", -1)
+        return OneWireOverlayResult("status", -1, owned_gpios=tuple(self.activated))
 
 
 def test_kernel_one_wire_existing_sensor_skips_privileged_setup(tmp_path) -> None:
@@ -525,6 +525,21 @@ def test_kernel_one_wire_rejects_initial_power_up_default_85c(tmp_path) -> None:
 
     with pytest.raises(HardwareUnavailable, match="power-up default"):
         reader.read_one_wire_gpio_detailed(4)
+
+
+def test_kernel_one_wire_retries_initial_power_up_default_85c(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "w1"
+    root.mkdir()
+    master = write_w1_bus(root, "w1_bus_master1", 4, {"28-000000000085": 85_000})
+    slave = master / "28-000000000085" / "w1_slave"
+    reader = TemperatureReader(simulation=False, one_wire_root=root)
+
+    def complete_conversion(_seconds: float) -> None:
+        slave.write_text("aa YES\nbb t=25000\n", encoding="utf-8")
+
+    monkeypatch.setattr("loggerhead.drivers.time.sleep", complete_conversion)
+
+    assert reader.read_one_wire_gpio_detailed(4).fahrenheit == 77.0
 
 
 def test_kernel_one_wire_requires_single_sensor_on_verified_gpio_bus(tmp_path) -> None:

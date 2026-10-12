@@ -2,11 +2,24 @@ from __future__ import annotations
 
 import json
 import types
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
 
 import pytest
 
 from loggerhead.hardware import DiagnosticHalt
 from loggerhead.onewire import HelperOneWireOverlayClient, parse_dtoverlay_list
+
+
+def load_helper_module():
+    path = Path(__file__).parents[1] / "scripts" / "loggerhead-onewire-helper"
+    loader = SourceFileLoader("loggerhead_onewire_helper_test", str(path))
+    spec = spec_from_loader(loader.name, loader)
+    assert spec is not None
+    module = module_from_spec(spec)
+    loader.exec_module(module)
+    return module
 
 
 def test_parse_dtoverlay_list_extracts_w1_gpio_runtime_overlays() -> None:
@@ -51,3 +64,67 @@ def test_helper_client_parses_json_result(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert result.created is True
     assert result.owned is True
+
+
+def test_helper_release_refuses_unowned_active_overlay(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    helper = load_helper_module()
+    helper.STATE_DIR = tmp_path
+    helper.STATE_PATH = tmp_path / "owned.json"
+    monkeypatch.setattr(helper, "list_overlays", lambda: [{"index": 0, "name": "w1-gpio", "params": {"gpiopin": "17"}}])
+
+    with pytest.raises(helper.HelperError, match="not owned"):
+        helper.release(17)
+
+
+def test_helper_release_refuses_stale_overlay_identity(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    helper = load_helper_module()
+    helper.STATE_DIR = tmp_path
+    helper.STATE_PATH = tmp_path / "owned.json"
+    helper.save_state(
+        {
+            "owned_gpios": {
+                "17": {
+                    "activated_at": 1.0,
+                    "overlay": {"index": 0, "name": "w1-gpio", "params": {"gpiopin": "17"}},
+                }
+            }
+        }
+    )
+    removed: list[list[str]] = []
+    monkeypatch.setattr(helper, "list_overlays", lambda: [{"index": 1, "name": "w1-gpio", "params": {"gpiopin": "17"}}])
+    monkeypatch.setattr(helper, "run", lambda command, **_kwargs: removed.append(command))
+
+    with pytest.raises(helper.HelperError, match="no longer matches"):
+        helper.release(17)
+
+    assert removed == []
+
+
+def test_helper_release_reports_later_w1_overlays_and_safe_handoff(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    helper = load_helper_module()
+    helper.STATE_DIR = tmp_path
+    helper.STATE_PATH = tmp_path / "owned.json"
+    helper.save_state(
+        {
+            "owned_gpios": {
+                "4": {
+                    "activated_at": 1.0,
+                    "overlay": {"index": 0, "name": "w1-gpio", "params": {"gpiopin": "4"}},
+                }
+            }
+        }
+    )
+    overlays = [
+        {"index": 0, "name": "w1-gpio", "params": {"gpiopin": "4"}},
+        {"index": 1, "name": "w1-gpio", "params": {"gpiopin": "17"}},
+    ]
+    removed: list[list[str]] = []
+    monkeypatch.setattr(helper, "list_overlays", lambda: overlays)
+    monkeypatch.setattr(helper, "run", lambda command, **_kwargs: removed.append(command))
+    monkeypatch.setattr(helper, "set_gpio_input", lambda _gpio: True)
+
+    result = helper.release(4)
+
+    assert result["affected_gpios"] == [17]
+    assert result["safe_input"] is True
+    assert removed == [[helper.DTOVERLAY, "-r", "0"]]

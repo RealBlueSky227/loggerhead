@@ -58,6 +58,9 @@ class RuntimeOverlay:
         except ValueError:
             return None
 
+    def identity(self) -> dict[str, Any]:
+        return {"index": self.index, "name": self.name, "params": dict(self.params)}
+
 
 @dataclass(frozen=True)
 class OneWireOverlayResult:
@@ -71,6 +74,7 @@ class OneWireOverlayResult:
     safe_input: bool | None = None
     message: str = ""
     overlays: tuple[RuntimeOverlay, ...] = ()
+    owned_gpios: tuple[int, ...] = ()
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> OneWireOverlayResult:
@@ -93,6 +97,7 @@ class OneWireOverlayResult:
             safe_input=payload.get("safe_input"),
             message=str(payload.get("message", "")),
             overlays=overlays,
+            owned_gpios=tuple(int(item) for item in payload.get("owned_gpios", [])),
         )
 
 

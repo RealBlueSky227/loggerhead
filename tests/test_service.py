@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from dataclasses import asdict
@@ -317,6 +318,68 @@ def test_sensor_runtime_releases_removed_kernel_one_wire_pin_and_marks_affected_
     assert service._kernel_one_wire_pins == {4}
     assert service.state.sensor_health["sense_port_2_analog"].status == "stale"
     assert "overlay stack" in service.state.sensor_health["sense_port_2_analog"].last_error
+
+
+def test_sensor_runtime_blocks_config_change_when_kernel_release_fails(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    previous = service.config
+    service.config.sense_ports[0].device = SensePortDevice.EMPTY
+    service._kernel_one_wire_pins = {4}
+    monkeypatch.setattr(
+        service.temperature_reader,
+        "release_kernel_one_wire",
+        lambda _gpio: (_ for _ in ()).throw(HardwareUnavailable("active overlay is not owned")),
+    )
+
+    with pytest.raises(HardwareFault, match="Could not release kernel 1-Wire backend"):
+        service._rebuild_sensor_runtime(previous_config=previous)
+
+
+def test_sensor_runtime_blocks_config_change_when_gpio_handoff_is_unsafe(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    previous = copy.deepcopy(service.config)
+    previous.sense_ports[0].device = SensePortDevice.DS18B20
+    previous.sense_ports[0].one_wire_mode = OneWireMode.KERNEL
+    service.config.sense_ports[0].device = SensePortDevice.ANALOG
+    service._kernel_one_wire_pins = {4}
+    monkeypatch.setattr(
+        service.temperature_reader,
+        "release_kernel_one_wire",
+        lambda gpio: OneWireOverlayResult("release", gpio, owned=True, safe_input=False),
+    )
+
+    with pytest.raises(HardwareFault, match="handoff could not be verified"):
+        service._rebuild_sensor_runtime(previous_config=previous)
+
+
+def test_startup_restore_forces_temperature_controlled_equipment_off(tmp_path) -> None:
+    service = make_service(tmp_path)
+    service.config.sense_ports[0].device = SensePortDevice.DS18B20
+    service.config.sense_ports[0].assigned_equipment = "ac1"
+    service.config.sense_ports[0].equipment_type = EquipmentKind.HEATER
+    service.state.equipment["ac1"] = EquipmentState("ac1", True, "restore")
+
+    service._invalidate_configured_sensor_readings_on_startup()
+    service._restore_equipment_defaults()
+
+    assert service.state.equipment["ac1"].on is False
+    assert service.state.equipment["ac1"].source == "startup_sensor_lockout"
+
+
+def test_startup_releases_helper_owned_overlay_not_in_config(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    service.config.sense_ports[0].device = SensePortDevice.EMPTY
+    released: list[int] = []
+    monkeypatch.setattr(service.temperature_reader, "owned_runtime_one_wire_pins", lambda: {4})
+    monkeypatch.setattr(
+        service.temperature_reader,
+        "release_kernel_one_wire",
+        lambda gpio: released.append(gpio) or OneWireOverlayResult("release", gpio, owned=True, safe_input=True),
+    )
+
+    service._rebuild_sensor_runtime()
+
+    assert released == [4]
 
 
 @pytest.mark.parametrize(

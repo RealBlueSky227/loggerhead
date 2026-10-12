@@ -583,6 +583,12 @@ class TemperatureReader:
             self._runtime_kernel_pins.discard(bcm_pin)
         return result
 
+    def owned_runtime_one_wire_pins(self) -> set[int]:
+        if self.simulation:
+            return set()
+        result = self._overlay_client.status()
+        return set(result.owned_gpios)
+
     def read_one_wire_bus(self, sensor_id: str = "", *, bcm_pin: int | None = None) -> float:
         if sensor_id:
             raise HardwareUnavailable("DS18B20 ROM IDs are not user-configurable; read by sense-port GPIO instead.")
@@ -625,21 +631,21 @@ class TemperatureReader:
                 f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
             )
         text = path.read_text(encoding="utf-8")
-        lines = text.splitlines()
-        crc_valid = bool(lines and lines[0].strip().endswith("YES"))
-        if not crc_valid:
-            raise HardwareUnavailable(f"1-Wire sensor {resolved_id} CRC check failed.")
-        marker = "t="
-        if marker not in text:
-            raise ValueError(f"1-Wire sensor {resolved_id} returned no temperature marker.")
-        celsius = int(text.split(marker, 1)[1].strip()) / 1000
+        celsius, crc_valid = self._parse_kernel_ds18b20_text(text, resolved_id)
         if celsius < -55.0 or celsius > 125.0:
             raise HardwareUnavailable(f"1-Wire sensor {resolved_id} returned implausible DS18B20 temperature {celsius:.3f} C.")
         power_up_default_suspect = celsius == 85.0 and int(bcm_pin) not in self._last_valid_kernel_celsius
         if power_up_default_suspect:
-            raise HardwareUnavailable(
-                f"1-Wire sensor {resolved_id} returned the DS18B20 power-up default 85.000 C before a verified conversion."
-            )
+            resolution = self._read_optional_int(self._one_wire_sensor_file(bus, resolved_id, "resolution"))
+            time.sleep(self._ds18b20_conversion_seconds(resolution))
+            text = path.read_text(encoding="utf-8")
+            celsius, crc_valid = self._parse_kernel_ds18b20_text(text, resolved_id)
+            power_up_default_suspect = celsius == 85.0 and int(bcm_pin) not in self._last_valid_kernel_celsius
+            if power_up_default_suspect:
+                raise HardwareUnavailable(
+                    f"1-Wire sensor {resolved_id} returned the DS18B20 power-up default 85.000 C after retry; "
+                    "no verified conversion is available yet."
+                )
         self._last_valid_kernel_celsius[int(bcm_pin)] = celsius
         fahrenheit = celsius * 9 / 5 + 32
         return OneWireTemperatureReading(
@@ -653,6 +659,21 @@ class TemperatureReader:
             resolution=self._read_optional_int(self._one_wire_sensor_file(bus, resolved_id, "resolution")),
             power_up_default_suspect=power_up_default_suspect,
         )
+
+    @staticmethod
+    def _parse_kernel_ds18b20_text(text: str, sensor_id: str) -> tuple[float, bool]:
+        lines = text.splitlines()
+        crc_valid = bool(lines and lines[0].strip().endswith("YES"))
+        if not crc_valid:
+            raise HardwareUnavailable(f"1-Wire sensor {sensor_id} CRC check failed.")
+        marker = "t="
+        if marker not in text:
+            raise ValueError(f"1-Wire sensor {sensor_id} returned no temperature marker.")
+        return int(text.split(marker, 1)[1].strip()) / 1000, crc_valid
+
+    @staticmethod
+    def _ds18b20_conversion_seconds(resolution: int | None) -> float:
+        return {9: 0.095, 10: 0.19, 11: 0.38, 12: 0.76}.get(resolution or 12, 0.76)
 
     def _one_wire_bus_masters(self) -> list[Path]:
         return sorted(path for path in self.one_wire_root.glob("w1_bus_master*") if path.is_dir())

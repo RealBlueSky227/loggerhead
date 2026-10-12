@@ -125,6 +125,7 @@ class LoggerheadService:
         self._last_polled_log = 0.0
         self._clear_transient_stepper_state()
         self._retire_manual_prime_limit_alarms()
+        self._invalidate_configured_sensor_readings_on_startup()
         self._save_state()
         self.buzzer.stop()
         self._restore_equipment_defaults()
@@ -233,9 +234,10 @@ class LoggerheadService:
         previous = self.config
         self.config = candidate
         try:
-            self._rebuild_sensor_runtime()
+            self._rebuild_sensor_runtime(previous_config=previous)
         except Exception:
             self.config = previous
+            self._restore_previous_sensor_runtime_after_failed_update()
             raise
         save_config(self.config_path, self.config)
         self.config = load_config(self.config_path)
@@ -259,9 +261,10 @@ class LoggerheadService:
         previous = self.config
         self.config = candidate
         try:
-            self._rebuild_sensor_runtime()
+            self._rebuild_sensor_runtime(previous_config=previous)
         except Exception:
             self.config = previous
+            self._restore_previous_sensor_runtime_after_failed_update()
             raise
         save_config(self.config_path, self.config)
         self.config = load_config(self.config_path)
@@ -406,22 +409,61 @@ class LoggerheadService:
             self.set_equipment(equipment_id, on, source="mqtt")
 
     def _restore_equipment_defaults(self) -> None:
+        startup_locked = self._temperature_controlled_equipment_ids()
         for item in self.config.equipment:
-            existing = self.state.equipment.get(item.id)
-            desired = existing.on if existing else item.default_on
-            self.set_equipment(item.id, desired, source="restore")
+            if item.id in startup_locked:
+                self.set_equipment(item.id, False, source="startup_sensor_lockout")
+            else:
+                existing = self.state.equipment.get(item.id)
+                desired = existing.on if existing else item.default_on
+                self.set_equipment(item.id, desired, source="restore")
+
+    def _temperature_controlled_equipment_ids(self) -> set[str]:
+        return {sensor.assigned_equipment for sensor in materialized_temperature_sensors(self.config) if sensor.assigned_equipment}
+
+    def _invalidate_configured_sensor_readings_on_startup(self) -> None:
+        now = time.time()
+        configured_ids = {sensor["id"] for sensor in self._configured_sensor_catalog()}
+        with self._state_lock:
+            for sensor_id in configured_ids:
+                reading = self.state.readings.get(sensor_id)
+                if reading:
+                    reading.ok = False
+                health = self.state.sensor_health.setdefault(sensor_id, SensorHealth(sensor_id))
+                health.status = "initializing"
+                health.worker_state = "starting"
+                health.data_status = "initializing"
+                health.last_error = "Waiting for fresh sensor validation after startup."
+                health.last_attempt_ts = now
 
     def _clear_transient_stepper_state(self) -> None:
         with self._state_lock:
             self.state.stepper_active = None
             self.state.manual_priming = {item.id: False for item in self.config.steppers}
 
-    def _rebuild_sensor_runtime(self) -> None:
+    def _restore_previous_sensor_runtime_after_failed_update(self) -> None:
+        try:
+            self._rebuild_sensor_runtime()
+        except Exception as exc:
+            message = f"Could not restore previous sensor runtime after failed config update: {exc}"
+            LOGGER.critical(message)
+            self._activate_alarm("sensor:runtime-restore", message, priority="critical")
+
+    def _rebuild_sensor_runtime(self, *, previous_config: AppConfig | None = None) -> None:
         restart_workers = self._sensor_workers_started
+        previous_config = previous_config or self.config
         previous_kernel_pins = set(self._kernel_one_wire_pins)
+        try:
+            previous_kernel_pins.update(self.temperature_reader.owned_runtime_one_wire_pins())
+        except Exception as exc:
+            LOGGER.warning("Could not query Loggerhead-owned runtime 1-Wire overlays: %s", exc)
         desired_kernel_pins = self._desired_kernel_one_wire_pins(self.config)
         affected_transition_pins = previous_kernel_pins ^ desired_kernel_pins
-        self._mark_sensor_transition_pins(affected_transition_pins, "SensePort backend transition in progress.")
+        self._mark_sensor_transition_pins(
+            affected_transition_pins | previous_kernel_pins,
+            "SensePort backend transition in progress.",
+            configs=(previous_config, self.config),
+        )
         stuck_workers = self._stop_sensor_workers()
         if stuck_workers:
             message = f"Cannot replace sensor configuration; workers did not stop: {', '.join(stuck_workers)}."
@@ -429,7 +471,13 @@ class LoggerheadService:
             self._activate_alarm("sensor:worker-stop", message, priority="high")
             raise HardwareFault(message)
         self._close_sensor_readers()
+        release_errors: list[str] = []
         for bcm_pin in sorted(previous_kernel_pins - desired_kernel_pins):
+            self._mark_sensor_transition_pins(
+                previous_kernel_pins,
+                f"Preparing runtime 1-Wire overlay release on BCM {bcm_pin}; readings paused for revalidation.",
+                configs=(previous_config, self.config),
+            )
             try:
                 result = self.temperature_reader.release_kernel_one_wire(bcm_pin)
                 if result.affected_gpios:
@@ -441,15 +489,20 @@ class LoggerheadService:
                     self._mark_sensor_transition_pins(
                         set(result.affected_gpios),
                         "Runtime overlay stack was disturbed during another SensePort transition; waiting for revalidation.",
+                        configs=(previous_config, self.config),
                     )
                 if result.safe_input is False:
                     message = f"Kernel 1-Wire overlay released on BCM {bcm_pin}, but GPIO input handoff could not be verified."
                     LOGGER.critical(message)
                     self._activate_alarm(f"sensor:gpio:{bcm_pin}:handoff", message, priority="high")
+                    release_errors.append(message)
             except Exception as exc:
                 message = f"Could not release kernel 1-Wire backend on BCM {bcm_pin}: {exc}"
                 LOGGER.exception(message)
                 self._activate_alarm(f"sensor:gpio:{bcm_pin}:release", message, priority="high")
+                release_errors.append(message)
+        if release_errors:
+            raise HardwareFault("; ".join(release_errors))
         self._hydros = {}
         self._hydros_readers = {}
         for sensor in materialized_water_level_sensors(self.config):
@@ -475,7 +528,7 @@ class LoggerheadService:
             except Exception as exc:
                 message = f"Kernel 1-Wire backend is not ready on BCM {bcm_pin}: {exc}"
                 LOGGER.warning(message)
-                self._mark_sensor_transition_pins({bcm_pin}, message)
+                self._mark_sensor_transition_pins({bcm_pin}, message, configs=(self.config,))
         configured_ids = {sensor["id"] for sensor in self._configured_sensor_catalog()}
         self._sensor_next_due = {key: value for key, value in self._sensor_next_due.items() if key in configured_ids}
         self._sensor_last_applied_attempt = {
@@ -497,25 +550,28 @@ class LoggerheadService:
                 pins.add(SENSE_PORTS[sensor.sense_port].digital_bcm)
         return pins
 
-    def _sensor_ids_for_bcm_pins(self, pins: set[int]) -> set[str]:
+    def _sensor_ids_for_bcm_pins(self, pins: set[int], *, config: AppConfig | None = None) -> set[str]:
+        config = config or self.config
         ids: set[str] = set()
         if not pins:
             return ids
-        for sensor in materialized_temperature_sensors(self.config):
+        for sensor in materialized_temperature_sensors(config):
             if sensor.sense_port is None:
                 continue
             if SENSE_PORTS[sensor.sense_port].digital_bcm in pins:
                 ids.add(sensor.id)
-        for sensor in materialized_water_level_sensors(self.config):
+        for sensor in materialized_water_level_sensors(config):
             if SENSE_PORTS[sensor.sense_port].digital_bcm in pins:
                 ids.add(sensor.id)
-        for sensor in materialized_analog_sensors(self.config):
+        for sensor in materialized_analog_sensors(config):
             if SENSE_PORTS[sensor.sense_port].digital_bcm in pins:
                 ids.add(sensor.id)
         return ids
 
-    def _mark_sensor_transition_pins(self, pins: set[int], message: str) -> None:
-        ids = self._sensor_ids_for_bcm_pins(pins)
+    def _mark_sensor_transition_pins(self, pins: set[int], message: str, *, configs: tuple[AppConfig, ...] | None = None) -> None:
+        ids: set[str] = set()
+        for config in configs or (self.config,):
+            ids.update(self._sensor_ids_for_bcm_pins(pins, config=config))
         if not ids:
             return
         now = time.time()
@@ -1175,6 +1231,8 @@ class LoggerheadService:
 
     def _read_temperature_with_metadata_threadsafe(self, sensor) -> tuple[float, dict[str, Any]]:
         if sensor.driver == TemperatureDriver.HOST_CPU:
+            return self._read_temperature_with_metadata(sensor)
+        if sensor.driver == TemperatureDriver.ONE_WIRE_BUS:
             return self._read_temperature_with_metadata(sensor)
         with self._gpio_lock:
             return self._read_temperature_with_metadata(sensor)

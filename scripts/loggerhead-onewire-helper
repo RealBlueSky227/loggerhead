@@ -87,7 +87,11 @@ def activate(gpio: int) -> dict[str, Any]:
     overlays = list_overlays()
     existing = overlay_for_gpio(overlays, gpio)
     if existing is not None:
-        owned = str(gpio) in state["owned_gpios"]
+        entry = state["owned_gpios"].get(str(gpio))
+        owned = bool(entry and overlay_matches(entry, existing))
+        if entry and not owned:
+            state["owned_gpios"].pop(str(gpio), None)
+            save_state(state)
         return payload(
             "activate",
             gpio,
@@ -102,7 +106,7 @@ def activate(gpio: int) -> dict[str, Any]:
     created = overlay_for_gpio(overlays, gpio)
     if created is None:
         raise HelperError(f"dtoverlay reported success but no runtime w1-gpio overlay appeared for BCM GPIO {gpio}.")
-    state["owned_gpios"][str(gpio)] = {"activated_at": time.time()}
+    state["owned_gpios"][str(gpio)] = {"activated_at": time.time(), "overlay": overlay_identity(created)}
     save_state(state)
     return payload("activate", gpio, created=True, owned=True, overlays=overlays, message="Runtime w1-gpio overlay activated.")
 
@@ -111,7 +115,10 @@ def release(gpio: int) -> dict[str, Any]:
     state = load_state()
     overlays = list_overlays()
     existing = overlay_for_gpio(overlays, gpio)
-    if str(gpio) not in state["owned_gpios"]:
+    entry = state["owned_gpios"].get(str(gpio))
+    if entry is None:
+        if existing is not None:
+            raise HelperError(f"BCM GPIO {gpio} has an active w1-gpio overlay that is not owned by Loggerhead; refusing removal.")
         return payload(
             "release",
             gpio,
@@ -132,6 +139,12 @@ def release(gpio: int) -> dict[str, Any]:
             safe_input=safe_input,
             overlays=overlays,
             message="Recorded Loggerhead overlay was already absent; GPIO input handoff attempted.",
+        )
+    if not overlay_matches(entry, existing):
+        state["owned_gpios"].pop(str(gpio), None)
+        save_state(state)
+        raise HelperError(
+            f"Recorded Loggerhead ownership for BCM GPIO {gpio} no longer matches the active overlay; refusing removal."
         )
     affected = tuple(
         sorted(
@@ -258,6 +271,21 @@ def overlay_gpio(item: dict[str, Any]) -> int | None:
         return None
 
 
+def overlay_identity(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "index": int(item["index"]),
+        "name": str(item["name"]),
+        "params": {str(key): str(value) for key, value in dict(item.get("params", {})).items()},
+    }
+
+
+def overlay_matches(entry: dict[str, Any], item: dict[str, Any]) -> bool:
+    recorded = entry.get("overlay")
+    if not isinstance(recorded, dict):
+        return False
+    return recorded == overlay_identity(item)
+
+
 def set_gpio_input(gpio: int) -> bool:
     commands = ([PINCTRL, "set", str(gpio), "ip"], [RASPI_GPIO, "set", str(gpio), "ip"])
     for command in commands:
@@ -265,7 +293,26 @@ def set_gpio_input(gpio: int) -> bool:
             continue
         result = subprocess.run(command, capture_output=True, check=False, text=True, timeout=3.0)
         if result.returncode == 0:
+            return gpio_is_input(gpio)
+    return False
+
+
+def gpio_is_input(gpio: int) -> bool:
+    checks = ([PINCTRL, "get", str(gpio)], [RASPI_GPIO, "get", str(gpio)], [shutil.which("gpioinfo") or "/usr/bin/gpioinfo", "gpiochip0"])
+    for command in checks:
+        if not Path(command[0]).exists():
+            continue
+        result = subprocess.run(command, capture_output=True, check=False, text=True, timeout=3.0)
+        if result.returncode != 0:
+            continue
+        text = result.stdout
+        lowered = text.lower()
+        if command[1] == "get" and ("func=input" in lowered or " ip " in lowered or lowered.strip().endswith(" ip")):
             return True
+        if command[0].endswith("gpioinfo"):
+            for line in text.splitlines():
+                if f"line {gpio}:" in line.lower() and "input" in line.lower() and "consumer=" not in line.lower():
+                    return True
     return False
 
 
