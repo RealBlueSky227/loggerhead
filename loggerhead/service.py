@@ -221,6 +221,7 @@ class LoggerheadService:
                 "buzzer_muted_until": self.state.buzzer_muted_until,
                 "buzzer_muted_remaining_seconds": max(0.0, self.state.buzzer_muted_until - time.time()),
                 "active_audible_alarm_ids": sorted(self._active_audible_alarm_ids()),
+                "history_streams": self.history_streams(),
                 "events": self.store.recent_events(30),
                 "time": time.time(),
                 "simulation": self.simulation,
@@ -228,6 +229,9 @@ class LoggerheadService:
 
     def history(self, streams: list[str], start_ts: float, end_ts: float | None = None) -> dict[str, Any]:
         return self.store.history(streams, start_ts=start_ts, end_ts=end_ts, max_points=self.config.plot_max_points)
+
+    def history_streams(self) -> list[dict[str, Any]]:
+        return self.store.stream_catalog()
 
     def update_config(self, payload: dict[str, Any]) -> AppConfig:
         # Implements SRS 5.4.1 Dynamic Application by replacing the active config

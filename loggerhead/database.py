@@ -136,6 +136,47 @@ class TelemetryStore:
                 )
         return result
 
+    def stream_catalog(self) -> list[dict[str, Any]]:
+        """Return streams that have ever been written to telemetry."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    stream,
+                    MAX(ts) AS last_ts,
+                    COUNT(*) AS count,
+                    SUM(CASE WHEN value IS NOT NULL THEN 1 ELSE 0 END) AS numeric_count,
+                    SUM(CASE WHEN text_value IS NOT NULL THEN 1 ELSE 0 END) AS text_count
+                FROM telemetry
+                GROUP BY stream
+                ORDER BY stream ASC
+                """
+            ).fetchall()
+            catalog: list[dict[str, Any]] = []
+            for row in rows:
+                latest = conn.execute(
+                    "SELECT unit FROM telemetry WHERE stream = ? ORDER BY ts DESC LIMIT 1",
+                    (row["stream"],),
+                ).fetchone()
+                numeric_count = int(row["numeric_count"] or 0)
+                text_count = int(row["text_count"] or 0)
+                if numeric_count and text_count:
+                    kind = "mixed"
+                elif text_count:
+                    kind = "categorical"
+                else:
+                    kind = "numeric"
+                catalog.append(
+                    {
+                        "stream": row["stream"],
+                        "unit": latest["unit"] if latest else "",
+                        "kind": kind,
+                        "last_ts": row["last_ts"],
+                        "count": row["count"],
+                    }
+                )
+            return catalog
+
     def prune_if_critical(self, *, warning_free_ratio: float = 0.20, critical_free_ratio: float = 0.05) -> bool:
         usage = shutil.disk_usage(self.path.parent)
         free_ratio = usage.free / usage.total if usage.total else 1.0
