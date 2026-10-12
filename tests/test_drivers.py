@@ -22,6 +22,7 @@ from loggerhead.drivers import (
     TemperatureReader,
 )
 from loggerhead.hardware import RELAYS, STEPPERS, AlarmPriority, DiagnosticHalt, LevelState
+from loggerhead.onewire import OneWireOverlayResult
 
 
 class FakeMCPBus:
@@ -390,6 +391,27 @@ def write_w1_bus(
     return master
 
 
+class FakeOverlayClient:
+    def __init__(self, root: Path | None = None, *, create_bus: bool = False) -> None:
+        self.root = root
+        self.create_bus = create_bus
+        self.activated: list[int] = []
+        self.released: list[int] = []
+
+    def activate(self, gpio: int) -> OneWireOverlayResult:
+        self.activated.append(gpio)
+        if self.create_bus and self.root is not None:
+            write_w1_bus(self.root, f"w1_bus_master{gpio}", gpio)
+        return OneWireOverlayResult("activate", gpio, created=True, owned=True)
+
+    def release(self, gpio: int) -> OneWireOverlayResult:
+        self.released.append(gpio)
+        return OneWireOverlayResult("release", gpio, owned=True, safe_input=True)
+
+    def status(self) -> OneWireOverlayResult:
+        return OneWireOverlayResult("status", -1)
+
+
 def test_kernel_one_wire_existing_sensor_skips_privileged_setup(tmp_path) -> None:
     root = tmp_path / "w1"
     root.mkdir()
@@ -398,10 +420,12 @@ def test_kernel_one_wire_existing_sensor_skips_privileged_setup(tmp_path) -> Non
     def fail_if_called(*_args, **_kwargs):
         raise AssertionError("dtoverlay should not be called when the configured sensor is already visible")
 
-    reader = TemperatureReader(simulation=False, one_wire_root=root, subprocess_run=fail_if_called)
+    overlay = FakeOverlayClient()
+    reader = TemperatureReader(simulation=False, one_wire_root=root, overlay_client=overlay, subprocess_run=fail_if_called)
     reader.configure_kernel_one_wire(4)
 
     assert reader.read_one_wire_gpio(4) == 77.0
+    assert overlay.activated == []
 
 
 def test_kernel_one_wire_reads_only_sensor_from_verified_gpio_bus(tmp_path) -> None:
@@ -415,37 +439,26 @@ def test_kernel_one_wire_reads_only_sensor_from_verified_gpio_bus(tmp_path) -> N
     assert reader.read_one_wire_gpio(17) == 86.0
 
 
-def test_kernel_one_wire_uses_narrow_privileged_overlay_setup(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_kernel_one_wire_uses_privileged_helper_overlay_client(tmp_path) -> None:
     root = tmp_path / "w1"
     root.mkdir()
-    calls: list[list[str]] = []
-    monkeypatch.setattr("loggerhead.drivers.os.geteuid", lambda: 1000, raising=False)
-
-    def fake_run(command, **_kwargs):
-        calls.append(list(command))
-        if command == ["dtoverlay", "-l"]:
-            return types.SimpleNamespace(returncode=0, stdout="No overlays loaded\n", stderr="")
-        if command == ["sudo", "-n", "dtoverlay", "w1-gpio", "gpiopin=4"]:
-            write_w1_bus(root, "w1_bus_master1", 4)
-            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
-        raise AssertionError(f"unexpected command {command}")
+    overlay = FakeOverlayClient(root, create_bus=True)
 
     reader = TemperatureReader(
         simulation=False,
         one_wire_root=root,
-        dtoverlay_command="dtoverlay",
-        sudo_command="sudo",
-        subprocess_run=fake_run,
+        overlay_client=overlay,
     )
     reader.configure_kernel_one_wire(4)
 
-    assert ["sudo", "-n", "dtoverlay", "w1-gpio", "gpiopin=4"] in calls
+    assert overlay.activated == [4]
+    assert reader._kernel_bus_for_gpio(4).master.name == "w1_bus_master4"
 
 
 def test_kernel_one_wire_refuses_runtime_setup_when_process_is_root(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "w1"
     root.mkdir()
-    monkeypatch.setattr("loggerhead.drivers.os.geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr("loggerhead.onewire.os.geteuid", lambda: 0, raising=False)
 
     def fake_run(command, **_kwargs):
         if command == ["dtoverlay", "-l"]:
@@ -455,12 +468,11 @@ def test_kernel_one_wire_refuses_runtime_setup_when_process_is_root(tmp_path, mo
     reader = TemperatureReader(
         simulation=False,
         one_wire_root=root,
-        dtoverlay_command="dtoverlay",
-        sudo_command="sudo",
+        overlay_client=None,
         subprocess_run=fake_run,
     )
 
-    with pytest.raises(HardwareUnavailable, match="root Loggerhead process"):
+    with pytest.raises(PermissionError, match="root Loggerhead process"):
         reader.configure_kernel_one_wire(4)
 
 
@@ -478,11 +490,41 @@ def test_kernel_one_wire_does_not_duplicate_loaded_overlay(tmp_path) -> None:
         one_wire_root=root,
         dtoverlay_command="dtoverlay",
         sudo_command="sudo",
+        overlay_client=FakeOverlayClient(),
         subprocess_run=fake_run,
     )
+    reader._wait_for_kernel_one_wire = lambda _pin: None  # type: ignore[method-assign]
     reader.configure_kernel_one_wire(4)
 
     assert calls == [["dtoverlay", "-l"]]
+
+
+def test_kernel_one_wire_detailed_read_reports_power_resolution_and_bus(tmp_path) -> None:
+    root = tmp_path / "w1"
+    root.mkdir()
+    master = write_w1_bus(root, "w1_bus_master1", 17, {"28-00000ff27476": 23_937})
+    sensor_dir = master / "28-00000ff27476"
+    sensor_dir.joinpath("ext_power").write_text("1\n", encoding="ascii")
+    sensor_dir.joinpath("resolution").write_text("12\n", encoding="ascii")
+    reader = TemperatureReader(simulation=False, one_wire_root=root)
+
+    reading = reader.read_one_wire_gpio_detailed(17)
+
+    assert reading.sensor_id == "28-00000ff27476"
+    assert reading.bus_master == "w1_bus_master1"
+    assert reading.ext_power == 1
+    assert reading.resolution == 12
+    assert reading.fahrenheit == pytest.approx(75.0866, abs=0.001)
+
+
+def test_kernel_one_wire_rejects_initial_power_up_default_85c(tmp_path) -> None:
+    root = tmp_path / "w1"
+    root.mkdir()
+    write_w1_bus(root, "w1_bus_master1", 4, {"28-000000000085": 85_000})
+    reader = TemperatureReader(simulation=False, one_wire_root=root)
+
+    with pytest.raises(HardwareUnavailable, match="power-up default"):
+        reader.read_one_wire_gpio_detailed(4)
 
 
 def test_kernel_one_wire_requires_single_sensor_on_verified_gpio_bus(tmp_path) -> None:

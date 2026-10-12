@@ -26,6 +26,13 @@ from .hardware import (
     RelayAssignment,
     StepperAssignment,
 )
+from .onewire import (
+    HelperOneWireOverlayClient,
+    NullOneWireOverlayClient,
+    OneWireOverlayClient,
+    OneWireOverlayResult,
+    OneWireTemperatureReading,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -528,14 +535,23 @@ class TemperatureReader:
         one_wire_root: Path | None = None,
         dtoverlay_command: str | None = None,
         sudo_command: str | None = None,
+        overlay_client: OneWireOverlayClient | None = None,
         subprocess_run: Callable[..., Any] = subprocess.run,
     ) -> None:
         self.simulation = simulation
         self._configured_kernel_pins: set[int] = set()
+        self._runtime_kernel_pins: set[int] = set()
+        self._last_valid_kernel_celsius: dict[int, float] = {}
         self.one_wire_root = one_wire_root or Path("/sys/bus/w1/devices")
         self._dtoverlay_command = dtoverlay_command
         self._sudo_command = sudo_command
         self._subprocess_run = subprocess_run
+        if overlay_client is not None:
+            self._overlay_client = overlay_client
+        elif simulation:
+            self._overlay_client = NullOneWireOverlayClient()
+        else:
+            self._overlay_client = HelperOneWireOverlayClient(subprocess_run=subprocess_run)
 
     def configure_kernel_one_wire(self, bcm_pin: int) -> None:
         if self.simulation:
@@ -548,10 +564,24 @@ class TemperatureReader:
             return
         if self._overlay_loaded_for_pin(bcm_pin):
             self._configured_kernel_pins.add(bcm_pin)
+            self._wait_for_kernel_one_wire(bcm_pin)
             return
-        self._load_kernel_overlay_privileged(bcm_pin)
+        result = self._overlay_client.activate(bcm_pin)
+        if result.created or result.owned:
+            self._runtime_kernel_pins.add(bcm_pin)
         self._configured_kernel_pins.add(bcm_pin)
         self._wait_for_kernel_one_wire(bcm_pin)
+
+    def release_kernel_one_wire(self, bcm_pin: int) -> OneWireOverlayResult:
+        bcm_pin = int(bcm_pin)
+        self._configured_kernel_pins.discard(bcm_pin)
+        self._last_valid_kernel_celsius.pop(bcm_pin, None)
+        if self.simulation:
+            return self._overlay_client.release(bcm_pin)
+        result = self._overlay_client.release(bcm_pin)
+        if result.owned:
+            self._runtime_kernel_pins.discard(bcm_pin)
+        return result
 
     def read_one_wire_bus(self, sensor_id: str = "", *, bcm_pin: int | None = None) -> float:
         if sensor_id:
@@ -561,8 +591,20 @@ class TemperatureReader:
         return self.read_one_wire_gpio(bcm_pin)
 
     def read_one_wire_gpio(self, bcm_pin: int) -> float:
+        return self.read_one_wire_gpio_detailed(bcm_pin).fahrenheit
+
+    def read_one_wire_gpio_detailed(self, bcm_pin: int) -> OneWireTemperatureReading:
         if self.simulation:
-            return 78.0
+            return OneWireTemperatureReading(
+                bcm_pin=int(bcm_pin),
+                sensor_id="simulation",
+                bus_master="simulation",
+                celsius=25.556,
+                fahrenheit=78.0,
+                crc_valid=True,
+                ext_power=1,
+                resolution=12,
+            )
         bus = self._kernel_bus_for_gpio(int(bcm_pin))
         sensor_ids = self._one_wire_sensor_ids_for_bus(bus)
         if not sensor_ids:
@@ -583,12 +625,34 @@ class TemperatureReader:
                 f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
             )
         text = path.read_text(encoding="utf-8")
-        if "YES" not in text.splitlines()[0]:
+        lines = text.splitlines()
+        crc_valid = bool(lines and lines[0].strip().endswith("YES"))
+        if not crc_valid:
             raise HardwareUnavailable(f"1-Wire sensor {resolved_id} CRC check failed.")
         marker = "t="
         if marker not in text:
             raise ValueError(f"1-Wire sensor {resolved_id} returned no temperature marker.")
-        return int(text.split(marker, 1)[1].strip()) / 1000 * 9 / 5 + 32
+        celsius = int(text.split(marker, 1)[1].strip()) / 1000
+        if celsius < -55.0 or celsius > 125.0:
+            raise HardwareUnavailable(f"1-Wire sensor {resolved_id} returned implausible DS18B20 temperature {celsius:.3f} C.")
+        power_up_default_suspect = celsius == 85.0 and int(bcm_pin) not in self._last_valid_kernel_celsius
+        if power_up_default_suspect:
+            raise HardwareUnavailable(
+                f"1-Wire sensor {resolved_id} returned the DS18B20 power-up default 85.000 C before a verified conversion."
+            )
+        self._last_valid_kernel_celsius[int(bcm_pin)] = celsius
+        fahrenheit = celsius * 9 / 5 + 32
+        return OneWireTemperatureReading(
+            bcm_pin=int(bcm_pin),
+            sensor_id=resolved_id,
+            bus_master=bus.master.name,
+            celsius=celsius,
+            fahrenheit=fahrenheit,
+            crc_valid=crc_valid,
+            ext_power=self._read_optional_int(self._one_wire_sensor_file(bus, resolved_id, "ext_power")),
+            resolution=self._read_optional_int(self._one_wire_sensor_file(bus, resolved_id, "resolution")),
+            power_up_default_suspect=power_up_default_suspect,
+        )
 
     def _one_wire_bus_masters(self) -> list[Path]:
         return sorted(path for path in self.one_wire_root.glob("w1_bus_master*") if path.is_dir())
@@ -729,12 +793,25 @@ class TemperatureReader:
         return sorted(path.name for path in bus.master.glob("28-*"))
 
     def _one_wire_slave_path(self, bus: KernelOneWireBus, sensor_id: str) -> Path:
-        bus_path = bus.master / sensor_id / "w1_slave"
+        bus_path = self._one_wire_sensor_file(bus, sensor_id, "w1_slave")
         if bus_path.exists():
             return bus_path
         # The ID comes from the verified bus master, so this is only a sysfs
         # layout fallback for kernels that expose slave directories at bus root.
         return self.one_wire_root / sensor_id / "w1_slave"
+
+    def _one_wire_sensor_file(self, bus: KernelOneWireBus, sensor_id: str, filename: str) -> Path:
+        bus_path = bus.master / sensor_id / filename
+        if bus_path.exists():
+            return bus_path
+        return self.one_wire_root / sensor_id / filename
+
+    @staticmethod
+    def _read_optional_int(path: Path) -> int | None:
+        try:
+            return int(path.read_text(encoding="ascii", errors="ignore").strip())
+        except (OSError, ValueError):
+            return None
 
     def _overlay_loaded_for_pin(self, bcm_pin: int) -> bool:
         dtoverlay = self._dtoverlay_path()
@@ -755,37 +832,6 @@ class TemperatureReader:
                 return True
         return False
 
-    def _load_kernel_overlay_privileged(self, bcm_pin: int) -> None:
-        dtoverlay = self._dtoverlay_path()
-        sudo = self._sudo_path()
-        if not dtoverlay or not sudo:
-            raise HardwareUnavailable(
-                f"Could not enable kernel 1-Wire on BCM {bcm_pin}: dtoverlay/sudo is unavailable. "
-                f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
-            )
-        if hasattr(os, "geteuid") and os.geteuid() == 0:
-            raise HardwareUnavailable(
-                f"Refusing to enable kernel 1-Wire on BCM {bcm_pin} from a root Loggerhead process. "
-                "Run Loggerhead as the unprivileged reef user and allow only the dtoverlay setup command via sudo. "
-                f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
-            )
-        command = [sudo, "-n", dtoverlay, "w1-gpio", f"gpiopin={bcm_pin}"]
-        try:
-            result = self._subprocess_run(command, capture_output=True, check=False, text=True)
-        except Exception as exc:
-            raise HardwareUnavailable(
-                f"Could not enable kernel 1-Wire on BCM {bcm_pin}: {exc}. "
-                f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
-            ) from exc
-        if result.returncode != 0:
-            stderr = str(result.stderr).strip() or str(result.stdout).strip() or f"exit code {result.returncode}"
-            raise HardwareUnavailable(
-                f"Could not enable kernel 1-Wire on BCM {bcm_pin} using narrow privileged setup: {stderr}. "
-                f"Run the controller as an unprivileged user and allow passwordless sudo only for: "
-                f"{sudo} -n {dtoverlay} w1-gpio gpiopin={bcm_pin}. "
-                f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
-            )
-
     def _wait_for_kernel_one_wire(self, bcm_pin: int) -> None:
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
@@ -796,9 +842,6 @@ class TemperatureReader:
 
     def _dtoverlay_path(self) -> str:
         return self._dtoverlay_command or shutil.which("dtoverlay") or "/usr/bin/dtoverlay"
-
-    def _sudo_path(self) -> str:
-        return self._sudo_command or shutil.which("sudo") or "/usr/bin/sudo"
 
     def _one_wire_diagnostics(self, *, bcm_pin: int | None = None) -> str:
         bus_details = []

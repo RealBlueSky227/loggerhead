@@ -1,0 +1,1 @@
+reef ALL=(root) NOPASSWD: /usr/local/sbin/loggerhead-onewire-helper *

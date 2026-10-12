@@ -254,7 +254,7 @@ INDEX_HTML = r"""<!doctype html>
       ["ds18b20", "DS18B20 temperature"],
       ["analog", "Analog voltage"],
     ];
-    const WIRE_OPTIONS = [["bit_bang", "GPIO bit-bang"], ["kernel", "Kernel 1-Wire"]];
+    const WIRE_OPTIONS = [["kernel", "Kernel 1-Wire"], ["bit_bang", "GPIO bit-bang experimental"]];
     const LEVEL_OPTIONS = [["dry", "Dry"], ["low", "Low"], ["normal", "Normal"], ["high", "High"], ["submerged", "Submerged"], ["wet", "Wet"]];
     const EQUIPMENT_TYPES = [["heater", "Heater"], ["chiller", "Chiller"], ["fan", "Fan"], ["generic", "Generic"]];
     document.querySelectorAll("[data-tab]").forEach(btn => btn.onclick = () => {

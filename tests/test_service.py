@@ -9,6 +9,7 @@ import pytest
 from loggerhead.config import ATOProfile, OneWireMode, SensePortDevice
 from loggerhead.drivers import HardwareFault, HardwareUnavailable, StepperRunResult
 from loggerhead.hardware import STEPPERS, AlarmPriority, DiagnosticHalt, EquipmentKind, LevelState
+from loggerhead.onewire import OneWireOverlayResult, OneWireTemperatureReading
 from loggerhead.sensor_workers import SensorWorkerSnapshot
 from loggerhead.service import LoggerheadService
 from loggerhead.state import AlarmState, EquipmentState
@@ -263,10 +264,21 @@ def test_kernel_one_wire_worker_recovers_after_setup_failure(tmp_path, monkeypat
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            raise HardwareUnavailable("sudo -n dtoverlay failed")
+            raise HardwareUnavailable("one-wire helper activation failed")
 
     monkeypatch.setattr(service.temperature_reader, "configure_kernel_one_wire", configure)
-    monkeypatch.setattr(service.temperature_reader, "read_one_wire_gpio", lambda _bcm_pin: 78.6)
+    monkeypatch.setattr(
+        service.temperature_reader,
+        "read_one_wire_gpio_detailed",
+        lambda _bcm_pin: OneWireTemperatureReading(
+            bcm_pin=4,
+            sensor_id="28-000000000001",
+            bus_master="w1_bus_master1",
+            celsius=25.889,
+            fahrenheit=78.6,
+            crc_valid=True,
+        ),
+    )
     service._start_sensor_workers()
     try:
         wait_for(lambda: attempts >= 2, timeout=1.0)
@@ -277,6 +289,34 @@ def test_kernel_one_wire_worker_recovers_after_setup_failure(tmp_path, monkeypat
 
     assert service.state.sensor_health["sense_port_1_temperature"].status == "online"
     assert service.state.readings["sense_port_1_temperature"].value == 78.6
+
+
+def test_sensor_runtime_releases_removed_kernel_one_wire_pin_and_marks_affected_stack(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    service.config.sense_ports[0].device = SensePortDevice.DS18B20
+    service.config.sense_ports[0].one_wire_mode = OneWireMode.KERNEL
+    service.config.sense_ports[1].device = SensePortDevice.ANALOG
+    service._kernel_one_wire_pins = {4, 17}
+    released: list[int] = []
+    configured: list[int] = []
+
+    def release(gpio: int) -> OneWireOverlayResult:
+        released.append(gpio)
+        return OneWireOverlayResult("release", gpio, owned=True, affected_gpios=(17,), safe_input=True)
+
+    def configure(gpio: int) -> None:
+        configured.append(gpio)
+
+    monkeypatch.setattr(service.temperature_reader, "release_kernel_one_wire", release)
+    monkeypatch.setattr(service.temperature_reader, "configure_kernel_one_wire", configure)
+
+    service._rebuild_sensor_runtime()
+
+    assert released == [17]
+    assert configured == [4]
+    assert service._kernel_one_wire_pins == {4}
+    assert service.state.sensor_health["sense_port_2_analog"].status == "stale"
+    assert "overlay stack" in service.state.sensor_health["sense_port_2_analog"].last_error
 
 
 @pytest.mark.parametrize(

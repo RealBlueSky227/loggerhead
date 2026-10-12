@@ -116,7 +116,7 @@ class SensePortProfile:
     device: SensePortDevice = SensePortDevice.EMPTY
     name: str = ""
     check_frequency: float = 10.0
-    one_wire_mode: OneWireMode = OneWireMode.BIT_BANG
+    one_wire_mode: OneWireMode = OneWireMode.KERNEL
     sensor_id: str = ""
     desired_state: LevelState = LevelState.NORMAL
     alert_wait: float = 60.0

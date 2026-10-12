@@ -120,6 +120,7 @@ class LoggerheadService:
         self._gpio_lock = threading.RLock()
         self._hydros: dict[str, HydrosTripleClassifier] = {}
         self._hydros_readers: dict[str, HydrosPulseReader] = {}
+        self._kernel_one_wire_pins: set[int] = set()
         self._rebuild_sensor_runtime()
         self._last_polled_log = 0.0
         self._clear_transient_stepper_state()
@@ -417,6 +418,10 @@ class LoggerheadService:
 
     def _rebuild_sensor_runtime(self) -> None:
         restart_workers = self._sensor_workers_started
+        previous_kernel_pins = set(self._kernel_one_wire_pins)
+        desired_kernel_pins = self._desired_kernel_one_wire_pins(self.config)
+        affected_transition_pins = previous_kernel_pins ^ desired_kernel_pins
+        self._mark_sensor_transition_pins(affected_transition_pins, "SensePort backend transition in progress.")
         stuck_workers = self._stop_sensor_workers()
         if stuck_workers:
             message = f"Cannot replace sensor configuration; workers did not stop: {', '.join(stuck_workers)}."
@@ -424,6 +429,27 @@ class LoggerheadService:
             self._activate_alarm("sensor:worker-stop", message, priority="high")
             raise HardwareFault(message)
         self._close_sensor_readers()
+        for bcm_pin in sorted(previous_kernel_pins - desired_kernel_pins):
+            try:
+                result = self.temperature_reader.release_kernel_one_wire(bcm_pin)
+                if result.affected_gpios:
+                    LOGGER.warning(
+                        "Releasing runtime w1-gpio overlay on BCM %s affected later runtime overlays on BCM pins %s.",
+                        bcm_pin,
+                        result.affected_gpios,
+                    )
+                    self._mark_sensor_transition_pins(
+                        set(result.affected_gpios),
+                        "Runtime overlay stack was disturbed during another SensePort transition; waiting for revalidation.",
+                    )
+                if result.safe_input is False:
+                    message = f"Kernel 1-Wire overlay released on BCM {bcm_pin}, but GPIO input handoff could not be verified."
+                    LOGGER.critical(message)
+                    self._activate_alarm(f"sensor:gpio:{bcm_pin}:handoff", message, priority="high")
+            except Exception as exc:
+                message = f"Could not release kernel 1-Wire backend on BCM {bcm_pin}: {exc}"
+                LOGGER.exception(message)
+                self._activate_alarm(f"sensor:gpio:{bcm_pin}:release", message, priority="high")
         self._hydros = {}
         self._hydros_readers = {}
         for sensor in materialized_water_level_sensors(self.config):
@@ -443,6 +469,13 @@ class LoggerheadService:
                 )
             except Exception as exc:
                 LOGGER.warning("HYDROS reader unavailable for %s on BCM %s: %s", sensor.id, port.digital_bcm, exc)
+        for bcm_pin in sorted(desired_kernel_pins):
+            try:
+                self.temperature_reader.configure_kernel_one_wire(bcm_pin)
+            except Exception as exc:
+                message = f"Kernel 1-Wire backend is not ready on BCM {bcm_pin}: {exc}"
+                LOGGER.warning(message)
+                self._mark_sensor_transition_pins({bcm_pin}, message)
         configured_ids = {sensor["id"] for sensor in self._configured_sensor_catalog()}
         self._sensor_next_due = {key: value for key, value in self._sensor_next_due.items() if key in configured_ids}
         self._sensor_last_applied_attempt = {
@@ -452,9 +485,51 @@ class LoggerheadService:
             self.state.sensor_health = {
                 key: value for key, value in self.state.sensor_health.items() if key in configured_ids
             }
+        self._kernel_one_wire_pins = desired_kernel_pins
         self._install_sensor_workers(self._build_sensor_worker_specs())
         if restart_workers:
             self._start_sensor_workers()
+
+    def _desired_kernel_one_wire_pins(self, config: AppConfig) -> set[int]:
+        pins: set[int] = set()
+        for sensor in materialized_temperature_sensors(config):
+            if sensor.driver == TemperatureDriver.ONE_WIRE_BUS and sensor.sense_port is not None:
+                pins.add(SENSE_PORTS[sensor.sense_port].digital_bcm)
+        return pins
+
+    def _sensor_ids_for_bcm_pins(self, pins: set[int]) -> set[str]:
+        ids: set[str] = set()
+        if not pins:
+            return ids
+        for sensor in materialized_temperature_sensors(self.config):
+            if sensor.sense_port is None:
+                continue
+            if SENSE_PORTS[sensor.sense_port].digital_bcm in pins:
+                ids.add(sensor.id)
+        for sensor in materialized_water_level_sensors(self.config):
+            if SENSE_PORTS[sensor.sense_port].digital_bcm in pins:
+                ids.add(sensor.id)
+        for sensor in materialized_analog_sensors(self.config):
+            if SENSE_PORTS[sensor.sense_port].digital_bcm in pins:
+                ids.add(sensor.id)
+        return ids
+
+    def _mark_sensor_transition_pins(self, pins: set[int], message: str) -> None:
+        ids = self._sensor_ids_for_bcm_pins(pins)
+        if not ids:
+            return
+        now = time.time()
+        with self._state_lock:
+            for sensor_id in ids:
+                health = self.state.sensor_health.setdefault(sensor_id, SensorHealth(sensor_id))
+                health.status = "stale"
+                health.worker_state = "stopped"
+                health.data_status = "stale"
+                health.last_error = message
+                reading = self.state.readings.get(sensor_id)
+                if reading:
+                    reading.ok = False
+                health.last_attempt_ts = now
 
     def _close_sensor_readers(self) -> None:
         for reader in self._hydros_readers.values():
@@ -471,8 +546,8 @@ class LoggerheadService:
 
             def read_temperature(stop: threading.Event, sensor=sensor, stale_after=stale_after) -> SensorReadResult:
                 del stop, stale_after
-                value = self._read_temperature_threadsafe(sensor)
-                return SensorReadResult(sensor.id, "temperature", round(value, 3), "F")
+                value, metadata = self._read_temperature_with_metadata_threadsafe(sensor)
+                return SensorReadResult(sensor.id, "temperature", round(value, 3), "F", metadata=metadata)
 
             specs.append(
                 SensorWorkerSpec(
@@ -1070,24 +1145,39 @@ class LoggerheadService:
                         )
 
     def _read_temperature(self, sensor) -> float:
+        value, _metadata = self._read_temperature_with_metadata(sensor)
+        return value
+
+    def _read_temperature_with_metadata(self, sensor) -> tuple[float, dict[str, Any]]:
         if sensor.driver == TemperatureDriver.ONE_WIRE_BUS:
             if sensor.sense_port is not None:
                 port = SENSE_PORTS[sensor.sense_port]
                 self.temperature_reader.configure_kernel_one_wire(port.digital_bcm)
-                return self.temperature_reader.read_one_wire_gpio(port.digital_bcm)
+                reading = self.temperature_reader.read_one_wire_gpio_detailed(port.digital_bcm)
+                metadata = reading.metadata()
+                metadata["sense_port"] = sensor.sense_port
+                return reading.fahrenheit, metadata
             raise HardwareUnavailable(f"Kernel 1-Wire sensor {sensor.id} is not assigned to a fixed sense-port GPIO.")
         if sensor.driver == TemperatureDriver.BIT_BANGED_ONE_WIRE:
             if sensor.sense_port is None:
                 raise HardwareUnavailable(f"Bit-banged DS18B20 sensor {sensor.id} is not assigned to a fixed sense-port GPIO.")
             port = SENSE_PORTS[sensor.sense_port]
-            return self.temperature_reader.read_bit_banged(port.digital_bcm)
-        return self.temperature_reader.read_host_cpu()
+            return self.temperature_reader.read_bit_banged(port.digital_bcm), {
+                "driver": "bit_banged_one_wire",
+                "bcm_pin": port.digital_bcm,
+                "sense_port": sensor.sense_port,
+            }
+        return self.temperature_reader.read_host_cpu(), {"driver": "host_cpu"}
 
     def _read_temperature_threadsafe(self, sensor) -> float:
+        value, _metadata = self._read_temperature_with_metadata_threadsafe(sensor)
+        return value
+
+    def _read_temperature_with_metadata_threadsafe(self, sensor) -> tuple[float, dict[str, Any]]:
         if sensor.driver == TemperatureDriver.HOST_CPU:
-            return self.temperature_reader.read_host_cpu()
+            return self._read_temperature_with_metadata(sensor)
         with self._gpio_lock:
-            return self._read_temperature(sensor)
+            return self._read_temperature_with_metadata(sensor)
 
     def _poll_ph(self, now: float) -> None:
         for sensor in self.config.ph_sensors:

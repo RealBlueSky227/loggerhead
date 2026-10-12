@@ -22,6 +22,7 @@ sudo apt-get update
 sudo apt-get install -y \
   git \
   i2c-tools \
+  gpiod \
   pigpio \
   python3-pigpio \
   python3-smbus \
@@ -49,6 +50,10 @@ BOOT_PID=$!
 sleep 3
 kill "$BOOT_PID" >/dev/null 2>&1 || true
 wait "$BOOT_PID" >/dev/null 2>&1 || true
+
+sudo install -o root -g root -m 0755 scripts/loggerhead-onewire-helper /usr/local/sbin/loggerhead-onewire-helper
+sudo install -o root -g root -m 0440 systemd/loggerhead-onewire-helper.sudoers /etc/sudoers.d/loggerhead-onewire-helper
+sudo visudo -cf /etc/sudoers.d/loggerhead-onewire-helper
 
 sudo cp systemd/loggerhead.service "/etc/systemd/system/$SERVICE_NAME"
 sudo systemctl daemon-reload
