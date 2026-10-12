@@ -423,6 +423,38 @@ class FakeOverlayClient:
         return OneWireOverlayResult("status", -1, owned_gpios=tuple(self.activated))
 
 
+def test_kernel_one_wire_configure_honors_stop_event_before_helper_activation(tmp_path) -> None:
+    root = tmp_path / "w1"
+    root.mkdir()
+    overlay = FakeOverlayClient(root, create_bus=True)
+    reader = TemperatureReader(simulation=False, one_wire_root=root, overlay_client=overlay)
+    stop_event = threading.Event()
+    stop_event.set()
+
+    with pytest.raises(HardwareUnavailable, match="cancelled"):
+        reader.configure_kernel_one_wire(4, stop_event=stop_event)
+
+    assert overlay.activated == []
+
+
+def test_kernel_one_wire_release_invalidates_affected_runtime_bus_mappings(tmp_path) -> None:
+    root = tmp_path / "w1"
+    root.mkdir()
+
+    class AffectedOverlayClient(FakeOverlayClient):
+        def release(self, gpio: int) -> OneWireOverlayResult:
+            self.released.append(gpio)
+            return OneWireOverlayResult("release", gpio, owned=True, affected_gpios=(17,), safe_input=True)
+
+    overlay = AffectedOverlayClient()
+    reader = TemperatureReader(simulation=False, one_wire_root=root, overlay_client=overlay)
+    reader._runtime_kernel_bus_names = {4: "w1_bus_master4", 17: "w1_bus_master17", 22: "w1_bus_master22"}
+
+    reader.release_kernel_one_wire(4)
+
+    assert reader._runtime_kernel_bus_names == {22: "w1_bus_master22"}
+
+
 def test_kernel_one_wire_existing_sensor_skips_privileged_setup(tmp_path) -> None:
     root = tmp_path / "w1"
     root.mkdir()
@@ -585,7 +617,7 @@ def test_kernel_one_wire_does_not_duplicate_loaded_overlay(tmp_path) -> None:
         overlay_client=FakeOverlayClient(),
         subprocess_run=fake_run,
     )
-    reader._wait_for_kernel_one_wire = lambda _pin: None  # type: ignore[method-assign]
+    reader._wait_for_kernel_one_wire = lambda _pin, **_kwargs: None  # type: ignore[method-assign]
     reader.configure_kernel_one_wire(4)
 
     assert calls == [["dtoverlay", "-l"]]

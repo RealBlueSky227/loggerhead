@@ -566,29 +566,33 @@ class TemperatureReader:
         else:
             self._overlay_client = HelperOneWireOverlayClient(subprocess_run=subprocess_run)
 
-    def configure_kernel_one_wire(self, bcm_pin: int) -> None:
+    def configure_kernel_one_wire(self, bcm_pin: int, *, stop_event: threading.Event | None = None) -> None:
         if self.simulation:
             return
         bcm_pin = int(bcm_pin)
-        self._sync_runtime_overlay_status()
+        self._raise_if_cancelled(stop_event, "configuration")
+        self._sync_runtime_overlay_status(stop_event=stop_event)
+        self._raise_if_cancelled(stop_event, "configuration")
         if bcm_pin in self._configured_kernel_pins and self._kernel_bus_for_gpio(bcm_pin, required=False) is not None:
             return
         if self._kernel_bus_for_gpio(bcm_pin, required=False) is not None:
             self._configured_kernel_pins.add(bcm_pin)
             return
-        if self._overlay_loaded_for_pin(bcm_pin):
+        if self._overlay_loaded_for_pin(bcm_pin, stop_event=stop_event):
             self._configured_kernel_pins.add(bcm_pin)
-            self._wait_for_kernel_one_wire(bcm_pin)
+            self._wait_for_kernel_one_wire(bcm_pin, stop_event=stop_event)
             return
         before_masters = self._one_wire_bus_master_names()
+        self._raise_if_cancelled(stop_event, "configuration")
         result = self._overlay_client.activate(bcm_pin)
+        self._raise_if_cancelled(stop_event, "configuration")
         if result.created or result.owned:
             self._runtime_kernel_pins.add(bcm_pin)
         self._record_runtime_bus_from_overlay_result(bcm_pin, result)
         if result.created and int(bcm_pin) not in self._runtime_kernel_bus_names:
-            self._capture_runtime_bus_after_activation(bcm_pin, before_masters)
+            self._capture_runtime_bus_after_activation(bcm_pin, before_masters, stop_event=stop_event)
         self._configured_kernel_pins.add(bcm_pin)
-        self._wait_for_kernel_one_wire(bcm_pin)
+        self._wait_for_kernel_one_wire(bcm_pin, stop_event=stop_event)
 
     def release_kernel_one_wire(self, bcm_pin: int) -> OneWireOverlayResult:
         bcm_pin = int(bcm_pin)
@@ -600,6 +604,7 @@ class TemperatureReader:
         result = self._overlay_client.release(bcm_pin)
         if result.owned:
             self._runtime_kernel_pins.discard(bcm_pin)
+        self._record_runtime_bus_from_overlay_result(None, result)
         return result
 
     def owned_runtime_one_wire_pins(self) -> set[int]:
@@ -616,10 +621,15 @@ class TemperatureReader:
             raise HardwareUnavailable("Kernel 1-Wire reads require a sense-port BCM GPIO.")
         return self.read_one_wire_gpio(bcm_pin)
 
-    def read_one_wire_gpio(self, bcm_pin: int) -> float:
-        return self.read_one_wire_gpio_detailed(bcm_pin).fahrenheit
+    def read_one_wire_gpio(self, bcm_pin: int, *, stop_event: threading.Event | None = None) -> float:
+        return self.read_one_wire_gpio_detailed(bcm_pin, stop_event=stop_event).fahrenheit
 
-    def read_one_wire_gpio_detailed(self, bcm_pin: int) -> OneWireTemperatureReading:
+    def read_one_wire_gpio_detailed(
+        self,
+        bcm_pin: int,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> OneWireTemperatureReading:
         if self.simulation:
             return OneWireTemperatureReading(
                 bcm_pin=int(bcm_pin),
@@ -631,7 +641,9 @@ class TemperatureReader:
                 ext_power=1,
                 resolution=12,
             )
+        self._raise_if_cancelled(stop_event, "read")
         bus = self._kernel_bus_for_gpio(int(bcm_pin))
+        self._raise_if_cancelled(stop_event, "read")
         sensor_ids = self._one_wire_sensor_ids_for_bus(bus)
         if not sensor_ids:
             raise HardwareUnavailable(
@@ -650,6 +662,7 @@ class TemperatureReader:
                 f"1-Wire sensor {resolved_id} from BCM {bcm_pin} bus is not readable at {path}. "
                 f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
             )
+        self._raise_if_cancelled(stop_event, "read")
         text = path.read_text(encoding="utf-8")
         celsius, crc_valid = self._parse_kernel_ds18b20_text(text, resolved_id)
         if celsius < -55.0 or celsius > 125.0:
@@ -657,7 +670,12 @@ class TemperatureReader:
         power_up_default_suspect = celsius == 85.0 and int(bcm_pin) not in self._last_valid_kernel_celsius
         if power_up_default_suspect:
             resolution = self._read_optional_int(self._one_wire_sensor_file(bus, resolved_id, "resolution"))
-            time.sleep(self._ds18b20_conversion_seconds(resolution))
+            conversion_seconds = self._ds18b20_conversion_seconds(resolution)
+            if stop_event is not None:
+                if stop_event.wait(conversion_seconds):
+                    raise HardwareUnavailable("Kernel 1-Wire read cancelled during DS18B20 conversion retry.")
+            else:
+                time.sleep(conversion_seconds)
             text = path.read_text(encoding="utf-8")
             celsius, crc_valid = self._parse_kernel_ds18b20_text(text, resolved_id)
             power_up_default_suspect = celsius == 85.0 and int(bcm_pin) not in self._last_valid_kernel_celsius
@@ -764,24 +782,35 @@ class TemperatureReader:
         evidence = (f"captured_bus_master={master_name}", f"platform={platform.name}", *platform.evidence)
         return KernelOneWireBus(master, int(bcm_pin), tuple(dict.fromkeys(evidence)))
 
-    def _sync_runtime_overlay_status(self) -> None:
+    def _sync_runtime_overlay_status(self, *, stop_event: threading.Event | None = None) -> None:
+        self._raise_if_cancelled(stop_event, "status sync")
         try:
             result = self._overlay_client.status()
         except Exception as exc:
             LOGGER.debug("Could not sync runtime 1-Wire overlay status: %s", exc)
             return
+        self._raise_if_cancelled(stop_event, "status sync")
         self._record_runtime_bus_from_overlay_result(None, result)
 
     def _record_runtime_bus_from_overlay_result(self, bcm_pin: int | None, result: OneWireOverlayResult) -> None:
+        for gpio in result.affected_gpios:
+            self._runtime_kernel_bus_names.pop(int(gpio), None)
         for gpio, bus_master in result.owned_bus_masters.items():
             if bus_master:
                 self._runtime_kernel_bus_names[int(gpio)] = bus_master
         if bcm_pin is not None and result.bus_master:
             self._runtime_kernel_bus_names[int(bcm_pin)] = result.bus_master
 
-    def _capture_runtime_bus_after_activation(self, bcm_pin: int, before_masters: set[str]) -> None:
+    def _capture_runtime_bus_after_activation(
+        self,
+        bcm_pin: int,
+        before_masters: set[str],
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> None:
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
+            self._raise_if_cancelled(stop_event, "bus capture")
             created = sorted(self._one_wire_bus_master_names() - before_masters)
             if len(created) == 1:
                 self._runtime_kernel_bus_names[int(bcm_pin)] = created[0]
@@ -793,7 +822,10 @@ class TemperatureReader:
                     created,
                 )
                 return
-            time.sleep(0.1)
+            if stop_event is not None and stop_event.wait(0.1):
+                raise HardwareUnavailable("Kernel 1-Wire bus capture cancelled during sensor shutdown.")
+            if stop_event is None:
+                time.sleep(0.1)
 
     def _verified_w1_gpio_platform_for_gpio(self, bcm_pin: int) -> KernelOneWirePlatform | None:
         matches = [platform for platform in self._w1_gpio_platforms() if platform.gpio_bcm == int(bcm_pin)]
@@ -973,14 +1005,16 @@ class TemperatureReader:
         except (OSError, ValueError):
             return None
 
-    def _overlay_loaded_for_pin(self, bcm_pin: int) -> bool:
+    def _overlay_loaded_for_pin(self, bcm_pin: int, *, stop_event: threading.Event | None = None) -> bool:
+        self._raise_if_cancelled(stop_event, "overlay check")
         dtoverlay = self._dtoverlay_path()
         if not dtoverlay:
             return False
         try:
-            result = self._subprocess_run([dtoverlay, "-l"], capture_output=True, check=False, text=True)
+            result = self._subprocess_run([dtoverlay, "-l"], capture_output=True, check=False, text=True, timeout=5.0)
         except Exception:
             return False
+        self._raise_if_cancelled(stop_event, "overlay check")
         if result.returncode != 0:
             return False
         for line in str(result.stdout).splitlines():
@@ -992,16 +1026,25 @@ class TemperatureReader:
                 return True
         return False
 
-    def _wait_for_kernel_one_wire(self, bcm_pin: int) -> None:
+    def _wait_for_kernel_one_wire(self, bcm_pin: int, *, stop_event: threading.Event | None = None) -> None:
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
+            self._raise_if_cancelled(stop_event, "bus verification")
             if self._kernel_bus_for_gpio(bcm_pin, required=False) is not None:
                 return
-            time.sleep(0.1)
+            if stop_event is not None and stop_event.wait(0.1):
+                raise HardwareUnavailable("Kernel 1-Wire bus verification cancelled during sensor shutdown.")
+            if stop_event is None:
+                time.sleep(0.1)
         raise HardwareUnavailable(
             f"Kernel 1-Wire overlay on BCM {bcm_pin} loaded, but no verifiable GPIO-to-w1-bus mapping appeared. "
             f"{self._one_wire_diagnostics(bcm_pin=bcm_pin)}"
         )
+
+    @staticmethod
+    def _raise_if_cancelled(stop_event: threading.Event | None, operation: str) -> None:
+        if stop_event is not None and stop_event.is_set():
+            raise HardwareUnavailable(f"Kernel 1-Wire {operation} cancelled during sensor shutdown.")
 
     def _dtoverlay_path(self) -> str:
         return self._dtoverlay_command or shutil.which("dtoverlay") or "/usr/bin/dtoverlay"

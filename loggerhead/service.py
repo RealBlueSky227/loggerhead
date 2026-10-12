@@ -72,6 +72,7 @@ class LoggerheadService:
 
     MANUAL_PRIME_LIMIT_REASONS = {"max_seconds", "max_steps"}
     MANUAL_PRIME_LIMIT_CHIRP_SECONDS = 0.15
+    SENSOR_WORKER_STOP_TIMEOUT_SECONDS = 15.0
 
     def __init__(self, config_path: Path, data_dir: Path, *, simulation: bool = False) -> None:
         self.config_path = config_path
@@ -606,8 +607,8 @@ class LoggerheadService:
             stale_after = self._stale_after(sensor.check_frequency)
 
             def read_temperature(stop: threading.Event, sensor=sensor, stale_after=stale_after) -> SensorReadResult:
-                del stop, stale_after
-                value, metadata = self._read_temperature_with_metadata_threadsafe(sensor)
+                del stale_after
+                value, metadata = self._read_temperature_with_metadata_threadsafe(sensor, stop_event=stop)
                 return SensorReadResult(sensor.id, "temperature", round(value, 3), "F", metadata=metadata)
 
             specs.append(
@@ -745,7 +746,7 @@ class LoggerheadService:
             self._sensor_workers_started = False
         stuck: list[str] = []
         for worker in workers:
-            if not worker.stop(timeout=2.0):
+            if not worker.stop(timeout=self.SENSOR_WORKER_STOP_TIMEOUT_SECONDS):
                 stuck.append(worker.sensor_id)
         return stuck
 
@@ -1209,12 +1210,23 @@ class LoggerheadService:
         value, _metadata = self._read_temperature_with_metadata(sensor)
         return value
 
-    def _read_temperature_with_metadata(self, sensor) -> tuple[float, dict[str, Any]]:
+    def _read_temperature_with_metadata(
+        self,
+        sensor,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> tuple[float, dict[str, Any]]:
+        if stop_event is not None and stop_event.is_set():
+            raise HardwareUnavailable("Temperature read cancelled during sensor shutdown.")
         if sensor.driver == TemperatureDriver.ONE_WIRE_BUS:
             if sensor.sense_port is not None:
                 port = SENSE_PORTS[sensor.sense_port]
-                self.temperature_reader.configure_kernel_one_wire(port.digital_bcm)
-                reading = self.temperature_reader.read_one_wire_gpio_detailed(port.digital_bcm)
+                if stop_event is None:
+                    self.temperature_reader.configure_kernel_one_wire(port.digital_bcm)
+                    reading = self.temperature_reader.read_one_wire_gpio_detailed(port.digital_bcm)
+                else:
+                    self.temperature_reader.configure_kernel_one_wire(port.digital_bcm, stop_event=stop_event)
+                    reading = self.temperature_reader.read_one_wire_gpio_detailed(port.digital_bcm, stop_event=stop_event)
                 metadata = reading.metadata()
                 metadata["sense_port"] = sensor.sense_port
                 return reading.fahrenheit, metadata
@@ -1225,13 +1237,18 @@ class LoggerheadService:
         value, _metadata = self._read_temperature_with_metadata_threadsafe(sensor)
         return value
 
-    def _read_temperature_with_metadata_threadsafe(self, sensor) -> tuple[float, dict[str, Any]]:
+    def _read_temperature_with_metadata_threadsafe(
+        self,
+        sensor,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> tuple[float, dict[str, Any]]:
         if sensor.driver == TemperatureDriver.HOST_CPU:
-            return self._read_temperature_with_metadata(sensor)
+            return self._read_temperature_with_metadata(sensor, stop_event=stop_event)
         if sensor.driver == TemperatureDriver.ONE_WIRE_BUS:
-            return self._read_temperature_with_metadata(sensor)
+            return self._read_temperature_with_metadata(sensor, stop_event=stop_event)
         with self._gpio_lock:
-            return self._read_temperature_with_metadata(sensor)
+            return self._read_temperature_with_metadata(sensor, stop_event=stop_event)
 
     def _poll_ph(self, now: float) -> None:
         for sensor in self.config.ph_sensors:

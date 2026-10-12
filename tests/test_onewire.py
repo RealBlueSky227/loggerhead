@@ -151,7 +151,13 @@ def test_helper_release_reports_later_w1_overlays_and_safe_handoff(tmp_path, mon
                 "4": {
                     "activated_at": 1.0,
                     "overlay": {"index": 0, "name": "w1-gpio", "params": {"gpiopin": "4"}},
-                }
+                    "bus_master": "w1_bus_master4",
+                },
+                "17": {
+                    "activated_at": 2.0,
+                    "overlay": {"index": 1, "name": "w1-gpio", "params": {"gpiopin": "17"}},
+                    "bus_master": "w1_bus_master17",
+                },
             }
         }
     )
@@ -165,7 +171,10 @@ def test_helper_release_reports_later_w1_overlays_and_safe_handoff(tmp_path, mon
     monkeypatch.setattr(helper, "set_gpio_input", lambda _gpio: True)
 
     result = helper.release(4)
+    status = helper.status()
 
     assert result["affected_gpios"] == [17]
     assert result["safe_input"] is True
+    assert status["owned_gpios"] == [17]
+    assert status["owned_bus_masters"] == {}
     assert removed == [[helper.DTOVERLAY, "-r", "0"]]

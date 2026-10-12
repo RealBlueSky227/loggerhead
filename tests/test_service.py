@@ -50,7 +50,7 @@ def test_sensor_polling_isolates_failures_and_recovers(tmp_path, monkeypatch: py
     analog.check_frequency = 1.0
     reads = {"temperature": 0, "analog": 0}
 
-    def fail_then_recover(_bcm_pin: int) -> OneWireTemperatureReading:
+    def fail_then_recover(_bcm_pin: int, **_kwargs) -> OneWireTemperatureReading:
         reads["temperature"] += 1
         if reads["temperature"] == 1:
             raise RuntimeError("probe failed")
@@ -84,7 +84,7 @@ def test_sensor_check_frequency_is_enforced(tmp_path, monkeypatch: pytest.Monkey
     port.check_frequency = 30.0
     calls = 0
 
-    def read_temperature(_bcm_pin: int) -> OneWireTemperatureReading:
+    def read_temperature(_bcm_pin: int, **_kwargs) -> OneWireTemperatureReading:
         nonlocal calls
         calls += 1
         return kernel_temperature_reading(78.0 + calls)
@@ -109,7 +109,7 @@ def test_temperature_sensor_failure_turns_dependent_heater_off(tmp_path, monkeyp
     monkeypatch.setattr(
         service.temperature_reader,
         "read_one_wire_gpio_detailed",
-        lambda _pin: (_ for _ in ()).throw(RuntimeError("lost bus")),
+        lambda _pin, **_kwargs: (_ for _ in ()).throw(RuntimeError("lost bus")),
     )
 
     service._poll_temperature(100.0)
@@ -144,7 +144,7 @@ def test_slow_sensor_worker_does_not_delay_other_sensors_or_control_loop(tmp_pat
     slow_release = threading.Event()
     analog_reads = 0
 
-    def slow_temperature(_bcm_pin: int) -> OneWireTemperatureReading:
+    def slow_temperature(_bcm_pin: int, **_kwargs) -> OneWireTemperatureReading:
         slow_started.set()
         slow_release.wait(1.0)
         return kernel_temperature_reading(78.0)
@@ -245,7 +245,7 @@ def test_worker_exception_does_not_stop_other_sensor_workers(tmp_path, monkeypat
     monkeypatch.setattr(
         service.temperature_reader,
         "read_one_wire_gpio_detailed",
-        lambda _pin: (_ for _ in ()).throw(RuntimeError("bad probe")),
+        lambda _pin, **_kwargs: (_ for _ in ()).throw(RuntimeError("bad probe")),
     )
     analog_reads = 0
 
@@ -274,7 +274,7 @@ def test_kernel_one_wire_worker_recovers_after_setup_failure(tmp_path, monkeypat
     service._rebuild_sensor_runtime()
     attempts = 0
 
-    def configure(_bcm_pin: int) -> None:
+    def configure(_bcm_pin: int, **_kwargs) -> None:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
@@ -284,7 +284,7 @@ def test_kernel_one_wire_worker_recovers_after_setup_failure(tmp_path, monkeypat
     monkeypatch.setattr(
         service.temperature_reader,
         "read_one_wire_gpio_detailed",
-        lambda _bcm_pin: OneWireTemperatureReading(
+        lambda _bcm_pin, **_kwargs: OneWireTemperatureReading(
             bcm_pin=4,
             sensor_id="28-000000000001",
             bus_master="w1_bus_master1",
@@ -303,6 +303,39 @@ def test_kernel_one_wire_worker_recovers_after_setup_failure(tmp_path, monkeypat
 
     assert service.state.sensor_health["sense_port_1_temperature"].status == "online"
     assert service.state.readings["sense_port_1_temperature"].value == 78.6
+
+
+def test_kernel_one_wire_worker_stop_cancels_blocking_setup(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    port = service.config.sense_ports[0]
+    port.device = SensePortDevice.DS18B20
+    port.check_frequency = 0.05
+    service._rebuild_sensor_runtime()
+    setup_started = threading.Event()
+    setup_cancelled = threading.Event()
+
+    def configure(_bcm_pin: int, *, stop_event: threading.Event | None = None) -> None:
+        assert stop_event is not None
+        setup_started.set()
+        if stop_event.wait(5.0):
+            setup_cancelled.set()
+            raise HardwareUnavailable("setup cancelled")
+        raise AssertionError("test setup did not receive worker cancellation")
+
+    monkeypatch.setattr(service.temperature_reader, "configure_kernel_one_wire", configure)
+
+    service._start_sensor_workers()
+    assert setup_started.wait(1.0)
+    started = time.monotonic()
+    stuck = service._stop_sensor_workers()
+
+    assert stuck == []
+    assert setup_cancelled.is_set()
+    assert time.monotonic() - started < 1.0
+
+
+def test_sensor_worker_stop_deadline_covers_one_wire_helper_timeout() -> None:
+    assert LoggerheadService.SENSOR_WORKER_STOP_TIMEOUT_SECONDS >= 10.0
 
 
 def test_sensor_runtime_releases_removed_kernel_one_wire_pin_and_marks_affected_stack(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
