@@ -14,9 +14,9 @@ from .config import (
     MIN_MANUAL_PRIME_STEPS_PER_SECOND,
     AppConfig,
     EquipmentProfile,
-    OneWireMode,
     SensePortDevice,
     StepperProfile,
+    _migrate_raw_config,
     apply_config_migrations,
     from_dict,
     load_config,
@@ -217,6 +217,9 @@ class LoggerheadService:
                 "manual_priming": dict(self.state.manual_priming),
                 "diagnostics": self._diagnostics(),
                 "heartbeat": {"ok": True, "ts": time.time()},
+                "buzzer_muted_until": self.state.buzzer_muted_until,
+                "buzzer_muted_remaining_seconds": max(0.0, self.state.buzzer_muted_until - time.time()),
+                "active_audible_alarm_ids": sorted(self._active_audible_alarm_ids()),
                 "events": self.store.recent_events(30),
                 "time": time.time(),
                 "simulation": self.simulation,
@@ -228,7 +231,9 @@ class LoggerheadService:
     def update_config(self, payload: dict[str, Any]) -> AppConfig:
         # Implements SRS 5.4.1 Dynamic Application by replacing the active config
         # after validation and rebuilding per-config helper state.
-        candidate = from_dict(AppConfig, copy.deepcopy(payload))
+        raw_payload = copy.deepcopy(payload)
+        _migrate_raw_config(raw_payload)
+        candidate = from_dict(AppConfig, raw_payload)
         apply_config_migrations(candidate)
         validate_config(candidate)
         previous = self.config
@@ -253,8 +258,6 @@ class LoggerheadService:
                 continue
             if key == "device":
                 value = SensePortDevice(value)
-            elif key == "one_wire_mode":
-                value = OneWireMode(value)
             setattr(port, key, value)
         apply_config_migrations(candidate)
         validate_config(candidate)
@@ -293,12 +296,14 @@ class LoggerheadService:
         self.store.log_event("ato", f"ATO {profile.name} reset from dashboard.")
         self._save_state()
 
-    def silence_buzzer(self) -> None:
+    def silence_buzzer(self) -> dict[str, Any]:
+        muted_until = time.time() + self.config.buzzer.rearm_seconds
         with self._state_lock:
-            self.state.buzzer_muted_until = time.time() + self.config.buzzer.rearm_seconds
+            self.state.buzzer_muted_until = muted_until
         self.buzzer.stop()
         self.store.log_event("alarm", "Buzzer temporarily silenced.")
         self._save_state()
+        return {"muted_until": muted_until, "rearm_seconds": self.config.buzzer.rearm_seconds}
 
     def set_alarm_enabled(self, enabled: bool) -> None:
         self.config.buzzer.alarm_enabled = enabled
@@ -1214,15 +1219,6 @@ class LoggerheadService:
                 metadata["sense_port"] = sensor.sense_port
                 return reading.fahrenheit, metadata
             raise HardwareUnavailable(f"Kernel 1-Wire sensor {sensor.id} is not assigned to a fixed sense-port GPIO.")
-        if sensor.driver == TemperatureDriver.BIT_BANGED_ONE_WIRE:
-            if sensor.sense_port is None:
-                raise HardwareUnavailable(f"Bit-banged DS18B20 sensor {sensor.id} is not assigned to a fixed sense-port GPIO.")
-            port = SENSE_PORTS[sensor.sense_port]
-            return self.temperature_reader.read_bit_banged(port.digital_bcm), {
-                "driver": "bit_banged_one_wire",
-                "bcm_pin": port.digital_bcm,
-                "sense_port": sensor.sense_port,
-            }
         return self.temperature_reader.read_host_cpu(), {"driver": "host_cpu"}
 
     def _read_temperature_threadsafe(self, sensor) -> float:

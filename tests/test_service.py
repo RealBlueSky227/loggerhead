@@ -7,7 +7,7 @@ from dataclasses import asdict
 
 import pytest
 
-from loggerhead.config import ATOProfile, OneWireMode, SensePortDevice
+from loggerhead.config import ATOProfile, SensePortDevice
 from loggerhead.drivers import HardwareFault, HardwareUnavailable, StepperRunResult
 from loggerhead.hardware import STEPPERS, AlarmPriority, DiagnosticHalt, EquipmentKind, LevelState
 from loggerhead.onewire import OneWireOverlayResult, OneWireTemperatureReading
@@ -29,24 +29,34 @@ def wait_for(predicate, timeout: float = 1.0) -> None:
     raise AssertionError("condition was not reached before timeout")
 
 
+def kernel_temperature_reading(value_f: float, bcm_pin: int = 4) -> OneWireTemperatureReading:
+    return OneWireTemperatureReading(
+        bcm_pin=bcm_pin,
+        sensor_id="28-test",
+        bus_master="simulation",
+        celsius=(value_f - 32) * 5 / 9,
+        fahrenheit=value_f,
+        crc_valid=True,
+    )
+
+
 def test_sensor_polling_isolates_failures_and_recovers(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = make_service(tmp_path)
     port = service.config.sense_ports[0]
     port.device = SensePortDevice.DS18B20
-    port.one_wire_mode = OneWireMode.BIT_BANG
     port.check_frequency = 1.0
     analog = service.config.sense_ports[1]
     analog.device = SensePortDevice.ANALOG
     analog.check_frequency = 1.0
     reads = {"temperature": 0, "analog": 0}
 
-    def fail_then_recover(_bcm_pin: int) -> float:
+    def fail_then_recover(_bcm_pin: int) -> OneWireTemperatureReading:
         reads["temperature"] += 1
         if reads["temperature"] == 1:
             raise RuntimeError("probe failed")
-        return 79.2
+        return kernel_temperature_reading(79.2)
 
-    monkeypatch.setattr(service.temperature_reader, "read_bit_banged", fail_then_recover)
+    monkeypatch.setattr(service.temperature_reader, "read_one_wire_gpio_detailed", fail_then_recover)
 
     def read_voltage(_address: int, _channel: int) -> float:
         reads["analog"] += 1
@@ -71,16 +81,15 @@ def test_sensor_check_frequency_is_enforced(tmp_path, monkeypatch: pytest.Monkey
     service = make_service(tmp_path)
     port = service.config.sense_ports[0]
     port.device = SensePortDevice.DS18B20
-    port.one_wire_mode = OneWireMode.BIT_BANG
     port.check_frequency = 30.0
     calls = 0
 
-    def read_temperature(_bcm_pin: int) -> float:
+    def read_temperature(_bcm_pin: int) -> OneWireTemperatureReading:
         nonlocal calls
         calls += 1
-        return 78.0 + calls
+        return kernel_temperature_reading(78.0 + calls)
 
-    monkeypatch.setattr(service.temperature_reader, "read_bit_banged", read_temperature)
+    monkeypatch.setattr(service.temperature_reader, "read_one_wire_gpio_detailed", read_temperature)
 
     service._poll_temperature(100.0)
     service._poll_temperature(101.0)
@@ -94,11 +103,14 @@ def test_temperature_sensor_failure_turns_dependent_heater_off(tmp_path, monkeyp
     service = make_service(tmp_path)
     port = service.config.sense_ports[0]
     port.device = SensePortDevice.DS18B20
-    port.one_wire_mode = OneWireMode.BIT_BANG
     port.assigned_equipment = "ac1"
     port.equipment_type = EquipmentKind.HEATER
     service.state.equipment["ac1"] = EquipmentState("ac1", True)
-    monkeypatch.setattr(service.temperature_reader, "read_bit_banged", lambda _pin: (_ for _ in ()).throw(RuntimeError("lost bus")))
+    monkeypatch.setattr(
+        service.temperature_reader,
+        "read_one_wire_gpio_detailed",
+        lambda _pin: (_ for _ in ()).throw(RuntimeError("lost bus")),
+    )
 
     service._poll_temperature(100.0)
 
@@ -123,7 +135,6 @@ def test_slow_sensor_worker_does_not_delay_other_sensors_or_control_loop(tmp_pat
     service = make_service(tmp_path)
     temp = service.config.sense_ports[0]
     temp.device = SensePortDevice.DS18B20
-    temp.one_wire_mode = OneWireMode.BIT_BANG
     temp.check_frequency = 0.05
     analog = service.config.sense_ports[1]
     analog.device = SensePortDevice.ANALOG
@@ -133,17 +144,17 @@ def test_slow_sensor_worker_does_not_delay_other_sensors_or_control_loop(tmp_pat
     slow_release = threading.Event()
     analog_reads = 0
 
-    def slow_temperature(_bcm_pin: int) -> float:
+    def slow_temperature(_bcm_pin: int) -> OneWireTemperatureReading:
         slow_started.set()
         slow_release.wait(1.0)
-        return 78.0
+        return kernel_temperature_reading(78.0)
 
     def read_voltage(_address: int, _channel: int) -> float:
         nonlocal analog_reads
         analog_reads += 1
         return 1.5
 
-    monkeypatch.setattr(service.temperature_reader, "read_bit_banged", slow_temperature)
+    monkeypatch.setattr(service.temperature_reader, "read_one_wire_gpio_detailed", slow_temperature)
     monkeypatch.setattr(service.analog_reader, "read_voltage", read_voltage)
     monkeypatch.setattr(service, "_publish_telemetry", lambda: None)
     monkeypatch.setattr(service, "_save_state", lambda: None)
@@ -226,13 +237,16 @@ def test_worker_exception_does_not_stop_other_sensor_workers(tmp_path, monkeypat
     service = make_service(tmp_path)
     temp = service.config.sense_ports[0]
     temp.device = SensePortDevice.DS18B20
-    temp.one_wire_mode = OneWireMode.BIT_BANG
     temp.check_frequency = 0.05
     analog = service.config.sense_ports[1]
     analog.device = SensePortDevice.ANALOG
     analog.check_frequency = 0.05
     service._rebuild_sensor_runtime()
-    monkeypatch.setattr(service.temperature_reader, "read_bit_banged", lambda _pin: (_ for _ in ()).throw(RuntimeError("bad probe")))
+    monkeypatch.setattr(
+        service.temperature_reader,
+        "read_one_wire_gpio_detailed",
+        lambda _pin: (_ for _ in ()).throw(RuntimeError("bad probe")),
+    )
     analog_reads = 0
 
     def read_voltage(_address: int, _channel: int) -> float:
@@ -256,7 +270,6 @@ def test_kernel_one_wire_worker_recovers_after_setup_failure(tmp_path, monkeypat
     service = make_service(tmp_path)
     port = service.config.sense_ports[0]
     port.device = SensePortDevice.DS18B20
-    port.one_wire_mode = OneWireMode.KERNEL
     port.check_frequency = 0.05
     service._rebuild_sensor_runtime()
     attempts = 0
@@ -295,7 +308,6 @@ def test_kernel_one_wire_worker_recovers_after_setup_failure(tmp_path, monkeypat
 def test_sensor_runtime_releases_removed_kernel_one_wire_pin_and_marks_affected_stack(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = make_service(tmp_path)
     service.config.sense_ports[0].device = SensePortDevice.DS18B20
-    service.config.sense_ports[0].one_wire_mode = OneWireMode.KERNEL
     service.config.sense_ports[1].device = SensePortDevice.ANALOG
     service._kernel_one_wire_pins = {4, 17}
     released: list[int] = []
@@ -339,7 +351,6 @@ def test_sensor_runtime_blocks_config_change_when_gpio_handoff_is_unsafe(tmp_pat
     service = make_service(tmp_path)
     previous = copy.deepcopy(service.config)
     previous.sense_ports[0].device = SensePortDevice.DS18B20
-    previous.sense_ports[0].one_wire_mode = OneWireMode.KERNEL
     service.config.sense_ports[0].device = SensePortDevice.ANALOG
     service._kernel_one_wire_pins = {4}
     monkeypatch.setattr(
@@ -380,6 +391,18 @@ def test_startup_releases_helper_owned_overlay_not_in_config(tmp_path, monkeypat
     service._rebuild_sensor_runtime()
 
     assert released == [4]
+
+
+def test_update_config_migrates_legacy_bit_bang_payload(tmp_path) -> None:
+    service = make_service(tmp_path)
+    payload = asdict(service.config)
+    payload["sense_ports"][0]["device"] = "ds18b20"
+    payload["sense_ports"][0]["one_wire_mode"] = "bit_bang"
+
+    updated = service.update_config(payload)
+
+    assert updated.sense_ports[0].device == SensePortDevice.DS18B20
+    assert "one_wire_mode" not in service.config_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(

@@ -8,7 +8,7 @@ The runtime is intentionally safe to import and test on non-Pi systems. Hardware
 
 ## What it does
 
-- Temperature sensing through kernel 1-Wire, GPIO bit-banged DS18B20 reads, and host CPU thermal files.
+- Temperature sensing through the Raspberry Pi kernel 1-Wire service and host CPU thermal files.
 - EZO pH readings over I2C address `0x63`.
 - Binary level sensors and Hydros Triple PWM pulse capture with debouncing and inactivity faults.
 - MCP23017 relay control with normally-open/normally-closed polarity mapping.

@@ -18,7 +18,6 @@ class EquipmentDriver(StrEnum):
 
 class TemperatureDriver(StrEnum):
     ONE_WIRE_BUS = "one_wire_bus"
-    BIT_BANGED_ONE_WIRE = "bit_banged_one_wire"
     HOST_CPU = "host_cpu"
 
 

@@ -38,11 +38,6 @@ class SensePortDevice(StrEnum):
     ANALOG = "analog"
 
 
-class OneWireMode(StrEnum):
-    BIT_BANG = "bit_bang"
-    KERNEL = "kernel"
-
-
 @dataclass
 class TelegramConfig:
     enabled: bool = False
@@ -116,7 +111,6 @@ class SensePortProfile:
     device: SensePortDevice = SensePortDevice.EMPTY
     name: str = ""
     check_frequency: float = 10.0
-    one_wire_mode: OneWireMode = OneWireMode.KERNEL
     sensor_id: str = ""
     desired_state: LevelState = LevelState.NORMAL
     alert_wait: float = 60.0
@@ -324,6 +318,12 @@ def load_config(path: Path) -> AppConfig:
 
 def _migrate_raw_config(raw: dict[str, Any]) -> None:
     """Move legacy fields before dataclass coercion can drop them."""
+    for port in raw.get("sense_ports", []):
+        if isinstance(port, dict):
+            port.pop("one_wire_mode", None)
+    for sensor in raw.get("temperature_sensors", []):
+        if isinstance(sensor, dict) and sensor.get("driver") == "bit_banged_one_wire":
+            sensor["driver"] = TemperatureDriver.ONE_WIRE_BUS.value
     dosing = raw.get("dosing", [])
     steppers = raw.get("steppers", [])
     if not isinstance(dosing, list) or not isinstance(steppers, list):
@@ -391,7 +391,7 @@ def apply_config_migrations(config: AppConfig) -> None:
         if port.device == SensePortDevice.DS18B20:
             port.sensor_id = ""
     for sensor in config.temperature_sensors:
-        if sensor.driver in {TemperatureDriver.ONE_WIRE_BUS, TemperatureDriver.BIT_BANGED_ONE_WIRE}:
+        if sensor.driver == TemperatureDriver.ONE_WIRE_BUS:
             sensor.sensor_id = ""
         if sensor.driver == TemperatureDriver.HOST_CPU and sensor.alert_above <= 100:
             sensor.target_temp = 140.0
@@ -534,7 +534,7 @@ def _validate_sense_port_profile(item: SensePortProfile, equipment_ids: set[str]
 
 def _validate_temperature_profile(item: TemperatureSensorProfile, equipment_ids: set[str]) -> None:
     _validate_positive_frequency(item.check_frequency, f"Temperature sensor {item.id}")
-    if item.driver in {TemperatureDriver.ONE_WIRE_BUS, TemperatureDriver.BIT_BANGED_ONE_WIRE}:
+    if item.driver == TemperatureDriver.ONE_WIRE_BUS:
         if item.sensor_id:
             raise DiagnosticHalt(
                 f"Temperature sensor {item.id} must not configure a DS18B20 ROM ID; assign it to a fixed sense port GPIO."
@@ -589,16 +589,11 @@ def materialized_temperature_sensors(config: AppConfig) -> list[TemperatureSenso
     for port in config.sense_ports:
         if port.device != SensePortDevice.DS18B20:
             continue
-        driver = (
-            TemperatureDriver.ONE_WIRE_BUS
-            if port.one_wire_mode == OneWireMode.KERNEL
-            else TemperatureDriver.BIT_BANGED_ONE_WIRE
-        )
         sensors.append(
             TemperatureSensorProfile(
                 f"sense_port_{port.number}_temperature",
                 port.display_name,
-                driver,
+                TemperatureDriver.ONE_WIRE_BUS,
                 target_temp=port.target_temp,
                 hysteresis=port.hysteresis,
                 check_frequency=port.check_frequency,

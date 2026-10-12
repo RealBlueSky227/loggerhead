@@ -86,7 +86,19 @@ def test_dashboard_sensor_editor_preserves_drafts_between_refreshes() -> None:
     assert "sensorEditorDirty" in INDEX_HTML
     assert "loadSensePortDrafts(false)" in INDEX_HTML
     assert "if (!force && (sensorEditorDirty || focused" in INDEX_HTML
-    assert "saveSensePorts" in INDEX_HTML
-    assert "one_wire_mode" in INDEX_HTML
+    assert "saveSensePorts" not in INDEX_HTML
+    assert "one_wire_mode" not in INDEX_HTML
     assert "DS18B20 ID" not in INDEX_HTML
+
+
+def test_dashboard_save_config_merges_sensor_drafts_and_shows_acknowledgement() -> None:
+    assert "payload.sense_ports = sensorDrafts.map(portForSave)" in INDEX_HTML
+    assert "Config saved at" in INDEX_HTML
+    assert "Sensor changes saved with config." in INDEX_HTML
+
+
+def test_dashboard_silence_button_shows_muted_state() -> None:
+    assert "buzzer_muted_remaining_seconds" in INDEX_HTML
+    assert "Silenced ${Math.floor" in INDEX_HTML
+    assert "Buzzer silenced until" in INDEX_HTML
 

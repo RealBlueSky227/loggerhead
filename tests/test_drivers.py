@@ -592,28 +592,6 @@ def test_kernel_one_wire_missing_sensor_is_not_simulated_on_real_hardware() -> N
         reader.read_one_wire_bus()
 
 
-def test_bit_banged_ds18b20_decodes_scratchpad_with_mocked_gpio(monkeypatch: pytest.MonkeyPatch) -> None:
-    reader = TemperatureReader(simulation=False)
-    raw = int(25 * 16)
-    scratchpad = bytearray([raw & 0xFF, (raw >> 8) & 0xFF, 0, 0, 0, 0, 0, 0, 0])
-    scratchpad[8] = reader._crc8_maxim(bytes(scratchpad[:8]))
-
-    class FakeOneWirePi:
-        connected = True
-
-        def set_pull_up_down(self, _pin: int, _pull: int) -> None:
-            return
-
-    monkeypatch.setitem(
-        sys.modules,
-        "pigpio",
-        types.SimpleNamespace(PUD_UP=2, pi=lambda: FakeOneWirePi()),
-    )
-    monkeypatch.setattr(reader, "_read_ds18b20_scratchpad_bit_banged", lambda _pi, _pin: bytes(scratchpad))
-
-    assert reader.read_bit_banged(4) == 77.0
-
-
 def test_hs300_xor_round_trip() -> None:
     payload = '{"system":{"get_sysinfo":{}}}'
     encrypted = KasaHS300Client.encrypt(payload)

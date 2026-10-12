@@ -114,6 +114,33 @@ def test_migrates_legacy_ds18b20_sense_ports_away_from_rom_ids(tmp_path) -> None
     assert materialized[0].sensor_id == ""
 
 
+def test_migrates_legacy_bit_banged_ds18b20_to_kernel_one_wire(tmp_path) -> None:
+    path = tmp_path / "loggerhead.json"
+    raw = json.loads(json.dumps(default_config(), default=lambda value: value.value if hasattr(value, "value") else value.__dict__))
+    raw["sense_ports"][0]["device"] = "ds18b20"
+    raw["sense_ports"][0]["one_wire_mode"] = "bit_bang"
+    raw["temperature_sensors"].append(
+        {
+            "id": "legacy_bitbang",
+            "name": "Legacy Bitbang",
+            "driver": "bit_banged_one_wire",
+            "sense_port": 2,
+        }
+    )
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = load_config(path)
+    save_config(path, loaded)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+
+    sense_port_sensor = next(sensor for sensor in materialized_temperature_sensors(loaded) if sensor.sense_port == 1)
+    legacy_sensor = next(sensor for sensor in loaded.temperature_sensors if sensor.id == "legacy_bitbang")
+
+    assert sense_port_sensor.driver == TemperatureDriver.ONE_WIRE_BUS
+    assert legacy_sensor.driver == TemperatureDriver.ONE_WIRE_BUS
+    assert "one_wire_mode" not in saved["sense_ports"][0]
+
+
 def test_rejects_ds18b20_temperature_without_fixed_sense_port() -> None:
     config = default_config()
     config.temperature_sensors.append(TemperatureSensorProfile("tank", "Tank", TemperatureDriver.ONE_WIRE_BUS))

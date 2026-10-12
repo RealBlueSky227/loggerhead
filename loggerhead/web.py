@@ -54,7 +54,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True})
             elif parsed.path == "/api/config":
                 config = self.server.service.update_config(payload)
-                self._send_json({"ok": True, "config": asdict(config)})
+                self._send_json({"ok": True, "config": asdict(config), "saved_at": time.time()})
             elif parsed.path == "/api/sense-port":
                 self.server.service.set_sense_port(int(payload["number"]), payload)
                 self._send_json({"ok": True})
@@ -62,8 +62,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.server.service.reset_ato(payload["id"])
                 self._send_json({"ok": True})
             elif parsed.path == "/api/buzzer/silence":
-                self.server.service.silence_buzzer()
-                self._send_json({"ok": True})
+                result = self.server.service.silence_buzzer()
+                self._send_json({"ok": True, **result})
             elif parsed.path == "/api/alarm/enabled":
                 self.server.service.set_alarm_enabled(bool(payload["enabled"]))
                 self._send_json({"ok": True})
@@ -191,6 +191,7 @@ INDEX_HTML = r"""<!doctype html>
         <label>Widget width <input id="scale" type="range" min="180" max="420" value="230"></label>
         <button id="silence">Silence</button>
         <button id="alarmToggle">Alarm Enabled</button>
+        <span id="alarmMessage" class="message"></span>
       </div>
       <h2>Life Support</h2>
       <div id="readings" class="grid"></div>
@@ -223,7 +224,6 @@ INDEX_HTML = r"""<!doctype html>
     <section id="config" hidden>
       <h2>Sense Ports</h2>
       <div class="toolbar">
-        <button id="saveSensePorts">Save Sensors</button>
         <button id="cancelSensePorts" class="hollow">Cancel</button>
         <span id="sensePortMessage" class="message"></span>
       </div>
@@ -254,7 +254,6 @@ INDEX_HTML = r"""<!doctype html>
       ["ds18b20", "DS18B20 temperature"],
       ["analog", "Analog voltage"],
     ];
-    const WIRE_OPTIONS = [["kernel", "Kernel 1-Wire"], ["bit_bang", "GPIO bit-bang experimental"]];
     const LEVEL_OPTIONS = [["dry", "Dry"], ["low", "Low"], ["normal", "Normal"], ["high", "High"], ["submerged", "Submerged"], ["wet", "Wet"]];
     const EQUIPMENT_TYPES = [["heater", "Heater"], ["chiller", "Chiller"], ["fan", "Fan"], ["generic", "Generic"]];
     document.querySelectorAll("[data-tab]").forEach(btn => btn.onclick = () => {
@@ -262,7 +261,17 @@ INDEX_HTML = r"""<!doctype html>
       ["dash","plots","diagnostics","config"].forEach(id => $(id).hidden = id !== btn.dataset.tab);
     });
     $("scale").oninput = e => document.documentElement.style.setProperty("--widget-width", `${e.target.value}px`);
-    $("silence").onclick = () => fetch("/api/buzzer/silence", {method:"POST", body:"{}"});
+    $("silence").onclick = async () => {
+      try {
+        const result = await apiPost("/api/buzzer/silence", {});
+        status.buzzer_muted_until = result.muted_until;
+        status.buzzer_muted_remaining_seconds = Math.max(0, result.muted_until - Date.now() / 1000);
+        updateSilenceControl();
+        setMessage("alarmMessage", `Buzzer silenced until ${new Date(result.muted_until * 1000).toLocaleTimeString()}.`, "ok");
+      } catch (error) {
+        setMessage("alarmMessage", error.message, "error");
+      }
+    };
     $("alarmToggle").onclick = async () => {
       await fetch("/api/alarm/enabled", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({enabled: !status.config.buzzer.alarm_enabled})});
       await refresh();
@@ -270,15 +279,27 @@ INDEX_HTML = r"""<!doctype html>
     $("configText").oninput = () => { rawConfigDirty = true; setMessage("configMessage", "Unsaved raw config changes."); };
     $("saveConfig").onclick = async () => {
       try {
-        const payload = JSON.parse($("configText").value);
+        const saveButton = $("saveConfig");
+        saveButton.disabled = true;
+        saveButton.textContent = "Saving...";
+        const payload = rawConfigDirty ? JSON.parse($("configText").value) : clone(status.config);
+        if (sensorEditorDirty) payload.sense_ports = sensorDrafts.map(portForSave);
         const result = await apiPost("/api/config", payload);
         status.config = result.config;
+        status.sense_ports = result.config.sense_ports;
         rawConfigDirty = false;
         sensorEditorDirty = false;
-        setMessage("configMessage", "Config saved.", "ok");
+        $("configText").value = JSON.stringify(result.config, null, 2);
+        lastSensePortHash = "";
+        loadSensePortDrafts(true);
+        setMessage("configMessage", `Config saved at ${new Date((result.saved_at || Date.now() / 1000) * 1000).toLocaleTimeString()}.`, "ok");
+        setMessage("sensePortMessage", "Sensor changes saved with config.", "ok");
         await refresh();
       } catch (error) {
         setMessage("configMessage", error.message, "error");
+      } finally {
+        $("saveConfig").disabled = false;
+        $("saveConfig").textContent = "Save Config";
       }
     };
     $("cancelConfig").onclick = () => {
@@ -286,7 +307,6 @@ INDEX_HTML = r"""<!doctype html>
       $("configText").value = JSON.stringify(status.config, null, 2);
       setMessage("configMessage", "Raw config changes canceled.");
     };
-    $("saveSensePorts").onclick = saveSensePorts;
     $("cancelSensePorts").onclick = () => {
       sensorEditorDirty = false;
       loadSensePortDrafts(true);
@@ -361,6 +381,7 @@ INDEX_HTML = r"""<!doctype html>
       loadSensePortDrafts(false);
       $("alarmToggle").textContent = status.config.buzzer.alarm_enabled ? "Alarm Enabled" : "Alarm Disabled";
       $("alarmToggle").className = status.config.buzzer.alarm_enabled ? "filled" : "danger";
+      updateSilenceControl();
       $("readings").innerHTML = status.sensor_catalog.filter(s => s.main).map(readingFor).join("");
       $("equipment").innerHTML = Object.values(status.equipment).map(e => {
         const klass = e.on ? "filled" : "hollow";
@@ -420,7 +441,6 @@ INDEX_HTML = r"""<!doctype html>
       ];
       if (port.device === "ds18b20") {
         fields.push(
-          selectField(port, "one_wire_mode", "DS18B20 backend", WIRE_OPTIONS),
           textField(port, "target_temp", "Target F", "number"),
           textField(port, "hysteresis", "Hysteresis F", "number"),
           textField(port, "alert_below", "Alert below F", "number"),
@@ -452,7 +472,7 @@ INDEX_HTML = r"""<!doctype html>
           textField(port, "analog_offset", "Offset", "number"),
         );
       }
-      const mode = port.device === "ds18b20" ? `DS18B20 ${port.one_wire_mode.replaceAll("_", " ")}` : port.device.replaceAll("_", " ");
+      const mode = port.device === "ds18b20" ? "DS18B20 kernel 1-Wire" : port.device.replaceAll("_", " ");
       return `<div class="card"><div class="label">Sense Port ${port.number}</div><div class="status-line">${esc(mode)}</div><div class="field-grid">${fields.join("")}</div></div>`;
     }
     function updatePortDraft(number, key, value) {
@@ -471,20 +491,10 @@ INDEX_HTML = r"""<!doctype html>
       next.invert_binary = !!next.invert_binary;
       return next;
     }
-    async function saveSensePorts() {
-      try {
-        const next = clone(status.config);
-        next.sense_ports = sensorDrafts.map(portForSave);
-        const result = await apiPost("/api/config", next);
-        status.config = result.config;
-        status.sense_ports = result.config.sense_ports;
-        sensorEditorDirty = false;
-        setMessage("sensePortMessage", "Sensors saved.", "ok");
-        loadSensePortDrafts(true);
-        await refresh();
-      } catch (error) {
-        setMessage("sensePortMessage", error.message, "error");
-      }
+    function updateSilenceControl() {
+      const remaining = Math.max(0, Math.ceil((status.buzzer_muted_until || 0) - Date.now() / 1000));
+      $("silence").className = remaining > 0 ? "filled" : "hollow";
+      $("silence").textContent = remaining > 0 ? `Silenced ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}` : "Silence";
     }
     async function loadPlot() {
       const selected = [...$("plotStream").selectedOptions].map(o => `stream=${encodeURIComponent(o.value)}`).join("&");

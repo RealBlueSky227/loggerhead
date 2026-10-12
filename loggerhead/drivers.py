@@ -523,7 +523,7 @@ class KernelOneWireBus:
 
 
 class TemperatureReader:
-    """Temperature sensor readers for 1-Wire bus, bit-banged GPIO, and host CPU.
+    """Temperature sensor readers for kernel 1-Wire and host CPU.
 
     Implements SRS 2.1.1 through 2.1.3.
     """
@@ -875,116 +875,6 @@ class TemperatureReader:
                 bus_details.append(f"{master.name}:gpio={bus.gpio_bcm}:sensors={sensors or 'none'}")
         target = f"target BCM GPIO {bcm_pin}; " if bcm_pin is not None else ""
         return f"{target}verified bus masters={bus_details or 'none'}."
-
-    def read_bit_banged(self, bcm_pin: int) -> float:
-        if self.simulation:
-            return 78.0
-        try:
-            import pigpio  # type: ignore
-
-            pi = pigpio.pi()
-            if not pi.connected:
-                raise HardwareUnavailable("pigpiod is not connected.")
-            if hasattr(pi, "set_pull_up_down") and hasattr(pigpio, "PUD_UP"):
-                pi.set_pull_up_down(bcm_pin, pigpio.PUD_UP)
-            scratchpad = self._read_ds18b20_scratchpad_bit_banged(pi, bcm_pin)
-            return self._decode_ds18b20_scratchpad(scratchpad)
-        except HardwareUnavailable:
-            raise
-        except Exception as exc:
-            raise HardwareUnavailable(f"Bit-banged DS18B20 read failed on BCM {bcm_pin}: {exc}") from exc
-
-    def _read_ds18b20_scratchpad_bit_banged(self, pi: Any, bcm_pin: int) -> bytes:
-        self._one_wire_reset(pi, bcm_pin)
-        self._one_wire_write_byte(pi, bcm_pin, 0xCC)  # Skip ROM; each sense port is expected to have one DS18B20.
-        self._one_wire_write_byte(pi, bcm_pin, 0x44)  # Convert T.
-        deadline = time.monotonic() + 0.8
-        while time.monotonic() < deadline:
-            if self._one_wire_read_bit(pi, bcm_pin):
-                break
-            time.sleep(0.01)
-        else:
-            raise HardwareUnavailable(f"DS18B20 conversion timed out on BCM {bcm_pin}.")
-        self._one_wire_reset(pi, bcm_pin)
-        self._one_wire_write_byte(pi, bcm_pin, 0xCC)
-        self._one_wire_write_byte(pi, bcm_pin, 0xBE)  # Read scratchpad.
-        scratchpad = bytes(self._one_wire_read_byte(pi, bcm_pin) for _ in range(9))
-        if self._crc8_maxim(scratchpad[:8]) != scratchpad[8]:
-            raise HardwareUnavailable("DS18B20 scratchpad CRC check failed.")
-        return scratchpad
-
-    def _one_wire_reset(self, pi: Any, bcm_pin: int) -> None:
-        self._drive_low(pi, bcm_pin)
-        self._sleep_us(480)
-        self._release_line(pi, bcm_pin)
-        self._sleep_us(70)
-        presence = pi.read(bcm_pin) == 0
-        self._sleep_us(410)
-        if not presence:
-            raise HardwareUnavailable(f"No DS18B20 presence pulse detected on BCM {bcm_pin}.")
-
-    def _one_wire_write_byte(self, pi: Any, bcm_pin: int, value: int) -> None:
-        for bit in range(8):
-            self._one_wire_write_bit(pi, bcm_pin, bool(value & (1 << bit)))
-
-    def _one_wire_read_byte(self, pi: Any, bcm_pin: int) -> int:
-        value = 0
-        for bit in range(8):
-            if self._one_wire_read_bit(pi, bcm_pin):
-                value |= 1 << bit
-        return value
-
-    def _one_wire_write_bit(self, pi: Any, bcm_pin: int, value: bool) -> None:
-        self._drive_low(pi, bcm_pin)
-        self._sleep_us(6 if value else 60)
-        self._release_line(pi, bcm_pin)
-        self._sleep_us(64 if value else 10)
-
-    def _one_wire_read_bit(self, pi: Any, bcm_pin: int) -> int:
-        self._drive_low(pi, bcm_pin)
-        self._sleep_us(6)
-        self._release_line(pi, bcm_pin)
-        self._sleep_us(9)
-        value = 1 if pi.read(bcm_pin) else 0
-        self._sleep_us(55)
-        return value
-
-    @staticmethod
-    def _drive_low(pi: Any, bcm_pin: int) -> None:
-        pi.set_mode(bcm_pin, 1)
-        pi.write(bcm_pin, 0)
-
-    @staticmethod
-    def _release_line(pi: Any, bcm_pin: int) -> None:
-        pi.set_mode(bcm_pin, 0)
-
-    @staticmethod
-    def _sleep_us(microseconds: int) -> None:
-        target = time.monotonic_ns() + microseconds * 1000
-        while time.monotonic_ns() < target:
-            pass
-
-    @staticmethod
-    def _decode_ds18b20_scratchpad(scratchpad: bytes) -> float:
-        if len(scratchpad) < 2:
-            raise HardwareUnavailable("DS18B20 scratchpad was incomplete.")
-        raw = scratchpad[0] | (scratchpad[1] << 8)
-        if raw & 0x8000:
-            raw -= 0x10000
-        celsius = raw / 16.0
-        return celsius * 9 / 5 + 32
-
-    @staticmethod
-    def _crc8_maxim(data: bytes) -> int:
-        crc = 0
-        for byte in data:
-            crc ^= byte
-            for _ in range(8):
-                if crc & 0x01:
-                    crc = (crc >> 1) ^ 0x8C
-                else:
-                    crc >>= 1
-        return crc & 0xFF
 
     def read_host_cpu(self) -> float:
         for path in (Path("/sys/class/thermal/thermal_zone0/temp"), Path("/sys/devices/virtual/thermal/thermal_zone0/temp")):
