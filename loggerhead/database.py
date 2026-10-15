@@ -157,18 +157,24 @@ class TelemetryStore:
 
     def log_many(self, values: Iterable[tuple[str, float | str, str]]) -> None:
         now = time.time()
+        self.log_samples((stream, value, unit, now) for stream, value, unit in values)
+
+    def log_samples(self, values: Iterable[tuple[str, float | str, str, float]]) -> None:
+        """Commit a control iteration together while preserving acquisition timestamps."""
         values = list(values)
+        if not values:
+            return
         with self.connect() as conn:
             conn.executemany(
                 "INSERT INTO telemetry(ts, stream, value, text_value, unit, metadata) VALUES (?, ?, ?, ?, ?, '{}')",
                 [
-                    (now, stream, float(value), None, unit)
+                    (ts, stream, float(value), None, unit)
                     if isinstance(value, int | float)
-                    else (now, stream, None, str(value), unit)
-                    for stream, value, unit in values
+                    else (ts, stream, None, str(value), unit)
+                    for stream, value, unit, ts in values
                 ],
             )
-        self._invalidate_catalog_if_new(values)
+        self._invalidate_catalog_if_new((stream, value, unit) for stream, value, unit, _ts in values)
 
     def _invalidate_catalog_if_new(self, values: Iterable[tuple[str, float | str, str]]) -> None:
         with self._catalog_lock:

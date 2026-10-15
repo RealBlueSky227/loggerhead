@@ -115,6 +115,8 @@ def test_helper_status_cache_coalesces_workers_and_invalidates(tmp_path, monkeyp
     client.status()
     assert len(calls) == 2
     (overlays / "0_w1-gpio").mkdir()
+    for name, content in (("dtbo", "overlay"), ("path", ""), ("status", "applied")):
+        (overlays / "0_w1-gpio" / name).write_text(content)
     client.status()
     assert len(calls) == 3
     (masters / "w1_bus_master10").mkdir()
@@ -143,6 +145,73 @@ def test_helper_status_without_verifiable_fingerprint_is_never_cached(tmp_path, 
     client.status()
     client.status()
     assert len(calls) == 2
+
+
+def test_helper_status_cache_spans_sensor_polls_but_rechecks_changed_evidence(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("loggerhead.onewire.os.geteuid", lambda: 1000, raising=False)
+    clock = [100.0]
+    monkeypatch.setattr("loggerhead.onewire.time.monotonic", lambda: clock[0])
+    state = tmp_path / "owned.json"
+    state.write_text("{}")
+    overlays = tmp_path / "overlays"
+    overlays.mkdir()
+    masters = tmp_path / "w1"
+    masters.mkdir()
+    calls = []
+
+    def run(*_args, **_kwargs):
+        calls.append(clock[0])
+        return types.SimpleNamespace(returncode=0, stdout='{"ok":true}', stderr="")
+
+    client = HelperOneWireOverlayClient(subprocess_run=run, state_path=state,
+                                        overlays_path=overlays, masters_path=masters)
+    for now in (100, 110, 120):
+        clock[0] = now
+        client.status()
+    assert calls == [100]
+    state.write_text('{"owned_gpios":{}}')
+    client.status()
+    assert calls == [100, 120]
+    clock[0] = 151
+    client.status()
+    assert calls == [100, 120, 151]
+
+
+def test_helper_cache_handles_trixie_configfs_inode_churn_but_checks_contents(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("loggerhead.onewire.os.geteuid", lambda: 1000, raising=False)
+    state = tmp_path / "owned.json"
+    state.write_text("{}")
+    overlays = tmp_path / "overlays"
+    overlay = overlays / "0_w1-gpio"
+    overlay.mkdir(parents=True)
+    masters = tmp_path / "w1"
+    masters.mkdir()
+    calls = []
+
+    def churn_attributes():
+        for name, data in (("dtbo", b"gpio=17"), ("path", b"\n"), ("status", b"applied\n")):
+            (overlay / name).unlink(missing_ok=True)
+            (overlay / name).write_bytes(data)
+
+    def run(*_args, **_kwargs):
+        calls.append(True)
+        churn_attributes()
+        return types.SimpleNamespace(returncode=0, stdout='{"ok":true}', stderr="")
+
+    churn_attributes()
+    client = HelperOneWireOverlayClient(subprocess_run=run, state_path=state,
+                                        overlays_path=overlays, masters_path=masters)
+    client.status()
+    churn_attributes()
+    client.status()
+    assert len(calls) == 1
+    (overlay / "dtbo").write_bytes(b"gpio=22")
+    client.status()
+    assert len(calls) == 2
+    (overlay / "status").unlink()
+    client.status()
+    client.status()
+    assert len(calls) == 4  # Unreadable/incomplete evidence never enables caching.
 
 
 def test_helper_activate_records_new_w1_bus_master(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

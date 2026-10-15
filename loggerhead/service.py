@@ -108,6 +108,8 @@ class LoggerheadService:
         self._stopped = False
         self._prime_lock = threading.RLock()
         self._threads: list[threading.Thread] = []
+        self._stepper_diagnostics: dict[str, dict[str, Any]] = {}
+        self._diagnostics_lock = threading.Lock()
         self._prime_stop: dict[str, threading.Event] = {}
         self._prime_threads: dict[str, threading.Thread] = {}
         self._restart_suppressed_alarm_ids = self._active_audible_alarm_ids()
@@ -139,6 +141,7 @@ class LoggerheadService:
         self._threads = [
             threading.Thread(target=self._poll_loop, name="loggerhead-poll", daemon=True),
             threading.Thread(target=server.serve_forever, name="loggerhead-web", daemon=True),
+            threading.Thread(target=self._diagnostics_loop, name="loggerhead-diagnostics", daemon=True),
         ]
         for thread in self._threads:
             thread.start()
@@ -552,6 +555,33 @@ class LoggerheadService:
         self._install_sensor_workers(self._build_sensor_worker_specs())
         if restart_workers:
             self._start_sensor_workers()
+        self._reconcile_sensor_alarms()
+
+    def _reconcile_sensor_alarms(self) -> None:
+        catalog = self._configured_sensor_catalog()
+        configured = {item["id"] for item in catalog}
+        valid_alarms = {f"sensor:{item['id']}" for item in catalog}
+        valid_alarms.update(f"{item['kind']}:{item['id']}" for item in catalog)
+        retired: list[str] = []
+        with self._state_lock:
+            for alarm_id, alarm in self.state.alarms.items():
+                sensor_alarm = alarm_id.startswith(("temperature:", "water:", "analog:", "ph:"))
+                resolved_lifecycle = alarm_id in {"sensor:worker-stop", "sensor:runtime-restore"}
+                # GPIO safety faults use additional colon-separated components.
+                sensor_alarm |= alarm_id.startswith("sensor:") and alarm_id.count(":") == 1 and not resolved_lifecycle
+                if alarm.active and ((sensor_alarm and alarm_id not in valid_alarms) or resolved_lifecycle):
+                    alarm.active = False
+                    retired.append(alarm_id)
+            self.state.readings = {
+                key: value for key, value in self.state.readings.items()
+                if key in configured or key.startswith("health_")
+            }
+            self.state.water_levels = {
+                key: value for key, value in self.state.water_levels.items() if f"water:{key}" in valid_alarms
+            }
+            self._level_since = {key: value for key, value in self._level_since.items() if key in configured}
+        if retired:
+            self.store.log_event("alarm", "Resolved alarms after sensor runtime reconciliation.", {"alarm_ids": retired})
 
     def _desired_kernel_one_wire_pins(self, config: AppConfig) -> set[int]:
         pins: set[int] = set()
@@ -955,6 +985,7 @@ class LoggerheadService:
         events: list[tuple[str, str, dict[str, Any] | None]] = []
         alarms: list[Any] = []
         ato_notifications: list[Any] = []
+        health_values = self.health.snapshot()
         with self._state_lock:
             self._apply_sensor_worker_snapshots_locked(
                 snapshots,
@@ -964,7 +995,9 @@ class LoggerheadService:
                 events=events,
                 alarms=alarms,
             )
-            self._poll_health(now)
+            for key, value in health_values.items():
+                self.state.readings[f"health_{key}"] = SensorReading(f"health_{key}", round(value, 3), "", ts=now)
+                value_logs.append((f"health.{key}", value, "", now))
             self._plan_ato_locked(now, equipment_commands=equipment_commands, alarms=alarms, notifications=ato_notifications)
         for equipment_id, on, source in equipment_commands:
             try:
@@ -976,8 +1009,7 @@ class LoggerheadService:
                     f"{source} could not command {equipment_id}: {exc}",
                     priority="high",
                 )
-        for stream, value, unit, ts in value_logs:
-            self.store.log_value(stream, value, unit=unit, ts=ts)
+        self.store.log_samples(value_logs)
         for category, message, metadata in events:
             self.store.log_event(category, message, metadata)
         for alarm in alarms:
@@ -1089,6 +1121,11 @@ class LoggerheadService:
             alarm = AlertEvaluator.water_alarm(sensor, observed_since, now)
             if alarm:
                 alarms.append(alarm)
+            elif level == sensor.desired_state:
+                existing = self.state.alarms.get(f"water:{sensor.id}")
+                if existing and existing.active:
+                    existing.active = False
+                    events.append(("alarm", f"{sensor.name} returned to {level.value}.", {"id": sensor.id}))
             value_logs.append((f"water.{sensor.id}", level.value, "", snapshot.last_success_ts or now))
 
     def _apply_sensor_health_snapshot_locked(
@@ -1440,13 +1477,15 @@ class LoggerheadService:
             self.store.log_value(f"analog.{sensor.id}", value, unit=sensor.unit, ts=now)
 
     def _publish_telemetry(self) -> None:
+        if not self.mqtt.client:
+            return
         self.mqtt.publish("state", self.status(), retain=False)
 
     def _log_poll_snapshot(self, now: float) -> None:
-        for key, reading in self.state.readings.items():
-            self.store.log_value(f"snapshot.{key}", reading.value, unit=reading.unit, ts=now)
-        for key, state in self.state.equipment.items():
-            self.store.log_value(f"equipment.{key}", int(state.on), ts=now)
+        with self._state_lock:
+            values = [(f"snapshot.{key}", reading.value, reading.unit, now) for key, reading in self.state.readings.items()]
+            values.extend((f"equipment.{key}", int(state.on), "", now) for key, state in self.state.equipment.items())
+        self.store.log_samples(values)
 
     def _equipment_profile(self, equipment_id: str) -> EquipmentProfile:
         for item in self.config.equipment:
@@ -1510,16 +1549,34 @@ class LoggerheadService:
             )
         return catalog
 
-    def _diagnostics(self) -> dict[str, Any]:
-        stepper_diagnostics = {}
-        for item in self.config.steppers:
-            try:
-                from .hardware import require_stepper
+    def _diagnostics_loop(self) -> None:
+        while not self._stop.is_set():
+            self._refresh_stepper_diagnostics()
+            self._stop.wait(10.0)
 
+    def _refresh_stepper_diagnostics(self) -> None:
+        for item in self.config.steppers:
+            if self._stop.is_set():
+                return
+            with self._state_lock:
+                moving = self.state.stepper_active or any(self.state.manual_priming.values())
+            if moving:
+                return
+            try:
                 assignment = require_stepper(item.assignment)
-                stepper_diagnostics[item.id] = self.uart.diagnostics(assignment.uart_address)
+                diagnostics = self.uart.diagnostics(assignment.uart_address)
             except Exception as exc:
-                stepper_diagnostics[item.id] = {"error": str(exc)}
+                diagnostics = {"error": str(exc)}
+            diagnostics = {**diagnostics, "sampled_at": time.time()}
+            with self._diagnostics_lock:
+                self._stepper_diagnostics[item.id] = diagnostics
+
+    def _diagnostics(self) -> dict[str, Any]:
+        with self._diagnostics_lock:
+            stepper_diagnostics = {
+                item.id: dict(self._stepper_diagnostics.get(item.id, {"status": "initializing"}))
+                for item in self.config.steppers
+            }
         return {
             "steppers": stepper_diagnostics,
             "sensor_workers": {key: asdict(value) for key, value in self._sensor_worker_snapshots().items()},

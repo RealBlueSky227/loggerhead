@@ -48,8 +48,13 @@ Plots opens. The default Plotly cloud-sharing button is removed.
 ## 1-Wire helper status coalescing
 
 The client serializes and coalesces successful helper status calls for at most
-2 seconds, only while the root-owned ownership file, configfs overlay entries,
-and kernel master directory identities/timestamps remain unchanged. It checks
+30 seconds, only while the root-owned ownership file, configfs overlay contents,
+and kernel master directory identities/timestamps remain unchanged. Configfs
+attribute inode numbers and overlay-directory timestamps are deliberately
+excluded: Trixie recreates those attributes during enumeration. Instead the
+client hashes `dtbo`, `path`, and `status` and retains the overlay-directory
+identity, so replacement, content changes, or a changed applied state invalidate
+the cache immediately. It checks
 those fingerprints on every status request and before/after refreshing the
 helper result. Missing/inaccessible evidence disables caching entirely.
 
@@ -61,7 +66,54 @@ configuration, or control decision was changed. Confirm the target Pi exposes
 readable fingerprint paths; otherwise correctness is preserved but helper-call
 reduction will be smaller.
 
+Status requests use cached stepper diagnostics, sampled every 10 seconds by a
+background worker (paused while a motor is active). Each result includes its
+`sampled_at` timestamp; motor-operation safety checks still read the driver
+directly. A slow UART can no longer block status requests while holding the
+equipment state lock. Disabled MQTT skips status serialization entirely.
+Host-health reads happen outside that lock, and telemetry is committed in one
+transaction per control iteration with the original acquisition timestamps.
+1-Wire discovery uses the kernel driver's bound-device directory and rechecks
+the device-tree GPIO and GPIO consumer on each reading.
+
+After startup or a successful sensor rebuild, alarms belonging to removed
+sensor types are resolved with an audit event. Historical telemetry remains
+available. Worker-stop/recovery alarms resolve after the rebuild succeeds;
+GPIO handoff and motor faults remain latched. Current water-level alarms
+resolve when a fresh reading returns to the configured desired state.
+
 ## Deployment
+
+### Live Pi Zero Verification (2026-10-15)
+
+Measured on `reef` (ARMv6, Raspberry Pi OS, kernel
+`6.18.34+rpt-rpi-v6`, Python 3.13.5), using its real database and independent
+sensor workers, with status GET requests spaced two seconds apart:
+
+| Measurement | Before | After |
+| --- | --- | --- |
+| Controller cgroup CPU (includes helper children) | 51.6% | 22.3% |
+| Status median | 245 ms | 104 ms |
+| Status maximum in sample | 1,584 ms | 322 ms |
+| Latest temperature worker read duration | 8.73 s | 1.17 s |
+
+The baseline used 10 requests; the final sample used 20 requests over 42.3
+seconds, with a status p95 of 146 ms. These are short live measurements,
+not a long-duration capacity guarantee. The helper's initial status took
+2.77 s; subsequent verified-cache calls took 7-13 ms. Logs confirmed that
+normal polling refreshed helper status approximately every 30-40 seconds.
+Seven-day numeric temperature, categorical water-level, and equipment
+history requests returned data in 142-331 ms in the final sample.
+
+The browser loaded the local Plotly assets, preserved three selected streams
+through dashboard refreshes, and rendered temperature, equipment, and HYDROS
+traces on desktop and 390px mobile layouts without JavaScript errors or extra
+history polling. The real DS18B20 and HYDROS readers remained online. No
+equipment-control commands, priming, or overlay-reconfiguration tests were
+performed as part of these measurements; multiport switching, electrical
+handoff, and loaded motor behavior still require separate hardware tests.
+
+### Updating an Existing Installation
 
 Keep the complete Python package and its `static` directory together. Installing
 a wheel includes the assets through `pyproject.toml` package data. Source/scp

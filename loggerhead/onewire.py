@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -133,7 +134,7 @@ class HelperOneWireOverlayClient:
         sudo_command: str | None = None,
         subprocess_run: Callable[..., Any] = subprocess.run,
         timeout: float = 8.0,
-        status_cache_seconds: float = 2.0,
+        status_cache_seconds: float = 30.0,
         state_path: Path = Path("/run/loggerhead-onewire/owned.json"),
         overlays_path: Path = Path("/sys/kernel/config/device-tree/overlays"),
         masters_path: Path = Path("/sys/bus/w1/devices"),
@@ -187,6 +188,19 @@ class HelperOneWireOverlayClient:
             stat = path.stat()
             return str(path), stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns
 
+        def overlay_evidence(path: Path) -> tuple:
+            stat = path.stat()
+            contents = []
+            # Configfs recreates attribute inodes on readdir and changes directory timestamps.
+            # Fingerprint the actual overlay, including its applied state, instead.
+            for name in ("dtbo", "path", "status"):
+                with (path / name).open("rb") as handle:
+                    data = handle.read(262145)
+                if len(data) > 262144:
+                    raise OSError("Overlay evidence exceeds the cache verification limit")
+                contents.append((name, hashlib.sha256(data).digest()))
+            return str(path), stat.st_dev, stat.st_ino, tuple(contents)
+
         try:
             overlays = sorted(self._overlays_path.iterdir())
             masters = sorted(path for path in self._masters_path.iterdir() if path.name.startswith("w1_bus_master"))
@@ -194,7 +208,7 @@ class HelperOneWireOverlayClient:
                 stamp(self._state_path),
                 stamp(self._overlays_path),
                 stamp(self._masters_path),
-                tuple((stamp(path), tuple(stamp(child) for child in sorted(path.iterdir()))) for path in overlays),
+                tuple(overlay_evidence(path) for path in overlays),
                 tuple(stamp(path) for path in masters),
             )
         except OSError:

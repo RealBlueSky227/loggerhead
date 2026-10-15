@@ -573,8 +573,6 @@ class TemperatureReader:
         self._raise_if_cancelled(stop_event, "configuration")
         self._sync_runtime_overlay_status(stop_event=stop_event)
         self._raise_if_cancelled(stop_event, "configuration")
-        if bcm_pin in self._configured_kernel_pins and self._kernel_bus_for_gpio(bcm_pin, required=False) is not None:
-            return
         if self._kernel_bus_for_gpio(bcm_pin, required=False) is not None:
             self._configured_kernel_pins.add(bcm_pin)
             return
@@ -841,11 +839,19 @@ class TemperatureReader:
 
     def _w1_gpio_platforms(self) -> list[KernelOneWirePlatform]:
         platforms: list[KernelOneWirePlatform] = []
-        for path in sorted(self.platform_root.glob("*")):
+        driver_root = self.platform_root.parent / "drivers" / "w1-gpio"
+        if driver_root.is_dir():
+            # The driver's symlinks list bound devices; avoid scanning every platform device.
+            candidates = [self.platform_root / item.name for item in driver_root.iterdir() if item.is_symlink()]
+        else:
+            candidates = list(self.platform_root.glob("*"))
+        for path in sorted(candidates):
             if not path.is_dir():
                 continue
             driver = self._driver_name(path)
             driver_ok = bool(driver and driver.replace("_", "-") == "w1-gpio")
+            if driver and not driver_ok:
+                continue
             compatible_ok = False
             gpio_values: list[int] = []
             evidence: list[str] = []
@@ -2200,11 +2206,12 @@ class HostHealthMonitor:
 
     def snapshot(self, root: Path = Path("/")) -> dict[str, float]:
         disk_used, disk_available = self.disk_usage(root)
+        memory = self.memory()
         return {
             "cpu_percent": self.cpu_percent(),
-            "memory_total": float(self.memory()["total"]),
-            "memory_active": float(self.memory()["active"]),
-            "memory_available": float(self.memory()["available"]),
+            "memory_total": float(memory["total"]),
+            "memory_active": float(memory["active"]),
+            "memory_available": float(memory["available"]),
             "disk_used": disk_used,
             "disk_available": disk_available,
             "uptime_seconds": self.uptime_seconds(),

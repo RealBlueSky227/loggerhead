@@ -8,6 +8,17 @@ import pytest
 from loggerhead.database import TelemetryStore
 
 
+def test_batched_samples_preserve_timestamps_units_types_and_catalog(tmp_path) -> None:
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    store.stream_catalog()
+    samples = [("temperature.water", 78.2, "F", 10.5), ("water.sump", "normal", "", 11.5)]
+    store.log_samples(iter(samples))
+    history = store.history([s[0] for s in samples], start_ts=0, end_ts=20)
+    assert history["temperature.water"][0] == {"ts": 10.5, "value": 78.2, "unit": "F"}
+    assert history["water.sump"][0] == {"ts": 11.5, "value": "normal", "unit": ""}
+    assert {item["stream"] for item in store.stream_catalog()} == {s[0] for s in samples}
+
+
 def test_history_downsamples(tmp_path) -> None:
     store = TelemetryStore(tmp_path / "loggerhead.sqlite3")
     start = time.time() - 10

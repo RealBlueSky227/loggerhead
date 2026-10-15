@@ -533,6 +533,35 @@ def test_kernel_one_wire_refuses_detached_boot_masters_without_captured_mapping(
         reader.read_one_wire_gpio(17)
 
 
+def test_kernel_platform_discovery_uses_bound_driver_devices_and_revalidates(tmp_path, monkeypatch) -> None:
+    platform_root = tmp_path / "devices"
+    platform_root.mkdir()
+    driver_root = tmp_path / "drivers" / "w1-gpio"
+    driver_root.mkdir(parents=True)
+    platform = write_trixie_w1_platform(platform_root, "onewire@11", 17)
+    bound = driver_root / platform.name
+    bound.mkdir()
+    # Model the kernel's bound-device symlink without requiring Windows symlink privileges.
+    original = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink", lambda path: path == bound or original(path))
+    reader = TemperatureReader(platform_root=platform_root)
+    seen = []
+    original_driver_name = reader._driver_name
+
+    def driver_name(path):
+        seen.append(path.name)
+        return original_driver_name(path)
+
+    monkeypatch.setattr(reader, "_driver_name", driver_name)
+    (platform_root / "unrelated-device").mkdir()
+    assert [p.gpio_bcm for p in reader._w1_gpio_platforms()] == [17]
+    assert seen == ["onewire@11"]
+    (platform / "of_node" / "gpios").write_bytes(b"".join(n.to_bytes(4, "big") for n in (7, 22, 0)))
+    assert [p.gpio_bcm for p in reader._w1_gpio_platforms()] == [22]
+    bound.rmdir()
+    assert reader._w1_gpio_platforms() == []
+
+
 def test_kernel_one_wire_configure_uses_helper_captured_bus_master_for_detached_runtime_overlay(tmp_path) -> None:
     root = tmp_path / "w1"
     platform_root = tmp_path / "platform"

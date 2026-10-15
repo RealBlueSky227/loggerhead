@@ -67,6 +67,134 @@ def test_status_excludes_catalog_and_reads_events_outside_state_lock(tmp_path, m
         assert snapshot["events"] == []
 
 
+def test_slow_diagnostics_do_not_block_status_or_equipment_state(tmp_path, monkeypatch) -> None:
+    service = make_service(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_uart(_node):
+        entered.set()
+        assert release.wait(2)
+        return {"drv_status": 0}
+
+    monkeypatch.setattr(service.uart, "diagnostics", slow_uart)
+    worker = threading.Thread(target=service._refresh_stepper_diagnostics)
+    worker.start()
+    try:
+        assert entered.wait(1)
+        snapshot = service.status()
+        assert snapshot["diagnostics"]["steppers"]["dose1"]["status"] == "initializing"
+        with service._state_lock:
+            service.state.equipment["ac1"] = EquipmentState("ac1", False)
+    finally:
+        release.set()
+        worker.join(3)
+    assert not worker.is_alive()
+    snapshot = service.status()
+    assert snapshot["diagnostics"]["steppers"]["dose1"]["drv_status"] == 0
+    assert snapshot["diagnostics"]["steppers"]["dose1"]["sampled_at"] > 0
+
+
+def test_disabled_mqtt_does_not_build_status_and_diagnostics_skip_active_motor(tmp_path, monkeypatch) -> None:
+    service = make_service(tmp_path)
+
+    def unexpected(*_args):
+        raise AssertionError("Unexpected status serialization or UART traffic")
+
+    monkeypatch.setattr(service, "status", unexpected)
+    service._publish_telemetry()
+    monkeypatch.setattr(service.uart, "diagnostics", unexpected)
+    service.state.stepper_active = "dose1"
+    service._refresh_stepper_diagnostics()
+    assert service._stepper_diagnostics == {}
+
+
+def test_control_health_reads_and_telemetry_writes_release_state_lock(tmp_path, monkeypatch) -> None:
+    service = make_service(tmp_path)
+    samples = []
+
+    def assert_unlocked():
+        acquired = threading.Event()
+
+        def probe():
+            with service._state_lock:
+                acquired.set()
+
+        worker = threading.Thread(target=probe)
+        worker.start()
+        worker.join(1)
+        assert acquired.is_set(), "I/O blocked the shared equipment state lock"
+
+    def health_snapshot():
+        assert_unlocked()
+        return {"cpu_percent": 25}
+
+    def log_samples(values):
+        assert_unlocked()
+        samples.extend(values)
+
+    monkeypatch.setattr(service.health, "snapshot", health_snapshot)
+    monkeypatch.setattr(service.store, "log_samples", log_samples)
+    service._control_loop_iteration(100)
+    assert ("health.cpu_percent", 25, "", 100) in samples
+
+
+def test_sensor_type_change_retires_only_obsolete_alarms_and_live_readings(tmp_path) -> None:
+    service = make_service(tmp_path)
+    service.set_sense_port(1, {"device": "ds18b20"})
+    alarms = ["sensor:sense_port_1_temperature", "temperature:sense_port_1_temperature",
+              "sensor:worker-stop", "sensor:gpio:4:handoff", "stepper:dose1", "water:sense_port_2_water"]
+    for alarm_id in alarms:
+        service.state.alarms[alarm_id] = AlarmState(alarm_id, "test fault", AlarmPriority.HIGH)
+    service.set_sense_port(2, {"device": "hydros_triple"})
+    service._poll_temperature(time.time())
+    service.set_sense_port(1, {"device": "analog"})
+    for alarm_id in alarms[:3]:
+        assert not service.state.alarms[alarm_id].active
+    for alarm_id in alarms[3:]:
+        assert service.state.alarms[alarm_id].active
+    assert "sense_port_1_temperature" not in service.status()["readings"]
+    assert "water:sense_port_2_water" in service._active_audible_alarm_ids()
+
+
+def test_restart_reconciles_removed_sensor_alarms_without_losing_history(tmp_path) -> None:
+    service = make_service(tmp_path)
+    alarm_id = "temperature:sense_port_2_temperature"
+    service.state.alarms[alarm_id] = AlarmState(alarm_id, "old temperature fault", AlarmPriority.CRITICAL)
+    service.store.log_value("temperature.sense_port_2_temperature", 32, unit="F")
+    service._save_state()
+    restarted = make_service(tmp_path)
+    assert not restarted.state.alarms[alarm_id].active
+    assert alarm_id not in restarted._active_audible_alarm_ids()
+    assert any(item["stream"] == "temperature.sense_port_2_temperature" for item in restarted.history_streams())
+
+
+def test_worker_stop_alarm_remains_until_successful_rebuild(tmp_path, monkeypatch) -> None:
+    service = make_service(tmp_path)
+    original = service._stop_sensor_workers
+    monkeypatch.setattr(service, "_stop_sensor_workers", lambda: ["sense_port_1_temperature"])
+    with pytest.raises(HardwareFault, match="workers did not stop"):
+        service._rebuild_sensor_runtime()
+    assert service.state.alarms["sensor:worker-stop"].active
+    monkeypatch.setattr(service, "_stop_sensor_workers", original)
+    service._rebuild_sensor_runtime()
+    assert not service.state.alarms["sensor:worker-stop"].active
+
+
+def test_water_level_alarm_resolves_when_desired_state_returns(tmp_path) -> None:
+    service = make_service(tmp_path)
+    service.set_sense_port(1, {"device": "hydros_triple"})
+    sensor_id = "sense_port_1_water"
+    alarm_id = f"water:{sensor_id}"
+    service.state.alarms[alarm_id] = AlarmState(alarm_id, "dry", AlarmPriority.HIGH)
+    snapshot = SensorWorkerSnapshot(sensor_id, "water", status="online", data_status="online",
+                                    value="normal", last_attempt_ts=100, last_success_ts=100)
+    service._apply_sensor_worker_snapshots_locked(
+        {sensor_id: snapshot}, 100, equipment_commands=[], value_logs=[], events=[], alarms=[]
+    )
+    assert not service.state.alarms[alarm_id].active
+
+
 def test_sensor_polling_isolates_failures_and_recovers(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = make_service(tmp_path)
     port = service.config.sense_ports[0]
@@ -829,7 +957,9 @@ def test_restart_suppresses_audible_buzzer_for_persisted_alarm(tmp_path, monkeyp
     config_path = tmp_path / "config" / "loggerhead.json"
     data_dir = tmp_path / "data"
     service = LoggerheadService(config_path, data_dir, simulation=True)
-    service.state.alarms["water:sump"] = AlarmState("water:sump", "Sump level high.", AlarmPriority.HIGH, active=True)
+    service.set_sense_port(1, {"device": "hydros_triple"})
+    alarm_id = "water:sense_port_1_water"
+    service.state.alarms[alarm_id] = AlarmState(alarm_id, "Sump level high.", AlarmPriority.HIGH, active=True)
     service.state_store.save(service.state)
 
     restarted = LoggerheadService(config_path, data_dir, simulation=True)
@@ -839,7 +969,7 @@ def test_restart_suppresses_audible_buzzer_for_persisted_alarm(tmp_path, monkeyp
     restarted._sound_buzzer_if_needed(time.time())
 
     assert sound_calls == []
-    assert "water:sump" in restarted._restart_suppressed_alarm_ids
+    assert alarm_id in restarted._restart_suppressed_alarm_ids
 
 
 def test_new_high_alarm_after_restart_can_still_sound(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
