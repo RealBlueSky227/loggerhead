@@ -1,0 +1,2 @@
+loggerhead/static/vendor/*.js -text
+loggerhead/static/vendor/*.gz binary

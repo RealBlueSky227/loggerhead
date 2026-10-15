@@ -203,7 +203,7 @@ class LoggerheadService:
 
     def status(self) -> dict[str, Any]:
         with self._state_lock:
-            return {
+            snapshot = {
                 "config": asdict(self.config),
                 "sense_ports": [asdict(item) for item in self.config.sense_ports],
                 "sensor_catalog": self._sensor_catalog(),
@@ -221,11 +221,11 @@ class LoggerheadService:
                 "buzzer_muted_until": self.state.buzzer_muted_until,
                 "buzzer_muted_remaining_seconds": max(0.0, self.state.buzzer_muted_until - time.time()),
                 "active_audible_alarm_ids": sorted(self._active_audible_alarm_ids()),
-                "history_streams": self.history_streams(),
-                "events": self.store.recent_events(30),
                 "time": time.time(),
                 "simulation": self.simulation,
             }
+        snapshot["events"] = self.store.recent_events(30)
+        return snapshot
 
     def history(self, streams: list[str], start_ts: float, end_ts: float | None = None) -> dict[str, Any]:
         return self.store.history(streams, start_ts=start_ts, end_ts=end_ts, max_points=self.config.plot_max_points)

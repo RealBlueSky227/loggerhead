@@ -40,6 +40,33 @@ def kernel_temperature_reading(value_f: float, bcm_pin: int = 4) -> OneWireTempe
     )
 
 
+def test_status_excludes_catalog_and_reads_events_outside_state_lock(tmp_path, monkeypatch) -> None:
+    service = make_service(tmp_path)
+
+    def unexpected_catalog():
+        raise AssertionError("Status polling must not query history streams")
+
+    def events(_limit):
+        acquired = threading.Event()
+
+        def check_lock():
+            with service._state_lock:
+                acquired.set()
+
+        worker = threading.Thread(target=check_lock)
+        worker.start()
+        worker.join(timeout=1)
+        assert acquired.is_set(), "Telemetry reads held the equipment state lock"
+        return []
+
+    monkeypatch.setattr(service, "history_streams", unexpected_catalog)
+    monkeypatch.setattr(service.store, "recent_events", events)
+    for _ in range(3):
+        snapshot = service.status()
+        assert "history_streams" not in snapshot
+        assert snapshot["events"] == []
+
+
 def test_sensor_polling_isolates_failures_and_recovers(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = make_service(tmp_path)
     port = service.config.sense_ports[0]

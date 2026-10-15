@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import types
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
@@ -68,7 +69,9 @@ def test_helper_client_parses_json_result(monkeypatch: pytest.MonkeyPatch) -> No
             stderr="",
         )
 
-    client = HelperOneWireOverlayClient(helper_path="/usr/local/sbin/loggerhead-onewire-helper", sudo_command="sudo", subprocess_run=fake_run)
+    client = HelperOneWireOverlayClient(
+        helper_path="/usr/local/sbin/loggerhead-onewire-helper", sudo_command="sudo", subprocess_run=fake_run
+    )
 
     result = client.activate(17)
 
@@ -76,6 +79,70 @@ def test_helper_client_parses_json_result(monkeypatch: pytest.MonkeyPatch) -> No
     assert result.owned is True
     assert result.bus_master == "w1_bus_master10"
     assert result.owned_bus_masters == {17: "w1_bus_master10"}
+
+
+def test_helper_status_cache_coalesces_workers_and_invalidates(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("loggerhead.onewire.os.geteuid", lambda: 1000, raising=False)
+    state = tmp_path / "owned.json"
+    state.write_text("{}")
+    overlays = tmp_path / "overlays"
+    overlays.mkdir()
+    masters = tmp_path / "w1"
+    masters.mkdir()
+    calls = []
+    fail = False
+
+    def run(command, **_kwargs):
+        calls.append(command[-1])
+        if fail:
+            raise TimeoutError("helper timeout")
+        return types.SimpleNamespace(returncode=0, stdout=json.dumps({"ok": True, "action": command[-1]}), stderr="")
+
+    client = HelperOneWireOverlayClient(
+        subprocess_run=run,
+        state_path=state,
+        overlays_path=overlays,
+        masters_path=masters,
+    )
+    threads = [threading.Thread(target=client.status) for _ in range(10)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    assert len(calls) == 1
+    state.write_text('{"changed":true}')
+    client.status()
+    assert len(calls) == 2
+    (overlays / "0_w1-gpio").mkdir()
+    client.status()
+    assert len(calls) == 3
+    (masters / "w1_bus_master10").mkdir()
+    client.status()
+    assert len(calls) == 4
+    client.release(17)
+    client.status()
+    assert len(calls) == 6  # Mutations always bypass and invalidate the cache.
+    client._status_expires = 0
+    fail = True
+    with pytest.raises(RuntimeError, match="timeout"):
+        client.status()
+    with pytest.raises(RuntimeError, match="timeout"):
+        client.status()  # Never fall back to a stale successful helper response.
+
+
+def test_helper_status_without_verifiable_fingerprint_is_never_cached(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("loggerhead.onewire.os.geteuid", lambda: 1000, raising=False)
+    calls = []
+
+    def run(*_args, **_kwargs):
+        calls.append(True)
+        return types.SimpleNamespace(returncode=0, stdout='{"ok":true}', stderr="")
+
+    client = HelperOneWireOverlayClient(subprocess_run=run, state_path=tmp_path / "missing")
+    client.status()
+    client.status()
+    assert len(calls) == 2
 
 
 def test_helper_activate_records_new_w1_bus_master(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

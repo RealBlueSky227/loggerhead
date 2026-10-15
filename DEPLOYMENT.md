@@ -53,6 +53,10 @@ http://192.168.60.3:8080
 
 ## Update Later
 
+The self-hosted Plotly update also requires the complete `loggerhead/static/`
+directory. See [Plots deployment and benchmarks](docs/PLOTS.md) for scp updates,
+the one-time SQLite catalog migration, existing-venv paths, and Pi validation.
+
 ```bash
 cd ~/controller/loggerhead
 git pull --ff-only

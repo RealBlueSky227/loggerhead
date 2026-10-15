@@ -5,8 +5,11 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from .hardware import ALLOWED_DIGITAL_BCM, DiagnosticHalt
@@ -101,19 +104,18 @@ class OneWireOverlayResult:
             overlays=overlays,
             owned_gpios=tuple(int(item) for item in payload.get("owned_gpios", [])),
             bus_master=str(payload.get("bus_master", "")),
-            owned_bus_masters={int(key): str(value) for key, value in dict(payload.get("owned_bus_masters", {})).items()},
+            owned_bus_masters={
+                int(key): str(value) for key, value in dict(payload.get("owned_bus_masters", {})).items()
+            },
         )
 
 
 class OneWireOverlayClient(Protocol):
-    def activate(self, gpio: int) -> OneWireOverlayResult:
-        ...
+    def activate(self, gpio: int) -> OneWireOverlayResult: ...
 
-    def release(self, gpio: int) -> OneWireOverlayResult:
-        ...
+    def release(self, gpio: int) -> OneWireOverlayResult: ...
 
-    def status(self) -> OneWireOverlayResult:
-        ...
+    def status(self) -> OneWireOverlayResult: ...
 
 
 class HelperOneWireOverlayClient:
@@ -131,20 +133,73 @@ class HelperOneWireOverlayClient:
         sudo_command: str | None = None,
         subprocess_run: Callable[..., Any] = subprocess.run,
         timeout: float = 8.0,
+        status_cache_seconds: float = 2.0,
+        state_path: Path = Path("/run/loggerhead-onewire/owned.json"),
+        overlays_path: Path = Path("/sys/kernel/config/device-tree/overlays"),
+        masters_path: Path = Path("/sys/bus/w1/devices"),
     ) -> None:
-        self.helper_path = helper_path or shutil.which("loggerhead-onewire-helper") or "/usr/local/sbin/loggerhead-onewire-helper"
+        self.helper_path = (
+            helper_path or shutil.which("loggerhead-onewire-helper") or "/usr/local/sbin/loggerhead-onewire-helper"
+        )
         self.sudo_command = sudo_command or shutil.which("sudo") or "/usr/bin/sudo"
         self._subprocess_run = subprocess_run
         self.timeout = timeout
+        self._status_cache_seconds = status_cache_seconds
+        self._state_path = state_path
+        self._overlays_path = overlays_path
+        self._masters_path = masters_path
+        self._status_lock = threading.RLock()
+        self._cached_status: OneWireOverlayResult | None = None
+        self._status_signature: tuple | None = None
+        self._status_expires = 0.0
 
     def activate(self, gpio: int) -> OneWireOverlayResult:
-        return self._call("activate", gpio)
+        with self._status_lock:
+            self._cached_status = None
+            return self._call("activate", gpio)
 
     def release(self, gpio: int) -> OneWireOverlayResult:
-        return self._call("release", gpio)
+        with self._status_lock:
+            self._cached_status = None
+            return self._call("release", gpio)
 
     def status(self) -> OneWireOverlayResult:
-        return self._call("status", None)
+        with self._status_lock:
+            signature = self._status_fingerprint()
+            if (
+                signature is not None
+                and signature == self._status_signature
+                and self._cached_status is not None
+                and time.monotonic() < self._status_expires
+            ):
+                return self._cached_status
+            self._cached_status = None
+            result = self._call("status", None)
+            # Cache only if observable ownership evidence stayed unchanged during the call.
+            if signature is not None and signature == self._status_fingerprint():
+                self._cached_status = result
+                self._status_signature = signature
+                self._status_expires = time.monotonic() + self._status_cache_seconds
+            return result
+
+    def _status_fingerprint(self) -> tuple | None:
+        def stamp(path: Path) -> tuple:
+            stat = path.stat()
+            return str(path), stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns
+
+        try:
+            overlays = sorted(self._overlays_path.iterdir())
+            masters = sorted(path for path in self._masters_path.iterdir() if path.name.startswith("w1_bus_master"))
+            return (
+                stamp(self._state_path),
+                stamp(self._overlays_path),
+                stamp(self._masters_path),
+                tuple((stamp(path), tuple(stamp(child) for child in sorted(path.iterdir()))) for path in overlays),
+                tuple(stamp(path) for path in masters),
+            )
+        except OSError:
+            # Missing/inaccessible evidence disables caching, never ownership checks.
+            return None
 
     def _call(self, operation: str, gpio: int | None) -> OneWireOverlayResult:
         if gpio is not None:

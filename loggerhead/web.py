@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import shutil
+import sqlite3
 import time
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -12,6 +16,11 @@ from .drivers import HardwareFault
 from .hardware import DiagnosticHalt
 
 LOGGER = logging.getLogger(__name__)
+STATIC_ROOT = Path(__file__).with_name("static")
+STATIC_ASSETS = {
+    "/static/plots.mjs": ("plots.mjs", "text/javascript; charset=utf-8"),
+    "/static/vendor/plotly-basic-4.1.2.min.js": ("vendor/plotly-basic-4.1.2.min.js", "text/javascript; charset=utf-8"),
+}
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -36,6 +45,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/":
                 self._send_html(INDEX_HTML)
+            elif parsed.path in STATIC_ASSETS:
+                self._send_asset(parsed.path)
             elif parsed.path == "/api/status":
                 self._send_json(self.server.service.status())
             elif parsed.path == "/api/history/streams":
@@ -43,12 +54,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/history":
                 query = parse_qs(parsed.query)
                 streams = query.get("stream", [])
-                lookback = max(1.0, float(query.get("lookback", ["86400"])[0]))
+                lookback = float(query.get("lookback", ["86400"])[0])
+                if not math.isfinite(lookback) or not 1 <= lookback <= 604800:
+                    raise ValueError("History lookback must be between 1 second and 7 days.")
+                if len(streams) > 12 or any(not stream or len(stream) > 200 for stream in streams):
+                    raise ValueError("Select at most 12 valid history stream IDs.")
                 self._send_json(self.server.service.history(streams, time.time() - lookback))
             else:
                 self.send_error(404)
         except (KeyError, ValueError) as exc:
             self._send_json({"ok": False, "error": "bad_request", "message": str(exc)}, status=400)
+        except sqlite3.OperationalError:
+            LOGGER.exception("Telemetry query unavailable while handling %s.", parsed.path)
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "telemetry_unavailable",
+                    "message": "Telemetry query busy or timed out; retry with fewer streams or a shorter range.",
+                },
+                status=503,
+            )
         except Exception as exc:
             LOGGER.exception("Unexpected dashboard API error while handling %s.", parsed.path)
             self._send_json({"ok": False, "error": "internal_error", "message": str(exc)}, status=500)
@@ -98,6 +123,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if length <= 0:
             return {}
         return json.loads(self.rfile.read(length).decode("utf-8"))
+
+    def _send_asset(self, url: str) -> None:
+        relative, content_type = STATIC_ASSETS[url]
+        path = STATIC_ROOT / relative
+        compressed = path.with_suffix(path.suffix + ".gz")
+        use_gzip = "gzip" in self.headers.get("Accept-Encoding", "") and compressed.is_file()
+        if use_gzip:
+            path = compressed
+        stat = path.stat()
+        etag = f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+        unchanged = self.headers.get("If-None-Match") == etag
+        self.send_response(304 if unchanged else 200)
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable" if "/vendor/" in url else "no-cache")
+        self.send_header("Vary", "Accept-Encoding")
+        if use_gzip:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Type", content_type)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if not unchanged:
+            self.send_header("Content-Length", str(stat.st_size))
+        self.end_headers()
+        if not unchanged:
+            with path.open("rb") as asset:
+                shutil.copyfileobj(asset, self.wfile)
 
     def _send_json(self, payload: Any, *, status: int = 200) -> None:
         body = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
@@ -166,7 +216,9 @@ INDEX_HTML = r"""<!doctype html>
     .row:last-child { border-bottom: 0; }
     .tabs { display: flex; gap: 8px; }
     section[hidden] { display: none; }
-    canvas { width: 100%; height: 320px; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; }
+    #plot { width: 100%; height: 520px; min-width: 0; }
+    #plotStream { max-width: 100%; min-width: 220px; }
+    @media (max-width: 640px) { #plot { height: 560px; } #plotStream { width: 100%; } }
     textarea { width: 100%; min-height: 360px; background: #080d11; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
     .alarm { border-color: var(--warn); }
     .diag { border-color: #31505a; }
@@ -212,16 +264,17 @@ INDEX_HTML = r"""<!doctype html>
     </section>
     <section id="plots" hidden>
       <div class="toolbar">
-        <select id="plotStream" multiple size="6"></select>
-        <select id="lookback">
+        <select id="plotStream" multiple size="6" aria-label="Historical streams"></select>
+        <select id="lookback" aria-label="Time range">
           <option value="3600">1 hour</option>
+          <option value="21600">6 hours</option>
           <option value="86400" selected>24 hours</option>
           <option value="604800">7 days</option>
         </select>
         <button id="loadPlot">Refresh</button>
-        <span id="plotMessage" class="message"></span>
+        <span id="plotMessage" class="message" role="status" aria-live="polite"></span>
       </div>
-      <canvas id="plot" width="1200" height="360"></canvas>
+      <div id="plot" aria-label="Telemetry history chart"></div>
     </section>
     <section id="diagnostics" hidden>
       <div id="healthGrid" class="grid"></div>
@@ -253,8 +306,6 @@ INDEX_HTML = r"""<!doctype html>
     let sensorEditorDirty = false;
     let sensorDrafts = [];
     let lastSensePortHash = "";
-    let plotStreamCatalogHash = "";
-    let plotStreams = [];
     const $ = (id) => document.getElementById(id);
     const clone = (value) => JSON.parse(JSON.stringify(value));
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
@@ -271,7 +322,7 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelectorAll("[data-tab]").forEach(b => b.classList.toggle("active", b === btn));
       ["dash","plots","diagnostics","config"].forEach(id => $(id).hidden = id !== btn.dataset.tab);
       if (btn.dataset.tab === "plots") {
-        ensurePlotStreams().then(loadPlot);
+        document.dispatchEvent(new Event("loggerhead:plots-open"));
       }
     });
     $("scale").oninput = e => document.documentElement.style.setProperty("--widget-width", `${e.target.value}px`);
@@ -299,6 +350,7 @@ INDEX_HTML = r"""<!doctype html>
         const payload = rawConfigDirty ? JSON.parse($("configText").value) : clone(status.config);
         if (sensorEditorDirty) payload.sense_ports = sensorDrafts.map(portForSave);
         const result = await apiPost("/api/config", payload);
+        document.dispatchEvent(new Event("loggerhead:config-saved"));
         status.config = result.config;
         status.sense_ports = result.config.sense_ports;
         rawConfigDirty = false;
@@ -326,7 +378,6 @@ INDEX_HTML = r"""<!doctype html>
       loadSensePortDrafts(true);
       setMessage("sensePortMessage", "Sensor changes canceled.");
     };
-    $("loadPlot").onclick = loadPlot;
     async function apiPost(path, payload) {
       const response = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
       const body = await response.json().catch(() => ({}));
@@ -409,7 +460,6 @@ INDEX_HTML = r"""<!doctype html>
       $("healthGrid").innerHTML = Object.values(status.readings).filter(r => r.id.startsWith("health_")).map(r => card(r.id.replace("health_", "").replaceAll("_", " "), r.value)).join("");
       $("diagnosticGrid").innerHTML = Object.entries(status.diagnostics).map(([k, v]) => card(k.replaceAll("_", " "), typeof v === "object" ? JSON.stringify(v) : v, "diag")).join("");
       $("events").innerHTML = status.events.map(e => card(e.category, e.message, "diag")).join("");
-      updatePlotStreamSelector(status.history_streams || []);
     }
     async function toggleEquipment(id, on) {
       await fetch("/api/equipment", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id, on})});
@@ -509,121 +559,9 @@ INDEX_HTML = r"""<!doctype html>
       $("silence").className = remaining > 0 ? "filled" : "hollow";
       $("silence").textContent = remaining > 0 ? `Silenced ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}` : "Silence";
     }
-    async function ensurePlotStreams() {
-      if (plotStreams.length) return;
-      try {
-        const response = await fetch("/api/history/streams");
-        const body = await response.json();
-        if (!response.ok || body.ok === false) throw new Error(body.message || `${response.status} ${response.statusText}`);
-        updatePlotStreamSelector(body.streams || []);
-      } catch (error) {
-        setMessage("plotMessage", `Could not load stream list: ${error.message}`, "error");
-      }
-    }
-    function updatePlotStreamSelector(streams) {
-      const catalog = [...streams].sort((a, b) => a.stream.localeCompare(b.stream));
-      const hash = JSON.stringify(catalog.map(item => [item.stream, item.kind, item.unit]));
-      if (hash === plotStreamCatalogHash) return;
-      const select = $("plotStream");
-      const previous = new Set([...select.selectedOptions].map(option => option.value));
-      plotStreams = catalog;
-      plotStreamCatalogHash = hash;
-      select.innerHTML = catalog.map(item => {
-        const detail = [item.kind, item.unit].filter(Boolean).join(" ");
-        const label = detail ? `${item.stream} (${detail})` : item.stream;
-        return `<option value="${esc(item.stream)}">${esc(label)}</option>`;
-      }).join("");
-      const available = new Set(catalog.map(item => item.stream));
-      const preserved = [...previous].filter(stream => available.has(stream));
-      const selected = preserved.length ? preserved : defaultPlotStreams(catalog);
-      [...select.options].forEach(option => { option.selected = selected.includes(option.value); });
-      if (!catalog.length) setMessage("plotMessage", "No historical telemetry streams have been recorded yet.");
-    }
-    function defaultPlotStreams(catalog) {
-      const temperature = catalog.find(item => item.stream.startsWith("temperature."));
-      const numeric = catalog.find(item => item.kind === "numeric");
-      const first = temperature || numeric || catalog[0];
-      return first ? [first.stream] : [];
-    }
-    async function loadPlot() {
-      const selectedOptions = [...$("plotStream").selectedOptions];
-      if (!selectedOptions.length) {
-        setMessage("plotMessage", "Select one or more streams to plot.");
-        drawCanvasMessage("No stream selected");
-        return;
-      }
-      const selected = selectedOptions.map(o => `stream=${encodeURIComponent(o.value)}`).join("&");
-      const lookback = $("lookback").value;
-      setMessage("plotMessage", "Loading history...");
-      drawCanvasMessage("Loading...");
-      try {
-        const response = await fetch(`/api/history?${selected}&lookback=${lookback}`);
-        const data = await response.json();
-        if (!response.ok || data.ok === false) throw new Error(data.message || `${response.status} ${response.statusText}`);
-        drawPlot(data);
-      } catch (error) {
-        setMessage("plotMessage", `History API error: ${error.message}`, "error");
-        drawCanvasMessage("History API error");
-      }
-    }
-    function drawPlot(series) {
-      const canvas = $("plot"), ctx = canvas.getContext("2d");
-      ctx.clearRect(0,0,canvas.width,canvas.height);
-      const colors = ["#35d07f", "#39a7ff", "#ff4b5f", "#ffc857", "#b68cff", "#78e0dc", "#f78fb3"];
-      const categories = new Map();
-      const prepared = Object.entries(series).map(([name, points]) => {
-        const values = points.map(point => {
-          if (typeof point.value === "number") return {...point, plotValue: point.value, category: ""};
-          const label = String(point.value ?? "unknown");
-          if (!categories.has(label)) categories.set(label, categories.size);
-          return {...point, plotValue: categories.get(label), category: label};
-        });
-        return [name, values];
-      });
-      const all = prepared.flatMap(([, points]) => points).filter(p => typeof p.plotValue === "number" && Number.isFinite(p.plotValue));
-      if (!all.length) {
-        setMessage("plotMessage", "No data points found for the selected stream and time range.");
-        drawCanvasMessage("No data");
-        return;
-      }
-      setMessage("plotMessage", `${all.length} point${all.length === 1 ? "" : "s"} loaded.`, "ok");
-      let minT = Math.min(...all.map(p => p.ts)), maxT = Math.max(...all.map(p => p.ts));
-      let minV = Math.min(...all.map(p => p.plotValue)), maxV = Math.max(...all.map(p => p.plotValue));
-      if (minT === maxT) { minT -= 1; maxT += 1; }
-      if (minV === maxV) { minV -= 1; maxV += 1; }
-      ctx.strokeStyle = "#26343c"; ctx.lineWidth = 1; ctx.beginPath();
-      ctx.moveTo(40, 10); ctx.lineTo(40, canvas.height - 28); ctx.lineTo(canvas.width - 12, canvas.height - 28); ctx.stroke();
-      Object.entries(series).forEach(([name, points], i) => {
-        const preparedPoints = prepared.find(([stream]) => stream === name)?.[1] || [];
-        ctx.strokeStyle = colors[i % colors.length]; ctx.fillStyle = ctx.strokeStyle; ctx.lineWidth = 3; ctx.beginPath();
-        preparedPoints.forEach((p, index) => {
-          const x = 40 + (p.ts - minT) / (maxT - minT) * (canvas.width - 60);
-          const y = canvas.height - 28 - ((p.plotValue - minV) / (maxV - minV) * (canvas.height - 48));
-          if (index === 0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
-          if (preparedPoints.length === 1) {
-            ctx.moveTo(x + 4, y);
-            ctx.arc(x, y, 4, 0, Math.PI * 2);
-          }
-        });
-        ctx.stroke(); ctx.fillStyle = ctx.strokeStyle; ctx.fillText(name, 12, 18 + i * 18);
-      });
-      if (categories.size) {
-        ctx.fillStyle = "#88a1a1";
-        [...categories.entries()].forEach(([label, value], index) => {
-          const y = canvas.height - 28 - ((value - minV) / (maxV - minV) * (canvas.height - 48));
-          ctx.fillText(label, canvas.width - 150, Math.max(14, y - 4 + index % 2 * 10));
-        });
-      }
-    }
-    function drawCanvasMessage(text) {
-      const canvas = $("plot"), ctx = canvas.getContext("2d");
-      ctx.clearRect(0,0,canvas.width,canvas.height);
-      ctx.fillStyle = "#88a1a1";
-      ctx.font = "24px system-ui, sans-serif";
-      ctx.fillText(text, 40, 70);
-    }
     refresh(); setInterval(refresh, 2000);
   </script>
+  <script type="module" src="/static/plots.mjs"></script>
 </body>
 </html>
 """

@@ -11,6 +11,8 @@ Loggerhead is organized around a small runtime core:
 - `notifications.py` implements Telegram and Home Assistant MQTT integration.
 - `service.py` wires drivers, controllers, state, database, alarms, and MQTT together.
 - `web.py` serves the local dashboard and JSON API using the Python standard library.
+- `static/plots.mjs` owns interactive Plotly history charts; its vendored basic
+  bundle loads only when Plots opens. See [Plots runtime](docs/PLOTS.md).
 
 The design keeps hardware I/O behind narrow interfaces so safety-critical behavior is testable without physical aquarium equipment. On a Raspberry Pi, the same interfaces use `smbus2`, `pigpio`, `pyserial`, and `RPi.GPIO` when available.
 
