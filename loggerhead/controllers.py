@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import time
 from dataclasses import dataclass
 
@@ -57,20 +58,47 @@ class DosingScheduler:
     """
 
     @staticmethod
+    def window(profile: DosingProfile, day: dt.date) -> tuple[dt.datetime, dt.datetime]:
+        start = dt.datetime.combine(day, dt.time.fromisoformat(profile.window_start))
+        end = dt.datetime.combine(day, dt.time.fromisoformat(profile.window_end))
+        if end <= start:
+            end += dt.timedelta(days=1)
+        return start, end
+
+    @classmethod
+    def due_slot(cls, profile: DosingProfile, now: dt.datetime) -> tuple[dt.datetime, str] | None:
+        if profile.daily_volume_ml <= 0 or profile.doses_per_day <= 0:
+            return None
+        for day in (now.date(), now.date() - dt.timedelta(days=1)):
+            start, end = cls.window(profile, day)
+            if start <= now < end:
+                interval = (end - start).total_seconds() / profile.doses_per_day
+                index = min(profile.doses_per_day - 1, int((now - start).total_seconds() / interval))
+                return start + dt.timedelta(seconds=index * interval), day.isoformat()
+        return None
+
+    @classmethod
+    def next_slot(cls, profile: DosingProfile, now: dt.datetime) -> dt.datetime | None:
+        if profile.daily_volume_ml <= 0 or profile.doses_per_day <= 0:
+            return None
+        candidates = []
+        for offset in (-1, 0, 1):
+            start, end = cls.window(profile, now.date() + dt.timedelta(days=offset))
+            interval = (end - start).total_seconds() / profile.doses_per_day
+            index = max(0, math.ceil((now - start).total_seconds() / interval))
+            if index < profile.doses_per_day:
+                candidates.append(start + dt.timedelta(seconds=index * interval))
+        return min(candidates) if candidates else None
+
+    @staticmethod
     def next_action(profile: DosingProfile, now: dt.datetime, last_dose_ts: float | None) -> DoseAction:
         if profile.daily_volume_ml <= 0 or profile.doses_per_day <= 0:
             return DoseAction(False, 0.0, 0.0)
-        start = _time_today(now, profile.window_start)
-        end = _time_today(now, profile.window_end)
-        if end <= start:
-            end += dt.timedelta(days=1)
-        if not start <= now <= end:
+        slot = DosingScheduler.due_slot(profile, now)
+        if slot is None:
             return DoseAction(False, 0.0, 0.0)
-        span = (end - start).total_seconds()
-        interval = span / profile.doses_per_day
-        slot = int((now - start).total_seconds() // interval)
-        slot_time = start + dt.timedelta(seconds=slot * interval)
-        if last_dose_ts and last_dose_ts >= slot_time.timestamp():
+        slot_time, _day = slot
+        if last_dose_ts is not None and last_dose_ts >= slot_time.timestamp():
             return DoseAction(False, 0.0, 0.0)
         volume = profile.daily_volume_ml / profile.doses_per_day
         run_seconds = volume / max(profile.calibration_ml_per_minute, 0.001) * 60

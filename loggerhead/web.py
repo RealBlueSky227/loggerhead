@@ -19,6 +19,7 @@ LOGGER = logging.getLogger(__name__)
 STATIC_ROOT = Path(__file__).with_name("static")
 STATIC_ASSETS = {
     "/static/plots.mjs": ("plots.mjs", "text/javascript; charset=utf-8"),
+    "/static/dosing.mjs": ("dosing.mjs", "text/javascript; charset=utf-8"),
     "/static/vendor/plotly-basic-4.1.2.min.js": ("vendor/plotly-basic-4.1.2.min.js", "text/javascript; charset=utf-8"),
 }
 
@@ -101,8 +102,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.server.service.set_alarm_enabled(bool(payload["enabled"]))
                 self._send_json({"ok": True})
             elif parsed.path == "/api/prime":
-                result = self.server.service.set_manual_priming(payload["id"], bool(payload["on"]))
+                result = self.server.service.set_manual_priming(
+                    payload["id"], bool(payload["on"]),
+                    speed_steps_per_second=payload.get("speed_steps_per_second"),
+                    max_seconds=payload.get("max_seconds"),
+                )
                 self._send_json({"ok": True, **result}, status=202)
+            elif parsed.path == "/api/calibration":
+                result = self.server.service.start_calibration(payload["id"], payload["steps"], payload.get("speed_steps_per_second"))
+                self._send_json({"ok": True, **result}, status=202)
+            elif parsed.path == "/api/dosing/preview":
+                self._send_json({"ok": True, **self.server.service.preview_dosing(payload["config"])})
+            elif parsed.path == "/api/dosing/pause":
+                self.server.service.dosing.pause(payload["id"], payload["paused"])
+                self._send_json({"ok": True})
+            elif parsed.path == "/api/dosing/reset":
+                self.server.service.dosing.reset(payload["id"])
+                self._send_json({"ok": True})
             else:
                 self.send_error(404)
         except (KeyError, ValueError, json.JSONDecodeError) as exc:
@@ -214,7 +230,7 @@ INDEX_HTML = r"""<!doctype html>
     .value.off { color: var(--muted); }
     .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid var(--line); padding: 10px 0; }
     .row:last-child { border-bottom: 0; }
-    .tabs { display: flex; gap: 8px; }
+    .tabs { display: flex; gap: 8px; flex-wrap: wrap; }
     section[hidden] { display: none; }
     #plot { width: 100%; height: 520px; min-width: 0; }
     #plotStream { max-width: 100%; min-width: 220px; }
@@ -223,14 +239,15 @@ INDEX_HTML = r"""<!doctype html>
     .alarm { border-color: var(--warn); }
     .diag { border-color: #31505a; }
     .field-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-top: 10px; }
-    .field-grid label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+    .field-grid label { display: grid; min-width: 0; gap: 4px; color: var(--muted); font-size: 12px; }
+    .field-grid input, .field-grid select { min-width: 0; max-width: 100%; }
     .field-grid label span { color: var(--muted); }
     .message { min-height: 24px; color: var(--muted); }
     .message.error { color: var(--hot); }
     .message.ok { color: var(--ok); }
     .status-line { color: var(--muted); font-size: 12px; margin-top: 8px; }
     .value.warn { color: var(--warn); }
-    @media (max-width: 640px) { header { align-items: flex-start; flex-direction: column; gap: 12px; } .clock { font-size: 24px; } main { padding: 12px; } }
+    @media (max-width: 640px) { header { align-items: flex-start; flex-direction: column; gap: 12px; } .clock { font-size: 24px; } main { padding: 12px; } .grid { grid-template-columns: minmax(0, 1fr); } main > section { min-width: 0; } }
   </style>
 </head>
 <body>
@@ -258,7 +275,9 @@ INDEX_HTML = r"""<!doctype html>
       <h2>Equipment</h2>
       <div id="equipment" class="grid"></div>
       <h2>Dosing Pumps</h2>
+      <span id="pumpMessage" class="message" role="status"></span>
       <div id="pumps" class="grid"></div>
+      <div id="dosingOverview" class="grid"></div>
       <h2>Alarms</h2>
       <div id="alarms" class="grid"></div>
     </section>
@@ -284,19 +303,25 @@ INDEX_HTML = r"""<!doctype html>
       <div id="events" class="grid"></div>
     </section>
     <section id="config" hidden>
+      <div class="toolbar">
+        <button id="saveConfig">Save Config</button>
+        <button id="cancelConfig" class="hollow">Cancel</button>
+        <span id="configMessage" class="message" role="status" aria-live="polite"></span>
+      </div>
+      <h2>Dosing Pump Configuration</h2>
+      <div id="pumpConfig" class="grid"></div>
+      <h2>Dosing Scheduler</h2>
+      <div class="toolbar"><button id="addDoseSchedule">Add Schedule</button></div>
+      <div id="dosingSchedules"></div>
+      <h3>Dosing History</h3>
+      <div id="dosingHistory"></div>
       <h2>Sense Ports</h2>
       <div class="toolbar">
         <button id="cancelSensePorts" class="hollow">Cancel</button>
         <span id="sensePortMessage" class="message"></span>
       </div>
       <div id="sensePorts" class="grid"></div>
-      <h2>Raw Config</h2>
-      <textarea id="configText"></textarea>
-      <div class="toolbar">
-        <button id="saveConfig">Save Config</button>
-        <button id="cancelConfig" class="hollow">Cancel</button>
-        <span id="configMessage" class="message"></span>
-      </div>
+      <details><summary>Raw Config</summary><textarea id="configText" aria-label="Raw configuration"></textarea></details>
     </section>
   </main>
   <script>
@@ -347,12 +372,14 @@ INDEX_HTML = r"""<!doctype html>
         const saveButton = $("saveConfig");
         saveButton.disabled = true;
         saveButton.textContent = "Saving...";
-        const payload = rawConfigDirty ? JSON.parse($("configText").value) : clone(status.config);
+        let payload = rawConfigDirty ? JSON.parse($("configText").value) : clone(status.config);
         if (sensorEditorDirty) payload.sense_ports = sensorDrafts.map(portForSave);
+        if (window.loggerheadDosing) payload = window.loggerheadDosing.mergeConfig(payload);
         const result = await apiPost("/api/config", payload);
-        document.dispatchEvent(new Event("loggerhead:config-saved"));
         status.config = result.config;
         status.sense_ports = result.config.sense_ports;
+        status.steppers = result.config.steppers;
+        document.dispatchEvent(new CustomEvent("loggerhead:config-saved", {detail: result.config}));
         rawConfigDirty = false;
         sensorEditorDirty = false;
         $("configText").value = JSON.stringify(result.config, null, 2);
@@ -370,8 +397,11 @@ INDEX_HTML = r"""<!doctype html>
     };
     $("cancelConfig").onclick = () => {
       rawConfigDirty = false;
+      sensorEditorDirty = false;
+      loadSensePortDrafts(true);
+      document.dispatchEvent(new Event("loggerhead:config-canceled"));
       $("configText").value = JSON.stringify(status.config, null, 2);
-      setMessage("configMessage", "Raw config changes canceled.");
+      setMessage("configMessage", "Unsaved config changes canceled.");
     };
     $("cancelSensePorts").onclick = () => {
       sensorEditorDirty = false;
@@ -453,22 +483,43 @@ INDEX_HTML = r"""<!doctype html>
         return `<div class="card"><div class="label">${e.id}</div><button class="${klass}" onclick="toggleEquipment('${e.id}', ${!e.on})">${e.on ? "ON" : "OFF"}</button></div>`;
       }).join("");
       $("pumps").innerHTML = status.steppers.map(p => {
-        const on = !!status.manual_priming[p.id];
-        return `<div class="card"><div class="label">${p.name}</div><button class="${on ? "filled" : "hollow"}" onclick="togglePrime('${p.id}', ${!on})">${on ? "PRIMING" : "PRIME"}</button></div>`;
+        const on = !!status.manual_priming[p.id] || status.stepper_active === p.id;
+        const occupied = status.stepper_active && !on;
+        return `<div class="card"><div class="label">${esc(p.name)}</div><button class="${on ? "filled" : "hollow"}" ${occupied ? "disabled" : ""} onclick="togglePrime('${esc(p.id)}', ${!on})">${on ? "STOP" : "PRIME"}</button></div>`;
+      }).join("");
+      $("dosingOverview").innerHTML = (status.config.dosing || []).filter(p => p.enabled).map(profile => {
+        const runtime = status.dosing?.schedules.find(s => s.id === profile.id) || {};
+        const active = status.dosing?.active?.schedule_id === profile.id;
+        const state = runtime.fault ? "Fault" : runtime.paused ? "Paused" : active ? "Dosing" : "Scheduled";
+        const next = runtime.next_ts ? new Date(runtime.next_ts * 1000).toLocaleString() : "No upcoming dose";
+        return `<div class="card"><div class="label">${esc(profile.name)}</div><div class="value ${runtime.fault ? "hot" : ""}">${state}</div><div class="status-line">${esc(runtime.paused || runtime.fault ? runtime.fault || "Paused" : `Next: ${next}`)}</div><button data-dose-id="${esc(profile.id)}" data-dose-action="${runtime.fault ? "reset" : runtime.paused ? "resume" : "pause"}">${runtime.fault ? "Reset Fault" : runtime.paused ? "Resume" : active ? "Stop / Pause" : "Pause"}</button></div>`;
       }).join("");
       $("alarms").innerHTML = Object.values(status.alarms).filter(a => a.active).map(a => card(a.priority, a.message, "alarm")).join("") || card("ok", "No active alarms");
       $("healthGrid").innerHTML = Object.values(status.readings).filter(r => r.id.startsWith("health_")).map(r => card(r.id.replace("health_", "").replaceAll("_", " "), r.value)).join("");
       $("diagnosticGrid").innerHTML = Object.entries(status.diagnostics).map(([k, v]) => card(k.replaceAll("_", " "), typeof v === "object" ? JSON.stringify(v) : v, "diag")).join("");
       $("events").innerHTML = status.events.map(e => card(e.category, e.message, "diag")).join("");
+      document.dispatchEvent(new CustomEvent("loggerhead:status", {detail: status}));
     }
     async function toggleEquipment(id, on) {
       await fetch("/api/equipment", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id, on})});
       await refresh();
     }
     async function togglePrime(id, on) {
-      await fetch("/api/prime", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id, on})});
-      await refresh();
+      try {
+        await apiPost("/api/prime", {id, on});
+        setMessage("pumpMessage", on ? "Priming started." : "Stop requested.", "ok");
+        await refresh();
+      } catch (error) { setMessage("pumpMessage", error.message, "error"); }
     }
+    $("dosingOverview").onclick = async event => {
+      const button = event.target.closest("[data-dose-action]");
+      if (!button) return;
+      try {
+        const action = button.dataset.doseAction;
+        await apiPost(action === "reset" ? "/api/dosing/reset" : "/api/dosing/pause", {id: button.dataset.doseId, paused: action === "pause"});
+        await refresh();
+      } catch (error) { setMessage("pumpMessage", error.message, "error"); }
+    };
     function loadSensePortDrafts(force) {
       const hash = JSON.stringify(status.sense_ports || []);
       const focused = $("sensePorts").contains(document.activeElement);
@@ -559,9 +610,12 @@ INDEX_HTML = r"""<!doctype html>
       $("silence").className = remaining > 0 ? "filled" : "hollow";
       $("silence").textContent = remaining > 0 ? `Silenced ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}` : "Silence";
     }
+    window.loggerheadConfigBridge = {getStatus: () => status};
+    document.addEventListener("loggerhead:refresh-request", () => refresh());
     refresh(); setInterval(refresh, 2000);
   </script>
   <script type="module" src="/static/plots.mjs"></script>
+  <script type="module" src="/static/dosing.mjs"></script>
 </body>
 </html>
 """

@@ -75,6 +75,69 @@ class TelemetryStore:
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS dosing_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, schedule_id TEXT NOT NULL,
+                    slot_ts REAL NOT NULL, window_date TEXT NOT NULL, pump_id TEXT NOT NULL,
+                    requested_ml REAL NOT NULL, requested_steps INTEGER NOT NULL,
+                    confirmed_steps INTEGER NOT NULL DEFAULT 0, possible_steps INTEGER NOT NULL DEFAULT 0,
+                    started_at REAL NOT NULL, finished_at REAL, status TEXT NOT NULL,
+                    error TEXT NOT NULL DEFAULT '', UNIQUE(schedule_id, slot_ts)
+                )
+            """)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(dosing_runs)")}
+            if "fault_acknowledged" not in columns:
+                conn.execute("ALTER TABLE dosing_runs ADD COLUMN fault_acknowledged INTEGER NOT NULL DEFAULT 0")
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dosing_runs_status ON dosing_runs(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dosing_runs_window ON dosing_runs(schedule_id, window_date)")
+
+    def claim_dose(self, *, schedule_id: str, slot_ts: float, window_date: str, pump_id: str,
+                   requested_ml: float, requested_steps: int, daily_limit: float) -> int | None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            used = conn.execute(
+                "SELECT COALESCE(SUM(requested_ml), 0) FROM dosing_runs WHERE schedule_id=? AND window_date=?",
+                (schedule_id, window_date),
+            ).fetchone()[0]
+            if used + requested_ml > daily_limit + 1e-9:
+                return None
+            cursor = conn.execute("""
+                INSERT OR IGNORE INTO dosing_runs
+                (schedule_id,slot_ts,window_date,pump_id,requested_ml,requested_steps,started_at,status)
+                VALUES (?,?,?,?,?,?,?,'running')
+            """, (schedule_id, slot_ts, window_date, pump_id, requested_ml, requested_steps, time.time()))
+            return cursor.lastrowid if cursor.rowcount else None
+
+    def finish_dose(self, run_id: int, status: str, *, confirmed_steps: int = 0,
+                    possible_steps: int = 0, error: str = "") -> None:
+        with self.connect() as conn:
+            conn.execute("""
+                UPDATE dosing_runs SET status=?,confirmed_steps=?,possible_steps=?,finished_at=?,error=? WHERE id=?
+            """, (status, confirmed_steps, possible_steps, time.time(), error, run_id))
+
+    def recover_interrupted_doses(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            conn.execute("""
+                UPDATE dosing_runs SET status='interrupted',finished_at=?,
+                    possible_steps=requested_steps,error='Controller restarted before dose completion was verified.'
+                WHERE status='running'
+            """, (time.time(),))
+            rows = [dict(row) for row in conn.execute("""
+                SELECT * FROM dosing_runs WHERE status IN ('failed','interrupted') AND fault_acknowledged=0
+            """)]
+        return rows
+
+    def acknowledge_dosing_fault(self, schedule_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute("""
+                UPDATE dosing_runs SET fault_acknowledged=1
+                WHERE schedule_id=? AND status IN ('failed','interrupted')
+            """, (schedule_id,))
+
+    def recent_doses(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute("SELECT * FROM dosing_runs ORDER BY id DESC LIMIT ?", (limit,))]
 
     @staticmethod
     def _init_stream_catalog(conn: sqlite3.Connection) -> None:

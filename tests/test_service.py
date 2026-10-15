@@ -832,6 +832,46 @@ def test_manual_priming_rejects_invalid_speed_before_worker(tmp_path) -> None:
     assert all(value is False for value in service.state.manual_priming.values())
 
 
+def test_manual_prime_overrides_are_transient_and_keep_motor_settings(tmp_path, monkeypatch) -> None:
+    service = make_service(tmp_path)
+    original = asdict(service.config.steppers[0])
+    config_bytes = service.config_path.read_bytes()
+    calls = []
+
+    def run(_assignment, **kwargs):
+        calls.append(kwargs)
+        return StepperRunResult(0, "stopped")
+
+    monkeypatch.setattr(service.stepper_engine, "run_continuous", run)
+    service.set_manual_priming("dose1", True, speed_steps_per_second=1000, max_seconds=3)
+    wait_for(lambda: bool(calls) and "dose1" not in service._prime_threads)
+    assert calls[0]["steps_per_second"] == 1000
+    assert calls[0]["max_seconds"] == 3
+    for key in ("run_current_ma", "hold_current_ma", "microsteps", "stallguard_threshold", "direction_high"):
+        assert calls[0][key] == original[key]
+    assert asdict(service.config.steppers[0]) == original
+    assert service.config_path.read_bytes() == config_bytes
+
+
+@pytest.mark.parametrize("overrides", [
+    {"speed_steps_per_second": 5001}, {"speed_steps_per_second": True},
+    {"speed_steps_per_second": 1000.5}, {"max_seconds": 61}, {"max_seconds": 0},
+    {"max_seconds": float("nan")}, {"max_seconds": "3"},
+])
+def test_invalid_prime_override_cannot_start_a_motor(tmp_path, overrides) -> None:
+    service = make_service(tmp_path)
+    with pytest.raises(DiagnosticHalt):
+        service.set_manual_priming("dose1", True, **overrides)
+    assert service._prime_threads == {}
+
+
+def test_stop_ignores_invalid_speed_and_duration(tmp_path) -> None:
+    service = make_service(tmp_path)
+    service.config.steppers[0].manual_speed_steps_per_second = 0
+    result = service.set_manual_priming("dose1", False, speed_steps_per_second=-1, max_seconds=-1)
+    assert result["state"] == "stopped"
+
+
 def test_manual_priming_rejects_competing_pumps(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = make_service(tmp_path)
     started = threading.Event()

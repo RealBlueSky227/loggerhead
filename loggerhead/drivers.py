@@ -1455,7 +1455,7 @@ class StepperPulseEngine:
 
     MIN_STEPS_PER_SECOND = 1
     MAX_STEPS_PER_SECOND = 5000
-    STEP_HIGH_US = 8
+    STEP_HIGH_US = 20
     WAVE_BATCH_SECONDS = 0.5
     WAVE_POLL_SECONDS = 0.01
     WAVE_DIAGNOSTIC_SECONDS = 0.25
@@ -2036,6 +2036,8 @@ class StepperPulseEngine:
                     )
                     next_diag = now + self.WAVE_DIAGNOSTIC_SECONDS
                 self._stop_event.wait(self.WAVE_POLL_SECONDS)
+            # request_stop() may cancel pigpio between busy polls, bypassing the loop body.
+            interrupted = interrupted or self._stop_event.is_set() or self._shutdown.is_set()
             elapsed = time.monotonic() - start
             if (
                 busy_seen

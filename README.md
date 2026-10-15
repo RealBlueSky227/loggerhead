@@ -75,3 +75,8 @@ pytest --cov=loggerhead --cov-report=term-missing
 ```
 
 The tests cover safety-critical behavior: pin validation, Hydros classification/debounce, HS300 framing, relay polarity, thermal control, dosing schedule math, ATO lockout, SQLite history downsampling, and stepper interlock release.
+
+The Config tab provides pump calibration, independent prime/dose speed settings,
+and daily dosing schedules with previews, pause/resume, fault recovery, and run
+history. See [Pump Configuration and Scheduled Dosing](docs/DOSING.md) before
+enabling automatic dosing. Existing schedules remain disabled on upgrade.

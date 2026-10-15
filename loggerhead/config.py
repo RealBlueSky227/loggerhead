@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
@@ -187,6 +188,9 @@ class DosingProfile:
     window_end: str = "20:00"
     doses_per_day: int = 12
     stepper: bool = False
+    enabled: bool = False
+    max_dose_ml: float = 10.0
+    max_run_seconds: float = 120.0
 
 
 @dataclass
@@ -201,6 +205,7 @@ class StepperProfile:
     steps_per_ml: float = 800.0
     stallguard_threshold: int = 50
     manual_speed_steps_per_second: int = DEFAULT_MANUAL_PRIME_STEPS_PER_SECOND
+    dose_speed_steps_per_second: int = DEFAULT_MANUAL_PRIME_STEPS_PER_SECOND
     manual_max_seconds: float = DEFAULT_MANUAL_PRIME_MAX_SECONDS
     manual_max_steps: int = DEFAULT_MANUAL_PRIME_MAX_STEPS
     direction_high: bool = True
@@ -464,7 +469,7 @@ def validate_config(config: AppConfig) -> None:
         if int(item.microsteps) not in SUPPORTED_MICROSTEPS:
             raise DiagnosticHalt(f"Stepper microsteps must be one of {sorted(SUPPORTED_MICROSTEPS)}.")
         item.microsteps = int(item.microsteps)
-        if item.steps_per_ml <= 0:
+        if not math.isfinite(float(item.steps_per_ml)) or item.steps_per_ml <= 0:
             raise DiagnosticHalt("Stepper steps_per_ml must be greater than zero.")
         if item.stallguard_threshold < 0 or item.stallguard_threshold > 255:
             raise DiagnosticHalt("Stepper StallGuard threshold must be between 0 and 255.")
@@ -482,18 +487,61 @@ def validate_config(config: AppConfig) -> None:
                 f"Stepper manual priming speed must be no more than {MAX_MANUAL_PRIME_STEPS_PER_SECOND} step/s."
             )
         item.manual_speed_steps_per_second = manual_speed
+        dose_speed = item.dose_speed_steps_per_second
+        if isinstance(dose_speed, bool) or not isinstance(dose_speed, int) or not 1 <= dose_speed <= 5000:
+            raise DiagnosticHalt("Scheduled dosing speed must be an integer from 1 to 5000 step/s.")
         item.manual_max_seconds = float(item.manual_max_seconds)
-        if item.manual_max_seconds <= 0:
+        if not math.isfinite(item.manual_max_seconds) or item.manual_max_seconds <= 0:
             raise DiagnosticHalt("Stepper manual priming max seconds must be greater than zero.")
         item.manual_max_steps = int(item.manual_max_steps)
         if item.manual_max_steps <= 0:
             raise DiagnosticHalt("Stepper manual priming max steps must be greater than zero.")
         item.direction_high = bool(item.direction_high)
+    if len({item.id for item in config.dosing}) != len(config.dosing):
+        raise DiagnosticHalt("Dosing schedule IDs must be unique.")
+    enabled_pumps: set[str] = set()
     for item in config.dosing:
         if item.stepper and item.actuator not in stepper_ids:
             raise DiagnosticHalt(f"Dosing profile {item.id} references unknown stepper {item.actuator}.")
         if not item.stepper and item.actuator not in equipment_ids:
             raise DiagnosticHalt(f"Dosing profile {item.id} references unknown equipment {item.actuator}.")
+        if type(item.enabled) is not bool:
+            raise DiagnosticHalt("Dosing enabled must be true or false.")
+        if item.enabled and not item.stepper:
+            raise DiagnosticHalt("Automatic dosing currently requires an onboard stepper pump.")
+        for value, name, allow_zero in (
+            (item.daily_volume_ml, "daily volume", True),
+            (item.max_dose_ml, "maximum dose volume", False),
+            (item.max_run_seconds, "maximum dose runtime", False),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0 or (not allow_zero and value == 0):
+                raise DiagnosticHalt(f"Dosing {name} must be finite and {'nonnegative' if allow_zero else 'positive'}.")
+        if type(item.doses_per_day) is not int or not 0 <= item.doses_per_day <= 96 or (item.enabled and item.doses_per_day == 0):
+            raise DiagnosticHalt("Dosing schedules require 1 to 96 doses per day.")
+        for value in (item.window_start, item.window_end):
+            try:
+                hour, minute = value.split(":")
+                valid = len(hour) == 2 and len(minute) == 2 and 0 <= int(hour) <= 23 and 0 <= int(minute) <= 59
+            except (AttributeError, TypeError, ValueError):
+                valid = False
+            if not valid:
+                raise DiagnosticHalt("Dosing window times must use HH:MM in 24-hour time.")
+        if item.max_run_seconds > 600:
+            raise DiagnosticHalt("A scheduled dose runtime cannot exceed 600 seconds.")
+        if item.enabled:
+            if item.daily_volume_ml <= 0:
+                raise DiagnosticHalt("An enabled dosing schedule requires a positive daily volume.")
+            if item.actuator in enabled_pumps:
+                raise DiagnosticHalt("Only one enabled dosing schedule is allowed per pump.")
+            enabled_pumps.add(item.actuator)
+            if item.daily_volume_ml / item.doses_per_day > item.max_dose_ml:
+                raise DiagnosticHalt("Scheduled dose volume exceeds the per-dose safety limit.")
+            pump = next(pump for pump in config.steppers if pump.id == item.actuator)
+            steps = math.floor(item.daily_volume_ml / item.doses_per_day * pump.steps_per_ml)
+            if steps < 1:
+                raise DiagnosticHalt("Scheduled dose is smaller than one calibrated step.")
+            if steps / pump.dose_speed_steps_per_second + 2 > item.max_run_seconds:
+                raise DiagnosticHalt("Scheduled dose cannot finish within its runtime limit (including startup margin).")
     for item in config.ato:
         if item.primary_level_sensor not in water_ids:
             raise DiagnosticHalt(f"ATO {item.id} references unknown primary sensor {item.primary_level_sensor}.")

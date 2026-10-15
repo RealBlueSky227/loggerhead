@@ -86,6 +86,8 @@ class RuntimeState:
     buzzer_muted_until: float = 0.0
     stepper_active: str | None = None
     manual_priming: dict[str, bool] = field(default_factory=dict)
+    dosing_paused: dict[str, bool] = field(default_factory=dict)
+    dosing_faults: dict[str, str] = field(default_factory=dict)
 
 
 class StateStore:
@@ -93,6 +95,8 @@ class StateStore:
         self.path = path
         self._state_lock = state_lock or threading.RLock()
         self._write_lock = threading.RLock()
+        self._generation = 0
+        self._committed_generation = 0
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> RuntimeState:
@@ -121,14 +125,20 @@ class StateStore:
         state.buzzer_muted_until = data.get("buzzer_muted_until", 0.0)
         state.stepper_active = data.get("stepper_active")
         state.manual_priming = data.get("manual_priming", {})
+        state.dosing_paused = data.get("dosing_paused", {})
+        state.dosing_faults = data.get("dosing_faults", {})
         return state
 
     def save(self, state: RuntimeState) -> None:
-        # Lock order is state snapshot first, then file write. Callers may already
-        # hold _state_lock; _write_lock is private to StateStore to avoid deadlocks.
+        # Snapshot generations prevent a delayed older writer from undoing a
+        # newer persisted pause without holding the state lock during disk I/O.
         with self._state_lock:
             payload = _state_dict(state)
+            self._generation += 1
+            generation = self._generation
         with self._write_lock:
+            if generation <= self._committed_generation:
+                return
             self._cleanup_abandoned_temps()
             tmp_name = ""
             try:
@@ -148,6 +158,7 @@ class StateStore:
                 os.replace(tmp_name, self.path)
                 tmp_name = ""
                 _fsync_directory(self.path.parent)
+                self._committed_generation = generation
             except Exception:
                 LOGGER.exception("Failed to persist Loggerhead runtime state to %s.", self.path)
                 if tmp_name:

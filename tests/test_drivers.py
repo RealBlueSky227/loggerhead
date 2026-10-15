@@ -953,18 +953,39 @@ def test_stepper_waveform_uses_dma_timed_edges(monkeypatch: pytest.MonkeyPatch, 
     assert len(pulses) == 20
     for high, low in zip(pulses[::2], pulses[1::2], strict=True):
         assert (high.gpio_on, high.gpio_off, high.delay) == (step_mask, 0, engine.STEP_HIGH_US)
+        assert high.delay >= 20  # Empirical margin verified by the Pi Zero chain tests.
         assert low.gpio_on == 0
         assert low.gpio_off == step_mask
         assert high.delay + low.delay == 1_000_000 // steps_per_second
 
 
-def test_stepper_waveform_preserves_exact_requested_pulse_count(monkeypatch: pytest.MonkeyPatch) -> None:
+def chain_pulse_count(pi: FakePigpioPi, chain: list[int]) -> int:
+    total = 0
+    index = 0
+    while index < len(chain):
+        if chain[index] == 255:
+            assert chain[index:index + 2] == [255, 0]
+            wave_id = chain[index + 2]
+            assert chain[index + 3:index + 5] == [255, 1]
+            count = chain[index + 5] + 256 * chain[index + 6]
+            index += 7
+        else:
+            wave_id, count = chain[index], 1
+            index += 1
+        total += count * len(pi.created_waves[wave_id]) // 2
+    return total
+
+
+@pytest.mark.parametrize("speed,steps", [(400, 257), (1000, 1200), (5000, 300000), (333, 257)])
+def test_stepper_waveform_preserves_exact_requested_pulse_count(monkeypatch, speed, steps) -> None:
     engine, _relay, _uart, fake_pi = make_real_stepper_engine(monkeypatch)
 
-    engine.move(STEPPERS["dose1"], steps=257, steps_per_second=1000, run_current_ma=500)
+    engine.move(STEPPERS["dose1"], steps=steps, steps_per_second=speed, run_current_ma=500)
 
-    assert len(fake_pi.wave_add_generic_calls) == 1
-    assert len(fake_pi.wave_add_generic_calls[0]) == 514
+    assert chain_pulse_count(fake_pi, fake_pi.wave_chain_calls[0]) == steps
+    assert all(len(pulses) <= 2 * engine._wave_batch_steps(speed) for pulses in fake_pi.wave_add_generic_calls)
+    if 1_000_000 % speed:
+        assert sum(p.delay for p in fake_pi.created_waves[1]) == 166 * 1_000_000 // speed
 
 
 def test_stepper_continuous_real_wave_batches_are_accounted(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1022,6 +1043,30 @@ def test_stepper_external_waveform_cancel_is_not_counted_successful(monkeypatch:
 
     assert fake_pi.wave_tx_stop_calls == 0
     assert fake_pi.wave_delete_calls == [1]
+    assert relay.shadow_a == 0xF0
+
+
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_stepper_cancellation_between_busy_polls_never_confirms_chain(monkeypatch, shutdown) -> None:
+    engine, relay, _uart, fake_pi = make_real_stepper_engine(monkeypatch)
+
+    def cancelled_before_busy_returns(_pi):
+        if fake_pi.wave_chain_calls:
+            engine._stop_event.set()
+            if shutdown:
+                engine._shutdown.set()
+
+    fake_pi.on_busy = cancelled_before_busy_returns
+    result = engine.run_continuous(
+        STEPPERS["dose1"], stop_event=threading.Event(), steps_per_second=400,
+        run_current_ma=700, max_seconds=60, max_steps=24000,
+    )
+    assert fake_pi.wave_chain_calls
+    assert result.steps_sent == 0
+    assert result.possible_steps > 0
+    assert result.completed_batches == 0
+    assert result.interrupted_batch
+    assert result.reason == ("shutdown" if shutdown else "stopped")
     assert relay.shadow_a == 0xF0
 
 

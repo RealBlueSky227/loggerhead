@@ -45,3 +45,34 @@ def test_state_store_preserves_existing_file_when_replace_fails(tmp_path, monkey
     assert set(data["equipment"]) == {"ac1"}
     assert not list(tmp_path.glob("state.json.*.tmp"))
 
+
+def test_delayed_old_snapshot_cannot_overwrite_a_saved_pause(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    state = RuntimeState(dosing_paused={"alk": False})
+    captured, release = threading.Event(), threading.Event()
+    write_lock = store._write_lock
+
+    class DelayedWriter:
+        def __enter__(self):
+            if threading.current_thread().name == "old-snapshot":
+                captured.set()
+                assert release.wait(3)
+            return write_lock.__enter__()
+
+        def __exit__(self, *args):
+            return write_lock.__exit__(*args)
+
+    store._write_lock = DelayedWriter()
+    thread = threading.Thread(target=store.save, args=(state,), name="old-snapshot")
+    thread.start()
+    try:
+        assert captured.wait(1)
+        with store._state_lock:
+            state.dosing_paused["alk"] = True
+        store.save(state)
+    finally:
+        release.set()
+        thread.join(3)
+    assert not thread.is_alive()
+    assert store.load().dosing_paused["alk"] is True
+

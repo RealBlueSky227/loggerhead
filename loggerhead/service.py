@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import signal
 import threading
 import time
-from dataclasses import asdict, fields
+import uuid
+from contextlib import nullcontext
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +31,7 @@ from .config import (
 )
 from .controllers import AlertEvaluator, ATOController, ThermalController
 from .database import TelemetryStore
+from .dosing import DosingManager
 from .drivers import (
     TMC2209UART,
     ADS1115AnalogReader,
@@ -107,6 +111,8 @@ class LoggerheadService:
         self._stop_lock = threading.RLock()
         self._stopped = False
         self._prime_lock = threading.RLock()
+        self._config_write_lock = threading.RLock()
+        self._prime_results: dict[str, dict[str, Any]] = {}
         self._threads: list[threading.Thread] = []
         self._stepper_diagnostics: dict[str, dict[str, Any]] = {}
         self._diagnostics_lock = threading.Lock()
@@ -132,12 +138,14 @@ class LoggerheadService:
         self._save_state()
         self.buzzer.stop()
         self._restore_equipment_defaults()
+        self.dosing = DosingManager(self)
 
     def run(self, *, host: str = "0.0.0.0", port: int = 8080) -> None:
         LOGGER.info("Starting Loggerhead on %s:%s", host, port)
         self._notify("Loggerhead", "Loggerhead aquarium controller started.")
         server = DashboardServer(self, host=host, port=port)
         self._start_sensor_workers()
+        self.dosing.start()
         self._threads = [
             threading.Thread(target=self._poll_loop, name="loggerhead-poll", daemon=True),
             threading.Thread(target=server.serve_forever, name="loggerhead-web", daemon=True),
@@ -178,6 +186,7 @@ class LoggerheadService:
             for name, action in (
                 ("stepper engine", self.stepper_engine.shutdown),
                 ("stepper ENN disable", self.relay_board.disable_all_steppers),
+                ("dosing worker", self.dosing.stop),
                 ("sensor workers", self._stop_sensor_workers_checked),
                 ("sensor callbacks", self._close_sensor_readers),
                 ("buzzer", self.buzzer.stop),
@@ -205,6 +214,9 @@ class LoggerheadService:
                 raise HardwareFault(f"Loggerhead shutdown could not verify all actuators disabled: {errors[0]}") from errors[0]
 
     def status(self) -> dict[str, Any]:
+        dosing = self.dosing.snapshot()
+        with self._prime_lock:
+            calibrations = copy.deepcopy({key: value for key, value in self._prime_results.items() if value["purpose"] == "calibration"})
         with self._state_lock:
             snapshot = {
                 "config": asdict(self.config),
@@ -219,6 +231,9 @@ class LoggerheadService:
                 "alarms": {key: asdict(value) for key, value in self.state.alarms.items()},
                 "ato": {key: asdict(value) for key, value in self.state.ato.items()},
                 "manual_priming": dict(self.state.manual_priming),
+                "stepper_active": self.state.stepper_active,
+                "calibrations": calibrations,
+                "dosing": dosing,
                 "diagnostics": self._diagnostics(),
                 "heartbeat": {"ok": True, "ts": time.time()},
                 "buzzer_muted_until": self.state.buzzer_muted_until,
@@ -237,6 +252,10 @@ class LoggerheadService:
         return self.store.stream_catalog()
 
     def update_config(self, payload: dict[str, Any]) -> AppConfig:
+        with self._config_write_lock:
+            return self._update_config(payload)
+
+    def _update_config(self, payload: dict[str, Any]) -> AppConfig:
         # Implements SRS 5.4.1 Dynamic Application by replacing the active config
         # after validation and rebuilding per-config helper state.
         raw_payload = copy.deepcopy(payload)
@@ -245,19 +264,36 @@ class LoggerheadService:
         apply_config_migrations(candidate)
         validate_config(candidate)
         previous = self.config
-        self.config = candidate
+        with self._prime_lock:
+            removed = {item.id for item in previous.dosing} - {item.id for item in candidate.dosing}
+            if any(self.state.dosing_faults.get(key) for key in removed):
+                raise RuntimeError("Reset the dosing fault before removing its schedule.")
+            moving = self.dosing.active or any(thread.is_alive() for thread in self._prime_threads.values())
+            if moving and (previous.steppers != candidate.steppers or previous.dosing != candidate.dosing):
+                raise RuntimeError("Stop the active pump before changing pump settings or dosing schedules.")
+        sensor_changed = any(getattr(previous, field) != getattr(candidate, field) for field in (
+            "sense_ports", "temperature_sensors", "water_level_sensors", "analog_sensors", "ph_sensors",
+        ))
         try:
-            self._rebuild_sensor_runtime(previous_config=previous)
+            if sensor_changed:
+                self.config = candidate
+                self._rebuild_sensor_runtime(previous_config=previous)
+            save_config(self.config_path, candidate)
+            self.config = load_config(self.config_path)
         except Exception:
             self.config = previous
-            self._restore_previous_sensor_runtime_after_failed_update()
+            if sensor_changed:
+                self._restore_previous_sensor_runtime_after_failed_update()
             raise
-        save_config(self.config_path, self.config)
-        self.config = load_config(self.config_path)
+        self.dosing.config_changed(previous)
         self.store.log_event("config", "Configuration reloaded from UI.")
         return self.config
 
     def set_sense_port(self, number: int, payload: dict[str, Any]) -> None:
+        with self._config_write_lock:
+            self._set_sense_port(number, payload)
+
+    def _set_sense_port(self, number: int, payload: dict[str, Any]) -> None:
         candidate = copy.deepcopy(self.config)
         port = next(item for item in candidate.sense_ports if item.number == number)
         field_names = {field.name for field in fields(port)}
@@ -321,13 +357,32 @@ class LoggerheadService:
         self.store.log_event("alarm", f"Global alarm {'enabled' if enabled else 'disabled'}.")
         self._save_state()
 
-    def set_manual_priming(self, stepper_id: str, enabled: bool) -> dict[str, Any]:
+    def set_manual_priming(
+        self,
+        stepper_id: str,
+        enabled: bool,
+        *,
+        speed_steps_per_second: int | None = None,
+        max_seconds: float | None = None,
+        max_steps: int | None = None,
+        purpose: str = "manual",
+    ) -> dict[str, Any]:
+        with self._config_write_lock if enabled else nullcontext():
+            return self._set_manual_priming(stepper_id, enabled, speed_steps_per_second=speed_steps_per_second,
+                                           max_seconds=max_seconds, max_steps=max_steps, purpose=purpose)
+
+    def _set_manual_priming(
+        self, stepper_id: str, enabled: bool, *, speed_steps_per_second: int | None = None,
+        max_seconds: float | None = None, max_steps: int | None = None, purpose: str = "manual",
+    ) -> dict[str, Any]:
         with self._prime_lock:
             profile = self._stepper_profile(stepper_id)
-            speed = self._manual_prime_speed(profile)
             if enabled and self._stop.is_set():
                 raise RuntimeError("Loggerhead is stopping; manual priming cannot be started.")
             if not enabled:
+                if self.dosing.active and self.dosing.active["pump_id"] == stepper_id:
+                    self.dosing.pause(self.dosing.active["schedule_id"], True)
+                    return {"id": stepper_id, "priming": False, "state": "stopping"}
                 stop = self._prime_stop.get(stepper_id)
                 thread = self._prime_threads.get(stepper_id)
                 if stop:
@@ -342,6 +397,26 @@ class LoggerheadService:
                 self.store.log_event("dosing", f"{profile.name} manual priming stop requested.")
                 self._save_state()
                 return {"id": stepper_id, "priming": False, "state": "stopping" if thread and thread.is_alive() else "stopped"}
+            if speed_steps_per_second is not None:
+                if type(speed_steps_per_second) is not int:
+                    raise DiagnosticHalt("Manual priming speed override must be an integer step/s value.")
+                profile = replace(profile, manual_speed_steps_per_second=speed_steps_per_second)
+            speed = self._manual_prime_speed(profile)
+            if max_seconds is not None:
+                if (
+                    isinstance(max_seconds, bool)
+                    or not isinstance(max_seconds, int | float)
+                    or not math.isfinite(max_seconds)
+                    or not 0 < max_seconds <= profile.manual_max_seconds
+                ):
+                    raise DiagnosticHalt("Manual priming duration must be positive and no greater than the configured limit.")
+                profile = replace(profile, manual_max_seconds=float(max_seconds))
+            if max_steps is not None:
+                if type(max_steps) is not int or not 1 <= max_steps <= profile.manual_max_steps:
+                    raise DiagnosticHalt("Requested steps must be a positive integer within the saved priming step limit.")
+                profile = replace(profile, manual_max_steps=max_steps)
+            if self.dosing.active:
+                raise RuntimeError("A scheduled dose is active; stop it before priming or calibrating.")
             for key, thread in list(self._prime_threads.items()):
                 if not thread.is_alive():
                     self._clear_prime_worker_locked(key)
@@ -363,6 +438,12 @@ class LoggerheadService:
             )
             self._prime_stop[stepper_id] = stop
             self._prime_threads[stepper_id] = thread
+            operation_id = uuid.uuid4().hex
+            self._prime_results[stepper_id] = {
+                "operation_id": operation_id, "purpose": purpose, "state": "running",
+                "requested_steps": profile.manual_max_steps, "confirmed_steps": 0, "possible_steps": 0,
+                "speed_steps_per_second": speed, "started_at": time.time(),
+            }
             with self._state_lock:
                 self.state.manual_priming[stepper_id] = True
                 self.state.stepper_active = stepper_id
@@ -378,7 +459,28 @@ class LoggerheadService:
                 self._save_state()
                 raise
             self.store.log_event("dosing", f"{profile.name} manual priming started at {speed} step/s.")
-            return {"id": stepper_id, "priming": True, "state": "started", "speed_steps_per_second": speed}
+            return {"id": stepper_id, "priming": True, "state": "started", "speed_steps_per_second": speed,
+                    "operation_id": operation_id}
+
+    def start_calibration(self, stepper_id: str, steps: int, speed_steps_per_second: int | None = None) -> dict[str, Any]:
+        profile = self._stepper_profile(stepper_id)
+        if type(steps) is not int or not 1 <= steps <= profile.manual_max_steps:
+            raise DiagnosticHalt("Calibration steps must be a positive integer within the pump's step limit.")
+        speed = self._manual_prime_speed(profile) if speed_steps_per_second is None else speed_steps_per_second
+        if type(speed) is not int or not 1 <= speed <= MAX_MANUAL_PRIME_STEPS_PER_SECOND:
+            raise DiagnosticHalt("Calibration speed must be an integer from 1 to 5000 step/s.")
+        if steps / speed + 2 > profile.manual_max_seconds:
+            raise DiagnosticHalt("Calibration cannot complete within the pump's priming time limit.")
+        return self.set_manual_priming(stepper_id, True, speed_steps_per_second=speed,
+                                      max_steps=steps, purpose="calibration")
+
+    def preview_dosing(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw = copy.deepcopy(payload)
+        _migrate_raw_config(raw)
+        candidate = from_dict(AppConfig, raw)
+        apply_config_migrations(candidate)
+        validate_config(candidate)
+        return self.dosing.preview(candidate)
 
     def _prime_loop(self, profile: StepperProfile, stop: threading.Event, speed_steps_per_second: int) -> None:
         assignment = require_stepper(profile.assignment)
@@ -395,9 +497,21 @@ class LoggerheadService:
                 max_seconds=profile.manual_max_seconds,
                 max_steps=profile.manual_max_steps,
             )
-            if result.reason in self.MANUAL_PRIME_LIMIT_REASONS:
+            with self._prime_lock:
+                record = self._prime_results.get(profile.id)
+                calibration_completed = False
+                if record:
+                    record.update({"state": "completed" if result.reason == "max_steps" and result.steps_sent == profile.manual_max_steps and not result.interrupted_batch else "incomplete",
+                                   "confirmed_steps": result.steps_sent, "possible_steps": result.possible_steps,
+                                   "reason": result.reason, "finished_at": time.time()})
+                    calibration_completed = record["purpose"] == "calibration" and record["state"] == "completed"
+            if result.reason in self.MANUAL_PRIME_LIMIT_REASONS and not calibration_completed:
                 self._handle_manual_prime_limit(profile, result)
         except Exception as exc:
+            with self._prime_lock:
+                record = self._prime_results.get(profile.id)
+                if record:
+                    record.update({"state": "failed", "error": str(exc), "finished_at": time.time()})
             LOGGER.exception("%s manual priming fault.", profile.name)
             self._activate_alarm(f"stepper:{profile.id}", f"{profile.name} manual priming fault: {exc}", priority="high")
         finally:
@@ -405,7 +519,14 @@ class LoggerheadService:
                 self.stepper_engine.stop(assignment)
             except Exception as exc:
                 LOGGER.critical("%s manual priming cleanup could not verify driver disabled: %s", profile.name, exc)
-                self._activate_alarm(f"stepper:{profile.id}:cleanup", f"{profile.name} cleanup fault: {exc}", priority="critical")
+                with self._prime_lock:
+                    record = self._prime_results.get(profile.id)
+                    if record:
+                        record.update({"state": "failed", "error": str(exc), "finished_at": time.time()})
+                try:
+                    self._activate_alarm(f"stepper:{profile.id}:cleanup", f"{profile.name} cleanup fault: {exc}", priority="critical")
+                except Exception:
+                    LOGGER.exception("Could not report critical cleanup fault for %s.", profile.name)
             with self._prime_lock:
                 self._clear_prime_worker_locked(profile.id)
                 with self._state_lock:

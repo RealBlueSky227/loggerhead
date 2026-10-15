@@ -22,7 +22,8 @@ class FakeService:
         self.config = default_config()
         self.history_requests: list[tuple[list[str], float]] = []
 
-    def set_manual_priming(self, stepper_id: str, enabled: bool) -> dict[str, object]:
+    def set_manual_priming(self, stepper_id: str, enabled: bool, **kwargs) -> dict[str, object]:
+        self.prime_options = kwargs
         if self.fail:
             raise RuntimeError("busy")
         return {"id": stepper_id, "priming": enabled, "state": "started"}
@@ -198,6 +199,22 @@ def test_history_api_rejects_invalid_ranges(lookback) -> None:
         assert status == 400
         assert body["error"] == "bad_request"
         assert service.history_requests == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_prime_api_forwards_transient_limits() -> None:
+    service = FakeService()
+    server = DashboardServer(service, host="127.0.0.1", port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, _body = post_json(server, "/api/prime", {
+            "id": "dose1", "on": True, "speed_steps_per_second": 1000, "max_seconds": 3,
+        })
+        assert status == 202
+        assert service.prime_options == {"speed_steps_per_second": 1000, "max_seconds": 3}
     finally:
         server.shutdown()
         server.server_close()
