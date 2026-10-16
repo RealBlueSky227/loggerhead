@@ -45,6 +45,28 @@ Plots opens. The default Plotly cloud-sharing button is removed.
   preserve zoom until the selected time range changes. The range slider,
   toolbar pan/zoom, hover, resize, and local PNG export run in the browser.
 
+## Local Time Display
+
+Telemetry storage and `/api/history` retain unmodified Unix timestamps. Plotly's
+date axis previously displayed their UTC clock values, several hours ahead of
+Eastern time. The browser now formats axis ticks and hover timestamps in its
+own timezone (for example, `America/New_York`), with a timezone abbreviation.
+No controller timezone setting or historical database rewrite is required.
+
+Coordinates remain epoch milliseconds, so elapsed time and ordering remain
+correct across daylight-saving changes. Repeated fall-back hours are labeled
+EDT/EST separately; spring-forward labels skip the nonexistent local hour.
+Plotly's timezone-less internal range strings are interpreted as UTC coordinates,
+not as browser-local input. Zoom, pan, range-slider, and resize events update only
+the local tick labels without fetching history or changing zoom/stream selection.
+PNG exports use the same local labels. A browser in a different timezone shows
+that viewer's local time rather than the Pi's timezone.
+
+Only `loggerhead/static/plots.mjs` needs updating on an existing installation.
+The server already revalidates this module with `Cache-Control: no-cache` and
+an ETag. Reload the dashboard once to load the new module; a controller restart
+and hardware changes are unnecessary.
+
 ## 1-Wire helper status coalescing
 
 The client serializes and coalesces successful helper status calls for at most

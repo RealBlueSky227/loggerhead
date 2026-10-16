@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {buildFigure, createPlotsController, defaultSelection} from "../loggerhead/static/plots.mjs";
+import {buildFigure, createPlotsController, defaultSelection, localTimeTicks, plotDateMs} from "../loggerhead/static/plots.mjs";
 
 const catalog = [
   {stream: "temperature.water", kind: "numeric", unit: "F"},
@@ -77,6 +77,53 @@ test("single/equal values, missing data, and unknown states remain renderable", 
   const figure = buildFigure({"water.level": [point("inactive"), point("unrecognized", 101)]}, catalog, "3600");
   assert.deepEqual(figure.traces[0].y, ["inactive", "unrecognized"]);
   assert.equal(figure.layout.yaxis.type, "category");
+});
+
+test("local time labels do not shift UTC coordinates or mutate history", () => {
+  const timestamp = Date.parse("2026-10-16T15:04:56Z");
+  const series = {"temperature.water": [point(78, timestamp/1000)]};
+  const before = JSON.stringify(series);
+  const eastern = buildFigure(series, catalog, "3600", "America/New_York");
+  const utc = buildFigure(series, catalog, "3600", "UTC");
+  const india = buildFigure(series, catalog, "3600", "Asia/Kolkata");
+  assert.deepEqual(eastern.traces[0].x.map(plotDateMs), [timestamp]);
+  assert.deepEqual(eastern.traces[0].x, utc.traces[0].x);
+  assert.match(eastern.traces[0].customdata[0], /11:04:56.*EDT/);
+  assert.match(utc.traces[0].customdata[0], /15:04:56.*UTC/);
+  assert.match(india.traces[0].customdata[0], /20:34:56/);
+  assert.match(eastern.traces[0].hovertemplate, /customdata/);
+  assert.equal(eastern.layout.meta.time_zone, "America/New_York");
+  assert.equal(eastern.layout.xaxis.title.text, "Local Time");
+  assert.equal(JSON.stringify(series), before);
+});
+
+test("DST repeated and skipped hours keep elapsed time and timezone labels accurate", () => {
+  const fall = buildFigure({"temperature.water": [point(78, Date.parse("2026-11-01T05:30:00Z")/1000),
+    point(79, Date.parse("2026-11-01T06:30:00Z")/1000)]}, catalog, "3600", "America/New_York");
+  assert.equal(plotDateMs(fall.traces[0].x[1])-plotDateMs(fall.traces[0].x[0]), 3600000);
+  assert.match(fall.traces[0].customdata[0], /01:30:00.*EDT/);
+  assert.match(fall.traces[0].customdata[1], /01:30:00.*EST/);
+  const ticks = localTimeTicks(fall.traces[0].x, "America/New_York");
+  assert.ok(ticks.ticktext.some(text => text.includes("EDT")));
+  assert.ok(ticks.ticktext.some(text => text.includes("EST")));
+  const spring = buildFigure({"water.level": [point("dry", Date.parse("2026-03-08T06:30:00Z")/1000),
+    point("high", Date.parse("2026-03-08T07:30:00Z")/1000)]}, catalog, "3600", "America/New_York");
+  assert.equal(plotDateMs(spring.traces[0].x[1])-plotDateMs(spring.traces[0].x[0]), 3600000);
+  assert.match(spring.traces[0].customdata[0], /01:30:00.*EST/);
+  assert.match(spring.traces[0].customdata[1], /03:30:00.*EDT/);
+});
+
+test("Plotly timezone-less ranges are UTC coordinates, not browser-local input", () => {
+  const timestamp = Date.parse("2026-10-16T15:04:56Z");
+  assert.equal(plotDateMs("2026-10-16 15:04:56"), timestamp);
+  assert.equal(plotDateMs("2026-10-16T11:04:56-04:00"), timestamp);
+  assert.equal(plotDateMs(timestamp), timestamp);
+  assert.equal(plotDateMs("2026-10-16"), Date.parse("2026-10-16T00:00:00Z"));
+  const ticks = localTimeTicks(["2026-10-16 15:00", "2026-10-16 16:00"], "America/New_York", 3);
+  assert.match(ticks.ticktext[0], /11:00.*EDT/);
+  assert.ok(ticks.tickvals.every((value, i, array) => !i || value > array[i-1]));
+  assert.deepEqual(localTimeTicks([NaN, Infinity]), {tickvals: [], ticktext: []});
+  assert.ok(localTimeTicks([timestamp, timestamp]).tickvals.length > 1);
 });
 
 test("selections persist across opens, dashboard polling, catalog refresh, and page reload", async () => {

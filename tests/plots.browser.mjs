@@ -6,9 +6,11 @@ import {mkdir} from "node:fs/promises";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
 import {createInterface} from "node:readline";
+import {plotDateMs} from "../loggerhead/static/plots.mjs";
 
 const require = createRequire(import.meta.url);
-const {chromium} = require(process.env.LOGGERHEAD_PLAYWRIGHT_MODULE || "playwright");
+const engines = require(process.env.LOGGERHEAD_PLAYWRIGHT_MODULE || "playwright");
+const engine = process.env.LOGGERHEAD_BROWSER_ENGINE || "chromium";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const python = process.env.LOGGERHEAD_PYTHON || path.join(root, process.platform === "win32" ? ".venv/Scripts/python.exe" : ".venv/bin/python");
 const server = spawn(python, ["scripts/benchmark_plots.py", "--serve", "--rows", "600"], {
@@ -27,10 +29,11 @@ try {
       resolve(JSON.parse(line));
     });
   });
-  browser = await chromium.launch({headless: true,
-    ...(process.env.LOGGERHEAD_BROWSER_EXECUTABLE ? {executablePath: process.env.LOGGERHEAD_BROWSER_EXECUTABLE} : {}),
+  browser = await engines[engine].launch({headless: true,
+    ...(engine === "chromium" && process.env.LOGGERHEAD_BROWSER_EXECUTABLE ? {executablePath: process.env.LOGGERHEAD_BROWSER_EXECUTABLE} : {}),
   });
-  const context = await browser.newContext({viewport: {width: 1365, height: 900}, acceptDownloads: true});
+  const context = await browser.newContext({viewport: {width: 1365, height: 900}, acceptDownloads: true,
+    timezoneId: "America/New_York", locale: "en-US"});
   const page = await context.newPage();
   const errors = [], calls = [];
   page.on("pageerror", error => errors.push(error.message));
@@ -63,7 +66,10 @@ try {
   const zoomed = (await chart()).range;
   await page.getByRole("button", {name: "Refresh", exact: true}).click();
   await page.waitForSelector('#plot[data-state="ready"]');
-  assert.deepEqual((await chart()).range, zoomed);
+  (await chart()).range.forEach((value, index) => {
+    assert.ok(Math.abs(plotDateMs(value)-plotDateMs(zoomed[index])) < 1,
+      `Refresh must preserve the zoomed time range: ${JSON.stringify({value, before: zoomed[index]})}`);
+  });
   await page.locator('#plot [data-title="Pan"]').click();
   assert.equal(await page.evaluate(() => document.getElementById("plot")._fullLayout.dragmode), "pan");
   await page.evaluate(() => window.Plotly.Fx.hover(document.getElementById("plot"), [{curveNumber: 0, pointNumber: 3}]));
@@ -106,9 +112,36 @@ try {
   await page.route("**/api/history?**", route => route.fulfill({json: {"temperature.water": []}}));
   await page.getByRole("button", {name: "Refresh", exact: true}).click();
   await page.waitForSelector('#plot[data-state="empty"]');
+  await page.unroute("**/api/history?**");
+  const fallPoints = [{ts: Date.parse("2026-11-01T05:30:00Z")/1000, value: 78, unit: "F"},
+    {ts: Date.parse("2026-11-01T06:30:00Z")/1000, value: 79, unit: "F"}];
+  await page.route("**/api/history?**", route => route.fulfill({json: {"temperature.water": fallPoints}}));
+  await page.selectOption("#plotStream", ["temperature.water"]);
+  await page.waitForFunction(() => document.getElementById("plot").data?.[0]?.x?.length === 2);
+  await page.evaluate(() => window.Plotly.relayout(document.getElementById("plot"), {"xaxis.autorange": true}));
+  await page.waitForFunction(() => {
+    const ticks = document.getElementById("plot").layout.xaxis.ticktext || [];
+    return ticks.some(text => text.includes("EDT")) && ticks.some(text => text.includes("EST"));
+  });
+  assert.equal(await page.evaluate(() => {
+    const chart = document.getElementById("plot");
+    return Date.parse(chart.data[0].x[1])-Date.parse(chart.data[0].x[0]);
+  }), 3600000);
+  for (const [index, zone] of [[0, "EDT"], [1, "EST"]]) {
+    await page.evaluate(index => window.Plotly.Fx.hover(document.getElementById("plot"), [{curveNumber: 0, pointNumber: index}]), index);
+    const hover = await page.locator("#plot .hovertext").allTextContents();
+    assert.ok(hover.some(text => text.includes("01:30:00") && text.includes(zone)), hover.join(" "));
+    await page.evaluate(() => window.Plotly.Fx.unhover(document.getElementById("plot")));
+  }
+  const beforeZoom = calls.filter(url => url.includes("/api/history")).length;
+  await page.evaluate(() => window.Plotly.relayout(document.getElementById("plot"), {
+    "xaxis.range": ["2026-11-01T06:10:00Z", "2026-11-01T06:40:00Z"], "xaxis.autorange": false,
+  }));
+  await page.waitForFunction(() => document.getElementById("plot").layout.xaxis.ticktext.every(text => text.includes("EST")));
+  assert.equal(calls.filter(url => url.includes("/api/history")).length, beforeZoom);
   assert.deepEqual(errors, []);
   assert.equal(calls.filter(url => url.startsWith("http") && new URL(url).hostname !== "127.0.0.1").length, 0);
-  console.log("Browser checks passed: local assets, polling isolation, selection, multiple axes, zoom, pan, hover, PNG, desktop/mobile, errors, empty data.");
+  console.log("Browser checks passed: local assets, polling isolation, selection, multiple axes, zoom, pan, hover, PNG, desktop/mobile, errors, empty data, local timezone and DST.");
 } finally {
   await browser?.close();
   const exited = new Promise(resolve => server.once("exit", resolve));

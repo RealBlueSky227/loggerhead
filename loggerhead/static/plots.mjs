@@ -24,14 +24,56 @@ export function defaultSelection(catalog) {
 
 const LEVEL_ORDER = ["unknown", "inactive", "dry", "low", "normal", "high", "submerged", "wet"];
 
-export function buildFigure(series, catalog, lookback) {
+const localZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// Plotly date coordinates are UTC. Localize labels, not coordinates: shifting
+// timestamps would distort elapsed time or collapse the repeated DST hour.
+export function plotDateMs(value) {
+  if (typeof value === "number") return value;
+  let text = String(value).replace(" ", "T");
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) text += "T00:00:00";
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(text)) text += "Z";
+  return Date.parse(text);
+}
+
+function hoverTimeFormatter(timeZone) {
+  return new Intl.DateTimeFormat(undefined, {timeZone, year: "numeric", month: "short", day: "numeric",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23", timeZoneName: "short"});
+}
+
+export function localTimeTicks(range, timeZone = localZone(), count = 6) {
+  let [start, end] = range.map(plotDateMs);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return {tickvals: [], ticktext: []};
+  if (end < start) [start, end] = [end, start];
+  if (end === start) { start -= 30000; end += 30000; }
+  const intervals = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 15000, 30000,
+    60000, 120000, 300000, 600000, 900000, 1800000, 3600000, 7200000, 10800000, 21600000,
+    43200000, 86400000, 172800000, 604800000, 2592000000, 31536000000];
+  const target = (end-start)/Math.max(1, count-1);
+  const step = intervals.find(value => value >= target) || intervals.at(-1);
+  const time = new Intl.DateTimeFormat(undefined, {timeZone, hour: "2-digit", minute: "2-digit",
+    ...(step < 60000 ? {second: "2-digit"} : {}), ...(step < 1000 ? {fractionalSecondDigits: 3} : {}),
+    hourCycle: "h23", timeZoneName: "short"});
+  const date = new Intl.DateTimeFormat(undefined, {timeZone, month: "short", day: "numeric"});
+  const tickvals = [], ticktext = [];
+  for (let value = Math.ceil(start/step)*step; value <= end && tickvals.length < 12; value += step) {
+    tickvals.push(new Date(value).toISOString());
+    ticktext.push(`${time.format(value)}<br>${date.format(value)}`);
+  }
+  return {tickvals, ticktext};
+}
+
+export function buildFigure(series, catalog, lookback, timeZone = localZone()) {
   const metadata = new Map(catalog.map(item => [item.stream, item]));
   const groups = new Map();
   const traces = [];
+  const hoverTime = hoverTimeFormatter(timeZone);
+  let start = Infinity, end = -Infinity;
   for (const [stream, raw] of Object.entries(series)) {
     const points = raw.filter(point => Number.isFinite(point.ts) && point.value !== null &&
       (typeof point.value === "string" || Number.isFinite(point.value)));
     if (!points.length) continue;
+    for (const point of points) { start = Math.min(start, point.ts*1000); end = Math.max(end, point.ts*1000); }
     const equipment = stream.startsWith("equipment.");
     const categorical = equipment || metadata.get(stream)?.kind === "categorical" ||
       points.some(point => typeof point.value === "string");
@@ -51,24 +93,27 @@ export function buildFigure(series, catalog, lookback) {
     traces.push({
       type: "scatter", name: stream, uid: stream,
       x: points.map(point => new Date(point.ts * 1000).toISOString()),
+      customdata: points.map(point => hoverTime.format(point.ts * 1000)),
       y: categorical ? labels : points.map(point => point.value),
       yaxis: axis === 1 ? "y" : `y${axis}`,
       mode: points.length === 1 ? "markers" : "lines",
       marker: {size: 7}, line: {shape: categorical ? "hv" : "linear", width: 2},
       connectgaps: false,
-      hovertemplate: categorical ? "%{x}<br>%{y}<extra>%{fullData.name}</extra>" :
-        `%{x}<br>%{y:.3f} ${unit}<extra>%{fullData.name}</extra>`,
+      hovertemplate: categorical ? "%{customdata}<br>%{y}<extra>%{fullData.name}</extra>" :
+        `%{customdata}<br>%{y:.3f} ${unit}<extra>%{fullData.name}</extra>`,
     });
   }
   const height = Math.max(520, groups.size * 155 + 150);
   const layout = {
-    autosize: true, height, margin: {l: 75, r: 20, t: 25, b: 50},
+    autosize: true, height, margin: {l: 75, r: 20, t: 25, b: 75},
     paper_bgcolor: "#10171c", plot_bgcolor: "#10171c",
     font: {family: "system-ui, sans-serif", color: "#e9f2f2", size: 12},
     colorway: ["#35d07f", "#39a7ff", "#ffc857", "#ff4b5f", "#78e0dc", "#f78fb3"],
-    uirevision: `loggerhead:${lookback}`, hovermode: "closest", dragmode: "zoom",
+    uirevision: `loggerhead:${lookback}:${timeZone}`, hovermode: "closest", dragmode: "zoom",
+    meta: {time_zone: timeZone},
     legend: {orientation: "h", y: 1.04, yanchor: "bottom", x: 0, xanchor: "left"},
     xaxis: {type: "date", anchor: groups.size > 1 ? `y${groups.size}` : "y",
+      title: {text: "Local Time"}, tickmode: "array", ...localTimeTicks([start, end], timeZone),
       rangeslider: {visible: true, thickness: 0.10}, gridcolor: "#26343c", automargin: true},
   };
   [...groups.values()].forEach((group, index) => {
@@ -82,7 +127,7 @@ export function buildFigure(series, catalog, lookback) {
       ...(group.categorical ? {type: "category", categoryorder: "array", categoryarray: group.labels} : {}),
     };
   });
-  return {traces, layout, height, points: traces.reduce((sum, trace) => sum + trace.x.length, 0)};
+  return {traces, layout, height, timeZone, points: traces.reduce((sum, trace) => sum + trace.x.length, 0)};
 }
 
 export function createPlotsController({
@@ -94,6 +139,7 @@ export function createPlotsController({
   const message = doc.getElementById("plotMessage");
   let catalog = [], catalogHash = "", catalogExpires = 0;
   let selected = null, pending, generation = 0, renderQueue = Promise.resolve();
+  let attached = false, disposed = false, activePlotly, activeTimeZone;
   try {
     const saved = JSON.parse(storage?.getItem(STORAGE_KEY) ?? "null");
     if (Array.isArray(saved) && saved.every(item => typeof item === "string")) selected = saved;
@@ -109,6 +155,22 @@ export function createPlotsController({
     selected = [...select.selectedOptions].map(option => option.value);
     try { storage?.setItem(STORAGE_KEY, JSON.stringify(selected)); } catch { /* Optional persistence. */ }
   }
+  async function updateTimeTicks() {
+    const axis = chart._fullLayout?.xaxis;
+    if (disposed || !axis?.range || !activePlotly?.relayout) return;
+    const width = chart._fullLayout.width || 900;
+    const ticks = localTimeTicks(axis.range, activeTimeZone, width < 600 ? 3 : 6);
+    if (JSON.stringify(chart.layout.xaxis.tickvals) === JSON.stringify(ticks.tickvals) &&
+        JSON.stringify(chart.layout.xaxis.ticktext) === JSON.stringify(ticks.ticktext)) return;
+    await activePlotly.relayout(chart, {"xaxis.tickvals": ticks.tickvals, "xaxis.ticktext": ticks.ticktext});
+  }
+  const onRelayout = event => {
+    if (disposed || !Object.keys(event).some(key => key.startsWith("xaxis.range") ||
+        key === "xaxis.autorange" || key === "autosize" || key === "width")) return;
+    renderQueue = renderQueue.catch(() => {}).then(updateTimeTicks).catch(error => {
+      if (!disposed) state("error", `Time axis error: ${error.message}`);
+    });
+  };
   async function json(url, signal) {
     const response = await request(url, {signal});
     const body = await response.json();
@@ -156,12 +218,19 @@ export function createPlotsController({
       const Plotly = await plotlyLoader();
       renderQueue = renderQueue.catch(() => {}).then(async () => {
         if (id !== generation || signal.aborted) return;
+        activePlotly = Plotly;
+        activeTimeZone = figure.timeZone;
         chart.style.height = `${figure.height}px`;
         await Plotly.react(chart, figure.traces, figure.layout, {
           responsive: true, scrollZoom: true, displaylogo: false,
           modeBarButtonsToRemove: ["sendChartToCloud"],
           toImageButtonOptions: {format: "png", filename: "loggerhead-history", scale: 2},
         });
+        if (!attached && typeof chart.on === "function") {
+          chart.on("plotly_relayout", onRelayout);
+          attached = true;
+        }
+        await updateTimeTicks();
         if (id !== generation || signal.aborted) return;
         const empty = !selection.length ? (catalog.length ? "Select one or more streams." : "No historical streams recorded yet.") :
           "No data points found in this time range.";
@@ -184,12 +253,14 @@ export function createPlotsController({
   return {
     open: () => load(),
     dispose() {
+      disposed = true;
       ++generation;
       pending?.abort();
       select.removeEventListener("change", onSelection);
       range.removeEventListener("change", onRange);
       refresh.removeEventListener("click", onRefresh);
       doc.removeEventListener("loggerhead:config-saved", onConfig);
+      if (attached) chart.removeListener?.("plotly_relayout", onRelayout);
     },
   };
 }
