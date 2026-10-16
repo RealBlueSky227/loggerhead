@@ -120,10 +120,10 @@ this work; acceptance of actual shutoff latency is **not** established by mocks.
 
 ## Passive Raspberry Pi Results: October 16, 2026
 
-The user authorized only passive observation. Code was copied into a separate
+During initial validation the user authorized only passive observation. Code was copied into a separate
 `/tmp/loggerhead-hydros-passive.*` package. It never changed pin mode/pulls, active
 settings, production files, overlays, or equipment, and never restarted Loggerhead.
-The production continuous reader remained running throughout. The extra reader
+The production continuous reader remained running throughout those passive tests. The extra reader
 verified the existing GPIO17 input mode and used `configure_gpio=False`.
 
 ### Initial DRY Run
@@ -199,8 +199,9 @@ Outstanding physical validation:
   classifier windows or synthesizing readings in production.
 - Controlled transitions/noise/missing sensor pulses, electrical behavior, and
   actual ATO shutoff/maximum-runtime behavior with safe non-aquarium loads.
-- Approved deployment, then same-signal baseline/after total Loggerhead, pigpiod,
-  and system CPU under representative browser and dosing-related GPIO load.
+- Longer/repeated deployed CPU comparisons, including separate pigpiod sampling,
+  under representative browser and dosing-related GPIO load. Initial authorized
+  production verification is recorded below.
 - Multiport captures, prolonged cycling, daemon disconnect/restart behavior,
   callback/socket cleanup and resource counts over hours, not just short tests.
 
@@ -235,4 +236,58 @@ as a substitute for an approved production-wide before/after benchmark.
 For deployment later: update `drivers.py`, `sensor_workers.py`, and `service.py`
 together, then restart only after explicit authorization and hardware-safety
 review. There are no new runtime dependencies or JSON migrations. The normal
-installation was **not** deployed or restarted as part of this task.
+installation was **not** changed during the initial passive-only phase.
+
+## Authorized Deployment Follow-Up
+
+The user subsequently authorized committing, pushing, deploying, and restarting.
+Code commit `79b93e0` was pushed to GitHub and its runtime files deployed by SCP.
+The Pi's unrelated/differing test files were left untouched. Source hashes were
+checked against known previous versions before replacement. Configuration,
+GPIO mapping, helper permissions, schedules, and the service's disabled-at-boot
+preference were unchanged. No dosing schedules or ATO profiles were enabled,
+and pumps were idle before deployment and throughout verification.
+
+Successful, integrity-checked backup:
+`~/controller/backups/hydros-bounded-20261016-110505`.
+It contains prior source, configuration, state, SQLite, and a hash manifest.
+An earlier live SQLite backup timed out before any code was applied; that
+incomplete attempt must not be used for recovery. The successful retry pinned
+a read transaction so ongoing telemetry could not repeatedly restart the copy.
+SQLite `quick_check` returned `ok` before replacement.
+
+The service restarted at 11:05:32 EDT on October 16, 2026, as unprivileged `reef`,
+PID 13673. The restart completed actuator-disable cleanup; one DS18B20 read
+reported expected cooperative cancellation while the old process shut down.
+The new process recovered the verified GPIO5 kernel bus and began reporting
+fresh CRC-valid DS18B20 and bounded GPIO17 HYDROS readings.
+
+Read-only production verification, 60 seconds, same submerged/HIGH signal and
+four-second HYDROS interval:
+
+| Metric | Earlier continuous HIGH baseline, 24 s | Deployed bounded capture, 60 s |
+| --- | ---: | ---: |
+| HYDROS notification thread CPU | 29.244% of one core | 0.167% |
+| Total Loggerhead process CPU | 42.658% | 16.533% |
+| Total system busy CPU, excluding idle/iowait | 72.985% | 31.613% |
+
+The different-length samples and other background/client activity are not a
+fully controlled A/B experiment, but the signal state/frequency were comparable
+and the bounded implementation was verified active. No extra passive observer
+was running during deployed sampling. The control loop and state persistence
+remain separate CPU costs; this change does not remove them.
+
+All 15 sampled sensor-health snapshots were online. HYDROS consistently reported
+HIGH with zero invalid periods, eight qualifying periods/nine accepted edges
+per acquisition, and paused subscriptions in its published capture results.
+Its successful timestamps advanced, as did the DS18B20's. Sampled capture median
+was 31.3 ms, maximum 47.9 ms; status API median was 137.8 ms, maximum 217.6 ms.
+The existing HIGH-level alarm was retained rather than cleared or suppressed.
+A short read-only WebKit check in an iPhone-sized viewport kept Dashboard,
+Config, and Plots connected, rendered the chart, and reported no page errors or
+failed requests. WebKit ran on Windows, not the physical iPhone.
+
+This validates actual deployed HIGH capture and short-run CPU reduction, not
+physical ATO shutoff, NORMAL/LOW hardware classification, or long-duration fault
+recovery. Those outstanding hardware tests still apply. No equipment commands,
+sensor-setting changes, or physical motor operations were used for verification.
