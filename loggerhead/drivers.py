@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -95,8 +95,28 @@ class HydrosTripleClassifier:
         return self.state
 
 
+@dataclass
+class _HydrosCapture:
+    start_tick: int
+    deadline: float
+    last_edge_mono: float
+    done: threading.Event = field(default_factory=threading.Event)
+    last_tick: int | None = None
+    candidate: LevelState = LevelState.UNKNOWN
+    periods: list[int] = field(default_factory=list)
+    edges: int = 0
+    invalid: int = 0
+    state: LevelState = LevelState.UNKNOWN
+    reason: str = "acquiring"
+
+
 class HydrosPulseReader:
-    """Reads HYDROS triple-optical PWM periods with pigpio edge callbacks."""
+    """Bounded rising-edge acquisitions on one persistent, dedicated connection."""
+
+    MIN_PERIODS = 8
+    MAX_CAPTURE_SECONDS = 5.0
+    CANCEL_CHECK_SECONDS = 0.025
+    COMMAND_TIMEOUT_SECONDS = 1.0
 
     def __init__(
         self,
@@ -105,20 +125,37 @@ class HydrosPulseReader:
         *,
         simulation: bool = False,
         pigpio_module: Any | None = None,
+        configure_gpio: bool = True,
     ) -> None:
         self.bcm_pin = bcm_pin
         self.classifier = classifier
         self.simulation = simulation
         self.pi = None
         self._callback = None
-        self._last_rising_tick: int | None = None
+        self._retiring_notify = None
+        self._capture: _HydrosCapture | None = None
+        self._closed = False
+        self._fault = ""
+        self._state = LevelState.UNKNOWN
+        self._edge = 0
+        self._required_periods = max(self.MIN_PERIODS, classifier.debounce_samples)
         self._pulse_count = 0
+        self._rising_edges = 0
+        self._callback_edges = 0
+        self._last_capture_edges = 0
+        self._last_capture_periods = 0
+        self._acquisitions = 0
+        self._last_duration = 0.0
+        self._last_reason = "not_measured"
+        self._last_measurement_ts = 0.0
         self._last_period_us: float | None = None
         self._last_frequency_hz: float | None = None
         self._last_edge_ts = 0.0
         self._last_valid_edge_ts = 0.0
         self._invalid_frequency_count = 0
         self._lock = threading.RLock()
+        self._resources = threading.RLock()
+        self._acquisition = threading.Lock()
         if not simulation:
             try:
                 pigpio = pigpio_module
@@ -129,61 +166,229 @@ class HydrosPulseReader:
                 self.pi = pigpio.pi()
                 if not self.pi.connected:
                     raise HardwareUnavailable("pigpiod is not connected.")
-                self.pi.set_mode(self.bcm_pin, getattr(pigpio, "INPUT", 0))
-                if hasattr(self.pi, "set_pull_up_down") and hasattr(pigpio, "PUD_UP"):
-                    self.pi.set_pull_up_down(self.bcm_pin, pigpio.PUD_UP)
-                edge = getattr(pigpio, "RISING_EDGE", 1)
-                self._callback = self.pi.callback(self.bcm_pin, edge, self._on_edge)
+                command_socket = getattr(getattr(self.pi, "sl", None), "s", None)
+                if command_socket is not None:
+                    command_socket.settimeout(self.COMMAND_TIMEOUT_SECONDS)
+                self._edge = getattr(pigpio, "RISING_EDGE", 0)
+                if configure_gpio:
+                    self._check(self.pi.set_mode(self.bcm_pin, getattr(pigpio, "INPUT", 0)), "input mode")
+                    if hasattr(self.pi, "set_pull_up_down") and hasattr(pigpio, "PUD_UP"):
+                        self._check(self.pi.set_pull_up_down(self.bcm_pin, pigpio.PUD_UP), "pull-up")
+                self._pause_notifications_locked()
             except Exception as exc:
+                self._disconnect_locked()
                 raise HardwareUnavailable(f"HYDROS PWM capture unavailable on BCM {self.bcm_pin}: {exc}") from exc
+
+    @property
+    def acquisition_timeout(self) -> float:
+        # Eight slowest valid periods plus phase/scheduling margin. Very large
+        # legacy debounce settings fail closed at the hard acquisition deadline.
+        return min(self.MAX_CAPTURE_SECONDS, max(0.75, self._required_periods * 0.06 + 0.25))
+
+    @staticmethod
+    def _check(result: Any, operation: str) -> None:
+        if isinstance(result, int) and result < 0:
+            raise HardwareUnavailable(f"pigpio HYDROS {operation} failed ({result}).")
 
     @staticmethod
     def _tick_diff(previous: int, current: int) -> int:
         return (current - previous) & 0xFFFFFFFF
 
-    def _on_edge(self, _gpio: int, level: int, tick: int) -> None:
-        if level not in {1, 2}:  # 2 is pigpio watchdog timeout; ignore it for period capture.
-            return
-        if level == 2:
+    def _on_edge(self, capture: _HydrosCapture, gpio: int, level: int, tick: int) -> None:
+        if gpio != self.bcm_pin or level != 1:
             return
         with self._lock:
+            if self._closed or capture is not self._capture:
+                return
+            self._callback_edges += 1
+            if capture.done.is_set():
+                return
+            # A newly installed callback can see older packets still queued in
+            # pigpio. Reject pre-arm ticks as well as old callback generations.
+            if self._tick_diff(capture.start_tick, tick) >= 0x80000000:
+                return
+            now = time.monotonic()
+            if now >= capture.deadline or now - capture.last_edge_mono > self.classifier.activity_timeout:
+                capture.reason = "timeout"
+                capture.done.set()
+                return
+            capture.last_edge_mono = now
+            capture.edges += 1
+            self._rising_edges += 1
             self._last_edge_ts = time.time()
-            if self._last_rising_tick is not None:
-                period_us = self._tick_diff(self._last_rising_tick, tick)
+            if capture.last_tick is not None:
+                period_us = self._tick_diff(capture.last_tick, tick)
                 self._pulse_count += 1
                 self._last_period_us = float(period_us)
                 self._last_frequency_hz = 1_000_000.0 / period_us if period_us > 0 else None
-                if self.classifier.classify_period_us(period_us) == LevelState.UNKNOWN:
+                candidate = self.classifier.classify_period_us(period_us)
+                if candidate == LevelState.UNKNOWN:
+                    capture.invalid += 1
                     self._invalid_frequency_count += 1
                 else:
                     self._last_valid_edge_ts = self._last_edge_ts
-                self.classifier.observe_period_us(period_us)
-            self._last_rising_tick = tick
+                if candidate != capture.candidate or candidate == LevelState.UNKNOWN:
+                    capture.periods.clear()
+                capture.candidate = candidate
+                if candidate != LevelState.UNKNOWN:
+                    capture.periods.append(period_us)
+                if len(capture.periods) >= self._required_periods:
+                    capture.state, capture.reason = candidate, "complete"
+                    capture.done.set()
+            capture.last_tick = tick
+            if capture.edges >= self._required_periods * 4 + 1 and not capture.done.is_set():
+                capture.reason = "inconsistent_periods"
+                capture.done.set()
 
-    def read_state(self) -> LevelState:
-        if self.simulation:
+    def _pause_notifications_locked(self) -> None:
+        errors = []
+        callback, self._callback = self._callback, None
+        if callback is not None:
+            try:
+                callback.cancel()  # Removes the GPIO bit from the daemon mask.
+            except Exception as exc:
+                errors.append(str(exc))
+        if self.pi is not None:
+            try:
+                # Dedicated connection: explicit daemon acknowledgment, since
+                # pigpio callback.cancel() discards its command return value.
+                handle = self.pi._notify.handle
+                result = self.pi.notify_pause(handle)
+                if result != 0:
+                    raise HardwareUnavailable(f"pigpio did not acknowledge HYDROS notification pause ({result}).")
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            self._fault = "Could not verify HYDROS notifications paused: " + "; ".join(errors)
+            self._disconnect_locked()
+            raise HardwareUnavailable(self._fault)
+
+    def _disconnect_locked(self) -> None:
+        if self.pi is None:
+            return
+        pi = self.pi
+        notify = self._retiring_notify or getattr(pi, "_notify", None)
+        self._retiring_notify = notify
+        try:
+            pi.stop()
+        finally:
+            if isinstance(notify, threading.Thread) and notify is not threading.current_thread():
+                notify.join(timeout=self.COMMAND_TIMEOUT_SECONDS)
+                if notify.is_alive():
+                    raise HardwareUnavailable("HYDROS pigpio notification thread did not exit; GPIO handoff is blocked.")
+        self.pi = self._retiring_notify = None
+
+    def read_state(self, *, stop_event: threading.Event | None = None) -> LevelState:
+        if not self._acquisition.acquire(blocking=False):
+            raise HardwareUnavailable("HYDROS acquisition is already in progress.")
+        started = time.monotonic()
+        capture = None
+        try:
+            with self._resources:
+                with self._lock:
+                    if self._closed or self._fault:
+                        raise HardwareUnavailable(self._fault or "HYDROS reader is closed.")
+                    if stop_event is not None and stop_event.is_set():
+                        raise HardwareUnavailable("HYDROS acquisition cancelled.")
+                    self._state = self.classifier.state = LevelState.UNKNOWN
+                    self._last_period_us = self._last_frequency_hz = None
+                    self._last_reason = "acquiring"
+                    self._acquisitions += 1
+                try:
+                    tick = 0 if self.simulation else self.pi.get_current_tick()
+                    self._check(tick, "start tick")
+                    if type(tick) is not int or not 0 <= tick <= 0xFFFFFFFF:
+                        raise HardwareUnavailable("pigpio returned an invalid HYDROS start tick.")
+                    capture = _HydrosCapture(tick, time.monotonic() + self.acquisition_timeout, time.monotonic())
+                    with self._lock:
+                        self._capture = capture
+                    if not self.simulation:
+                        self._callback = self.pi.callback(self.bcm_pin, self._edge,
+                                                          lambda gpio, level, tick: self._on_edge(capture, gpio, level, tick))
+                except Exception as exc:
+                    self._fault = f"HYDROS subscription failed; reinitialize the SensePort: {exc}"
+                    self._disconnect_locked()
+                    raise HardwareUnavailable(self._fault) from exc
+            if self.simulation:
+                for index in range(self._required_periods + 1):
+                    self._on_edge(capture, self.bcm_pin, 1, (index + 1) * 2520)
+            while not capture.done.is_set():
+                if self._closed or (stop_event is not None and stop_event.is_set()):
+                    capture.reason = "cancelled"
+                    break
+                now = time.monotonic()
+                remaining = min(capture.deadline - now, self.classifier.activity_timeout - (now - capture.last_edge_mono))
+                if remaining <= 0:
+                    capture.reason = "timeout"
+                    break
+                capture.done.wait(min(self.CANCEL_CHECK_SECONDS, remaining))
+            # Freeze before cancelling: callbacks never perform socket I/O or
+            # mutate another acquisition, even while cancellation is in flight.
             with self._lock:
-                self._pulse_count += 1
-                self._last_period_us = 2520.0
-                self._last_frequency_hz = 1_000_000.0 / 2520.0
-                self._last_edge_ts = time.time()
-                self._last_valid_edge_ts = self._last_edge_ts
-                return self.classifier.observe_period_us(2520)
-        with self._lock:
-            return self.classifier.activity_state()
+                capture.done.set()
+            with self._resources:
+                self._pause_notifications_locked()
+            with self._lock:
+                if self._closed or (stop_event is not None and stop_event.is_set()):
+                    capture.reason = "cancelled"
+                if time.monotonic() >= capture.deadline and capture.reason == "complete":
+                    capture.reason = "timeout"
+                self._last_reason = capture.reason
+                if capture.reason == "complete":
+                    self._state = capture.state
+                    self._last_measurement_ts = self._last_edge_ts
+                else:
+                    self._state = LevelState.INACTIVE if capture.edges < 2 else LevelState.UNKNOWN
+                self.classifier.state = self._state
+                return self._state
+        except Exception as exc:
+            with self._lock:
+                self._state = self.classifier.state = LevelState.UNKNOWN
+                self._last_reason = str(exc)
+            raise
+        finally:
+            try:
+                with self._lock:
+                    if capture is not None:
+                        capture.done.set()
+                with self._resources:
+                    if self._callback is not None:
+                        self._pause_notifications_locked()
+            finally:
+                with self._lock:
+                    self._capture = None
+                    self._last_duration = time.monotonic() - started
+                    self._last_capture_edges = capture.edges if capture is not None else 0
+                    self._last_capture_periods = len(capture.periods) if capture is not None else 0
+                self._acquisition.release()
 
     def diagnostics(self) -> dict[str, Any]:
         with self._lock:
-            state = self.classifier.activity_state() if not self.simulation else self.classifier.state
             return {
                 "bcm_pin": self.bcm_pin,
-                "state": state.value,
+                "state": self._state.value,
                 "frequency_hz": self._last_frequency_hz,
                 "period_us": self._last_period_us,
                 "pulse_count": self._pulse_count,
                 "last_edge_ts": self._last_edge_ts,
                 "last_valid_edge_ts": self._last_valid_edge_ts,
                 "invalid_frequency_count": self._invalid_frequency_count,
+                "capture_mode": "bounded_on_demand",
+                "capture_active": self._capture is not None and not self._capture.done.is_set(),
+                "notifications_subscribed": self._callback is not None,
+                "required_periods": self._required_periods,
+                "acquisitions": self._acquisitions,
+                "rising_edges": self._rising_edges,
+                "callback_rising_edges": self._callback_edges,
+                "last_acquisition_edges": self._last_capture_edges,
+                "last_acquisition_valid_periods": self._last_capture_periods,
+                "last_acquisition_seconds": self._last_duration,
+                "last_acquisition_reason": self._last_reason,
+                "last_measurement_ts": self._last_measurement_ts,
+                "measurement_age_seconds": max(0.0, time.time()-self._last_measurement_ts) if self._last_measurement_ts else None,
+                "acquisition_timeout_seconds": self.acquisition_timeout,
+                "activity_timeout_scope": "missing edges during active acquisition only",
+                "fault": self._fault,
                 "measurement_method": self.classifier.MEASUREMENT_METHOD,
                 "classification_windows_us": {
                     state.value: [low, high] for state, low, high in self.classifier.WINDOWS
@@ -191,13 +396,17 @@ class HydrosPulseReader:
             }
 
     def close(self) -> None:
-        callback = self._callback
-        self._callback = None
-        if callback is not None and hasattr(callback, "cancel"):
-            callback.cancel()
-        if self.pi is not None and hasattr(self.pi, "stop"):
-            self.pi.stop()
-        self.pi = None
+        with self._lock:
+            self._closed = True
+            self._state = self.classifier.state = LevelState.UNKNOWN
+            if self._capture is not None:
+                self._capture.reason = "cancelled"
+                self._capture.done.set()
+        with self._resources:
+            try:
+                self._pause_notifications_locked()
+            finally:
+                self._disconnect_locked()
 
 
 class KasaHS300Client:

@@ -34,6 +34,8 @@ class SensorWorkerSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
     last_attempt_ts: float = 0.0
     last_attempt_monotonic: float = 0.0
+    last_finished_ts: float = 0.0
+    last_finished_monotonic: float = 0.0
     last_success_ts: float = 0.0
     last_success_monotonic: float = 0.0
     read_started_ts: float = 0.0
@@ -173,6 +175,8 @@ class SensorWorker:
             self._snapshot.data_status = status
             self._snapshot.status = status
             self._snapshot.error = result.error
+            self._snapshot.last_finished_ts = finished_wall
+            self._snapshot.last_finished_monotonic = finished_mono
             self._snapshot.last_success_ts = finished_wall if status == "online" else self._snapshot.last_success_ts
             self._snapshot.last_success_monotonic = finished_mono if status == "online" else self._snapshot.last_success_monotonic
             self._snapshot.read_duration_seconds = max(0.0, finished_mono - started_mono)
@@ -187,6 +191,8 @@ class SensorWorker:
             self._snapshot.status = status
             self._snapshot.data_status = status
             self._snapshot.error = str(exc)
+            self._snapshot.last_finished_ts = time.time()
+            self._snapshot.last_finished_monotonic = finished_mono
             self._snapshot.read_duration_seconds = max(0.0, finished_mono - started_mono)
             self._snapshot.consecutive_failures += 1
             self._snapshot.read_started_ts = 0.0

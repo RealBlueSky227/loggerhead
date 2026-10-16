@@ -59,6 +59,10 @@ for recovery behavior and the read-only CPU/helper benchmark.
 See [Runtime Performance](docs/RUNTIME_PERFORMANCE.md) for per-thread/browser
 benchmarks, calibration responsiveness fixes, and safe incident-capture commands.
 
+HYDROS PWM uses bounded on-demand acquisitions with notifications paused between
+reads. See [HYDROS Acquisition](docs/HYDROS_ACQUISITION.md) for ATO freshness/latency
+limits, passive Pi measurements, and remaining pre-deployment validation.
+
 ## Hardware Map
 
 Loggerhead enforces only BCM GPIO names and fixed I2C addresses:

@@ -225,6 +225,14 @@ class FakeHydrosPigpioPi:
         self.callback_func = None
         self.callback_obj = FakePigpioCallback()
         self.stopped = False
+        self._notify = types.SimpleNamespace(handle=1)
+        self.period = 5040
+
+    def notify_pause(self, _handle: int) -> int:
+        return 0
+
+    def get_current_tick(self) -> int:
+        return 0
 
     def set_mode(self, _bcm_pin: int, _mode: int) -> None:
         return
@@ -234,6 +242,8 @@ class FakeHydrosPigpioPi:
 
     def callback(self, _bcm_pin: int, _edge: int, func) -> FakePigpioCallback:
         self.callback_func = func
+        for index in range(9):
+            func(_bcm_pin, 1, 1000 + index * self.period)
         return self.callback_obj
 
     def stop(self) -> None:
@@ -343,11 +353,7 @@ def test_hydros_pulse_reader_uses_rising_edge_periods() -> None:
     classifier = HydrosTripleClassifier(debounce_samples=2, activity_timeout=10.0)
     reader = HydrosPulseReader(17, classifier, pigpio_module=FakeHydrosPigpioModule(fake_pi))
 
-    assert fake_pi.callback_func is not None
-    fake_pi.callback_func(17, 1, 1_000)
-    fake_pi.callback_func(17, 1, 6_040)
-    assert reader.read_state() == LevelState.UNKNOWN
-    fake_pi.callback_func(17, 1, 11_080)
+    assert fake_pi.callback_func is None
     assert reader.read_state() == LevelState.NORMAL
     diagnostics = reader.diagnostics()
     assert diagnostics["period_us"] == 5040.0

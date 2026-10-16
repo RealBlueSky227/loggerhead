@@ -78,6 +78,7 @@ class LoggerheadService:
     MANUAL_PRIME_LIMIT_REASONS = {"max_seconds", "max_steps"}
     MANUAL_PRIME_LIMIT_CHIRP_SECONDS = 0.15
     SENSOR_WORKER_STOP_TIMEOUT_SECONDS = 15.0
+    ATO_LEVEL_MAX_POLL_SECONDS = 1.0
 
     def __init__(self, config_path: Path, data_dir: Path, *, simulation: bool = False) -> None:
         self.config_path = config_path
@@ -291,7 +292,7 @@ class LoggerheadService:
                 raise RuntimeError("Stop the active pump before changing pump settings or dosing schedules.")
         sensor_changed = any(getattr(previous, field) != getattr(candidate, field) for field in (
             "sense_ports", "temperature_sensors", "water_level_sensors", "analog_sensors", "ph_sensors",
-        ))
+        )) or self._ato_input_ids(previous) != self._ato_input_ids(candidate)
         try:
             if sensor_changed:
                 self.config = candidate
@@ -802,15 +803,20 @@ class LoggerheadService:
                 health.last_attempt_ts = now
 
     def _close_sensor_readers(self) -> None:
-        for reader in self._hydros_readers.values():
+        failed = {}
+        for sensor_id, reader in self._hydros_readers.items():
             try:
                 reader.close()
             except Exception as exc:
                 LOGGER.warning("HYDROS callback cleanup failed: %s", exc)
-        self._hydros_readers = {}
+                failed[sensor_id] = reader
+        self._hydros_readers = failed
+        if failed:
+            raise HardwareFault(f"HYDROS resources did not close; GPIO handoff blocked: {', '.join(failed)}.")
 
     def _build_sensor_worker_specs(self) -> list[SensorWorkerSpec]:
         specs: list[SensorWorkerSpec] = []
+        ato_inputs = self._ato_input_ids(self.config)
         for sensor in materialized_temperature_sensors(self.config):
             stale_after = self._stale_after(sensor.check_frequency)
 
@@ -900,19 +906,26 @@ class LoggerheadService:
                 )
                 continue
 
-            def read_hydros(_stop: threading.Event, sensor=sensor) -> SensorReadResult:
+            ato_input = sensor.id in ato_inputs
+            interval = min(sensor.check_frequency, self.ATO_LEVEL_MAX_POLL_SECONDS) if ato_input else sensor.check_frequency
+            if ato_input:
+                stale_after = min(stale_after, 2.0)
+
+            def read_hydros(stop: threading.Event, sensor=sensor, interval=interval, ato_input=ato_input) -> SensorReadResult:
                 reader = self._hydros_readers.get(sensor.id)
                 if reader is None:
                     raise HardwareUnavailable(f"HYDROS PWM reader is unavailable for {sensor.id}.")
-                level = reader.read_state()
+                level = reader.read_state(stop_event=stop)
                 diagnostics = reader.diagnostics()
+                diagnostics.update(configured_poll_seconds=sensor.check_frequency, effective_poll_seconds=interval,
+                                   ato_monitoring=ato_input)
                 if level == LevelState.INACTIVE:
                     return SensorReadResult(
                         sensor.id,
                         "water",
                         level.value,
                         data_status="stale",
-                        error="HYDROS PWM pulses are inactive.",
+                        error=f"HYDROS PWM acquisition inactive: {diagnostics.get('last_acquisition_reason', 'no pulses')}.",
                         metadata=diagnostics,
                     )
                 if level == LevelState.UNKNOWN:
@@ -921,7 +934,7 @@ class LoggerheadService:
                         "water",
                         level.value,
                         data_status="read_error",
-                        error="HYDROS PWM frequency is outside known windows.",
+                        error=f"HYDROS PWM acquisition invalid: {diagnostics.get('last_acquisition_reason', 'unstable frequency')}.",
                         metadata=diagnostics,
                     )
                 return SensorReadResult(sensor.id, "water", level.value, metadata=diagnostics)
@@ -930,13 +943,18 @@ class LoggerheadService:
                 SensorWorkerSpec(
                     sensor.id,
                     "water",
-                    sensor.check_frequency,
+                    interval,
                     stale_after,
                     read_hydros,
                     read_timeout_seconds=stale_after,
                 )
             )
         return specs
+
+    @staticmethod
+    def _ato_input_ids(config: AppConfig) -> set[str]:
+        return {sensor_id for profile in config.ato if profile.enabled
+                for sensor_id in (profile.primary_level_sensor, profile.backup_failsafe_sensor)}
 
     def _install_sensor_workers(self, specs: list[SensorWorkerSpec]) -> None:
         with self._sensor_worker_lock:
@@ -1351,12 +1369,18 @@ class LoggerheadService:
         alarms.append(AlarmState(alarm_id, message, AlarmPriority.WARNING, first_seen=now))
 
     def _snapshot_has_new_attempt(self, snapshot: SensorWorkerSnapshot) -> bool:
-        if not snapshot.last_attempt_ts:
+        # A new attempt may still contain the last completed value. Use its
+        # completion marker, even when an overrunning worker is reading again.
+        marker = snapshot.last_finished_monotonic
+        if not marker:
+            # Compatibility with synthetic/legacy snapshots lacking completion
+            # markers; real workers always publish one on success or failure.
+            if not snapshot.last_attempt_ts or snapshot.worker_state == "reading":
+                return False
+            marker = snapshot.last_attempt_ts
+        if marker <= self._sensor_last_applied_attempt.get(snapshot.sensor_id, 0.0):
             return False
-        last_applied = self._sensor_last_applied_attempt.get(snapshot.sensor_id, 0.0)
-        if snapshot.last_attempt_ts <= last_applied:
-            return False
-        self._sensor_last_applied_attempt[snapshot.sensor_id] = snapshot.last_attempt_ts
+        self._sensor_last_applied_attempt[snapshot.sensor_id] = marker
         return True
 
     def _plan_equipment_off_if_on_locked(
@@ -1496,7 +1520,7 @@ class LoggerheadService:
                     reader = self._hydros_readers.get(sensor.id)
                     if reader is None:
                         raise HardwareUnavailable(f"HYDROS PWM reader is unavailable for {sensor.id}.")
-                    level = reader.read_state()
+                    level = reader.read_state(stop_event=self._stop)
             except Exception as exc:
                 self._mark_sensor_failure(sensor.id, now, exc, sensor.check_frequency, stale_after=stale_after)
                 previous = self.state.water_levels.get(sensor.id)
