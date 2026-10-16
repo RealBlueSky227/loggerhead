@@ -6,6 +6,7 @@ import math
 import shutil
 import sqlite3
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -42,6 +43,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:
+        monitor = getattr(self.server.service, "performance", None)
+        path = urlparse(self.path).path
+        label = path if path in {"/", "/api/status", "/api/performance", "/api/history", "/api/history/streams"} else "asset_or_other"
+        with monitor.measure(f"http.GET {label}") if monitor else nullcontext():
+            self._handle_GET()
+
+    def _handle_GET(self) -> None:
         parsed = urlparse(self.path)
         try:
             if parsed.path == "/":
@@ -50,6 +58,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_asset(parsed.path)
             elif parsed.path == "/api/status":
                 self._send_json(self.server.service.status())
+            elif parsed.path == "/api/performance":
+                self._send_json(self.server.service.performance_snapshot(stacks=parse_qs(parsed.query).get("stacks") == ["1"]))
             elif parsed.path == "/api/history/streams":
                 self._send_json({"streams": self.server.service.history_streams()})
             elif parsed.path == "/api/history":
@@ -80,6 +90,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "internal_error", "message": str(exc)}, status=500)
 
     def do_POST(self) -> None:
+        monitor = getattr(self.server.service, "performance", None)
+        with monitor.measure("http.POST") if monitor else nullcontext():
+            self._handle_POST()
+
+    def _handle_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
             payload = self._read_json()
@@ -167,11 +182,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, payload: Any, *, status: int = 200) -> None:
         body = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except ConnectionError:
+            LOGGER.debug("Dashboard client disconnected while receiving %s.", self.path)
 
     def _send_html(self, html: str) -> None:
         body = html.encode("utf-8")
@@ -327,6 +345,7 @@ INDEX_HTML = r"""<!doctype html>
   <script>
     let status = {};
     let lastStatusAt = 0;
+    let refreshInFlight = false;
     let rawConfigDirty = false;
     let sensorEditorDirty = false;
     let sensorDrafts = [];
@@ -463,14 +482,27 @@ INDEX_HTML = r"""<!doctype html>
       $("heartbeatText").textContent = text;
     }
     async function refresh() {
+      if (refreshInFlight) return;
+      refreshInFlight = true;
+      const controller = new AbortController();
+      const deadline = setTimeout(() => controller.abort(), 8000);
       try {
-        status = await fetch("/api/status").then(r => r.json());
-        lastStatusAt = Date.now();
-        setHeartbeat(true, "Backend online");
+        await refreshStatus(controller.signal);
       } catch {
         setHeartbeat(false, lastStatusAt ? "Backend stale" : "Backend offline");
-        return;
+      } finally {
+        clearTimeout(deadline);
+        refreshInFlight = false;
       }
+    }
+    async function refreshStatus(signal) {
+      const response = await fetch("/api/status", {signal});
+      if (!response.ok) throw new Error(`Status unavailable (${response.status}).`);
+      const next = await response.json();
+      if (!next.config || !next.heartbeat?.ok) throw new Error("Invalid backend status.");
+      status = next;
+      lastStatusAt = Date.now();
+      setHeartbeat(true, "Backend online");
       $("clock").textContent = new Date(status.time * 1000).toLocaleString();
       if (!rawConfigDirty && document.activeElement !== $("configText")) $("configText").value = JSON.stringify(status.config, null, 2);
       loadSensePortDrafts(false);

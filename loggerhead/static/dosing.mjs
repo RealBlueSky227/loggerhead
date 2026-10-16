@@ -229,7 +229,8 @@ export function mountDosingEditor(doc, bridge, post) {
         button.disabled=true;
         const result=await post("/api/calibration",{id,steps,speed_steps_per_second:speed});
         work.operationId=result.operation_id; work.blocked=false; work.message="";
-        model.status={...model.status,stepper_active:id,manual_priming:{...model.status.manual_priming,[id]:true}};
+        if (result.priming !== false) model.status={...model.status,stepper_active:id,manual_priming:{...model.status.manual_priming,[id]:true}};
+        else work.message="Calibration cancelled before motion.";
         refresh();
       }
       if (what === "apply") {

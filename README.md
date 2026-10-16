@@ -56,6 +56,9 @@ runtime mappings. Normal temperature polling performs unprivileged evidence/CRC
 checks, not privileged helper calls. See [1-Wire Lifecycle](docs/ONEWIRE_LIFECYCLE.md)
 for recovery behavior and the read-only CPU/helper benchmark.
 
+See [Runtime Performance](docs/RUNTIME_PERFORMANCE.md) for per-thread/browser
+benchmarks, calibration responsiveness fixes, and safe incident-capture commands.
+
 ## Hardware Map
 
 Loggerhead enforces only BCM GPIO names and fixed I2C addresses:
