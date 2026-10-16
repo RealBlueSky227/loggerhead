@@ -530,6 +530,12 @@ class KernelOneWirePlatform:
     evidence: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class VerifiedOneWireBus:
+    bus: KernelOneWireBus
+    token: tuple
+
+
 class TemperatureReader:
     """Temperature sensor readers for kernel 1-Wire and host CPU.
 
@@ -553,6 +559,12 @@ class TemperatureReader:
         self._runtime_kernel_pins: set[int] = set()
         self._runtime_kernel_bus_names: dict[int, str] = {}
         self._last_valid_kernel_celsius: dict[int, float] = {}
+        self._last_kernel_sensor_ids: dict[int, str] = {}
+        self._kernel_lifecycle_lock = threading.RLock()
+        self._verified_kernel_buses: dict[int, VerifiedOneWireBus] = {}
+        self._kernel_recovery_after: dict[int, float] = {}
+        self._runtime_master_instances: dict[int, tuple] = {}
+        self._rejected_runtime_masters: set[tuple[int, str]] = set()
         self.one_wire_root = one_wire_root or Path("/sys/bus/w1/devices")
         self.platform_root = platform_root or Path("/sys/bus/platform/devices")
         self._dtoverlay_command = dtoverlay_command
@@ -567,6 +579,16 @@ class TemperatureReader:
             self._overlay_client = HelperOneWireOverlayClient(subprocess_run=subprocess_run)
 
     def configure_kernel_one_wire(self, bcm_pin: int, *, stop_event: threading.Event | None = None) -> None:
+        with self._kernel_lifecycle_lock:
+            bcm_pin = int(bcm_pin)
+            self._configured_kernel_pins.add(bcm_pin)
+            self._verified_kernel_buses.pop(bcm_pin, None)
+            self._kernel_recovery_after[bcm_pin] = time.monotonic() + 30.0
+            self._configure_kernel_one_wire(bcm_pin, stop_event=stop_event)
+            if not self.simulation:
+                self._remember_verified_kernel_bus(self._kernel_bus_for_gpio(bcm_pin))
+
+    def _configure_kernel_one_wire(self, bcm_pin: int, *, stop_event: threading.Event | None = None) -> None:
         if self.simulation:
             return
         bcm_pin = int(bcm_pin)
@@ -593,9 +615,18 @@ class TemperatureReader:
         self._wait_for_kernel_one_wire(bcm_pin, stop_event=stop_event)
 
     def release_kernel_one_wire(self, bcm_pin: int) -> OneWireOverlayResult:
+        with self._kernel_lifecycle_lock:
+            # Overlay-stack changes may disturb other ports. No cached lease is
+            # usable until its post-transition physical mapping is reverified.
+            self._verified_kernel_buses.clear()
+            return self._release_kernel_one_wire(bcm_pin)
+
+    def _release_kernel_one_wire(self, bcm_pin: int) -> OneWireOverlayResult:
         bcm_pin = int(bcm_pin)
         self._configured_kernel_pins.discard(bcm_pin)
         self._last_valid_kernel_celsius.pop(bcm_pin, None)
+        self._last_kernel_sensor_ids.pop(bcm_pin, None)
+        self._kernel_recovery_after.pop(bcm_pin, None)
         self._runtime_kernel_bus_names.pop(bcm_pin, None)
         if self.simulation:
             return self._overlay_client.release(bcm_pin)
@@ -608,9 +639,101 @@ class TemperatureReader:
     def owned_runtime_one_wire_pins(self) -> set[int]:
         if self.simulation:
             return set()
-        result = self._overlay_client.status()
-        self._record_runtime_bus_from_overlay_result(None, result)
-        return set(result.owned_gpios)
+        with self._kernel_lifecycle_lock:
+            result = self._overlay_client.status()
+            self._record_runtime_bus_from_overlay_result(None, result)
+            return set(result.owned_gpios)
+
+    @staticmethod
+    def _kernel_object_identity(path: Path) -> tuple:
+        stat = path.stat()
+        return str(path.resolve(strict=True)), stat.st_dev, stat.st_ino
+
+    def _kernel_mapping_token(self, bus: KernelOneWireBus) -> tuple:
+        """Check live kernel evidence without helper, gpioinfo, or conversion I/O."""
+        proof = self._kernel_bus_from_master(bus.master)
+        platforms = self._w1_gpio_platforms()
+        if proof is not None and proof.gpio_bcm != bus.gpio_bcm:
+            raise HardwareUnavailable("Kernel 1-Wire direct GPIO evidence conflicts with the verified mapping.")
+        if proof is None:
+            matches = [item for item in platforms if item.gpio_bcm == bus.gpio_bcm]
+            if (
+                self._runtime_kernel_bus_names.get(bus.gpio_bcm) != bus.master.name
+                or self._kernel_object_identity(bus.master) != self._runtime_master_instances.get(bus.gpio_bcm)
+                or len(matches) != 1
+                or f"platform={matches[0].name}" not in bus.evidence
+            ):
+                raise HardwareUnavailable("Captured 1-Wire master instance or physical GPIO platform is no longer verified.")
+        token_reader = getattr(self._overlay_client, "verification_token", None)
+        ownership = token_reader() if token_reader else ()
+        if proof is None and isinstance(self._overlay_client, HelperOneWireOverlayClient) and ownership is None:
+            raise HardwareUnavailable("Runtime 1-Wire ownership evidence is unavailable; refusing the captured bus mapping.")
+        return (
+            ownership,
+            tuple((path.name, self._kernel_object_identity(path)) for path in self._one_wire_bus_masters()),
+            tuple((item.name, item.gpio_bcm, item.evidence, self._kernel_object_identity(item.path)) for item in platforms),
+            None if proof is None else (proof.gpio_bcm, proof.evidence),
+        )
+
+    def _remember_verified_kernel_bus(self, bus: KernelOneWireBus) -> VerifiedOneWireBus:
+        verified = VerifiedOneWireBus(bus, self._kernel_mapping_token(bus))
+        self._verified_kernel_buses[bus.gpio_bcm] = verified
+        LOGGER.info("Verified kernel 1-Wire lifecycle mapping BCM %s -> %s.", bus.gpio_bcm, bus.master.name)
+        return verified
+
+    def _verified_kernel_bus_for_read(self, bcm_pin: int, stop_event: threading.Event | None) -> VerifiedOneWireBus:
+        with self._kernel_lifecycle_lock:
+            self._raise_if_cancelled(stop_event, "read")
+            cached = self._verified_kernel_buses.get(bcm_pin)
+            if cached is not None:
+                self._check_kernel_bus_lease(cached)
+                return cached
+            if bcm_pin in self._configured_kernel_pins:
+                if time.monotonic() < self._kernel_recovery_after.get(bcm_pin, 0):
+                    raise HardwareUnavailable(f"Kernel 1-Wire mapping for BCM {bcm_pin} is invalid; waiting for bounded recovery.")
+                self._kernel_recovery_after[bcm_pin] = time.monotonic() + 30.0
+                LOGGER.warning("Recovering invalid kernel 1-Wire mapping on BCM %s (verification only; no GPIO reassignment).", bcm_pin)
+                self._sync_runtime_overlay_status(stop_event=stop_event, required=True)
+            # Standalone readers may discover a directly linked sysfs bus, but
+            # reads never activate/release overlays or infer a different port.
+            bus = self._kernel_bus_for_gpio(bcm_pin)
+            self._raise_if_cancelled(stop_event, "read")
+            return self._remember_verified_kernel_bus(bus)
+
+    def _check_kernel_bus_lease(self, verified: VerifiedOneWireBus) -> None:
+        try:
+            valid = self._verified_kernel_buses.get(verified.bus.gpio_bcm) is verified
+            valid = valid and verified.token == self._kernel_mapping_token(verified.bus)
+        except (OSError, HardwareUnavailable):
+            valid = False
+        if not valid:
+            self._verified_kernel_buses.clear()
+            self._last_valid_kernel_celsius.clear()
+            self._last_kernel_sensor_ids.clear()
+            # Recovery refreshes helper evidence, but may not reuse an old
+            # captured name for a different kernel object after external churn.
+            for gpio, name in list(self._runtime_kernel_bus_names.items()):
+                try:
+                    identity = self._kernel_object_identity(self.one_wire_root / name)
+                except OSError:
+                    identity = None
+                if identity != self._runtime_master_instances.get(gpio):
+                    self._rejected_runtime_masters.add((gpio, name))
+                    self._runtime_kernel_bus_names.pop(gpio, None)
+            raise HardwareUnavailable(
+                f"Kernel 1-Wire ownership/topology changed for BCM {verified.bus.gpio_bcm}; "
+                "reading invalidated pending physical bus revalidation."
+            )
+
+    def complete_kernel_one_wire_configuration(self) -> None:
+        """Seal mappings after all serialized startup/config overlay changes."""
+        if self.simulation:
+            return
+        with self._kernel_lifecycle_lock:
+            for gpio in sorted(self._configured_kernel_pins):
+                # Failed initialization stays failed; only renew verified buses.
+                if gpio in self._verified_kernel_buses:
+                    self._remember_verified_kernel_bus(self._kernel_bus_for_gpio(gpio))
 
     def read_one_wire_bus(self, sensor_id: str = "", *, bcm_pin: int | None = None) -> float:
         if sensor_id:
@@ -640,7 +763,8 @@ class TemperatureReader:
                 resolution=12,
             )
         self._raise_if_cancelled(stop_event, "read")
-        bus = self._kernel_bus_for_gpio(int(bcm_pin))
+        verified = self._verified_kernel_bus_for_read(int(bcm_pin), stop_event)
+        bus = verified.bus
         self._raise_if_cancelled(stop_event, "read")
         sensor_ids = self._one_wire_sensor_ids_for_bus(bus)
         if not sensor_ids:
@@ -654,6 +778,9 @@ class TemperatureReader:
                 "Attach exactly one DS18B20 per sense port."
             )
         resolved_id = sensor_ids[0]
+        if self._last_kernel_sensor_ids.get(int(bcm_pin)) != resolved_id:
+            self._last_valid_kernel_celsius.pop(int(bcm_pin), None)
+            self._last_kernel_sensor_ids[int(bcm_pin)] = resolved_id
         path = self._one_wire_slave_path(bus, resolved_id)
         if not path.exists():
             raise HardwareUnavailable(
@@ -682,7 +809,16 @@ class TemperatureReader:
                     f"1-Wire sensor {resolved_id} returned the DS18B20 power-up default 85.000 C after retry; "
                     "no verified conversion is available yet."
                 )
-        self._last_valid_kernel_celsius[int(bcm_pin)] = celsius
+        ext_power = self._read_optional_int(self._one_wire_sensor_file(bus, resolved_id, "ext_power"))
+        resolution = self._read_optional_int(self._one_wire_sensor_file(bus, resolved_id, "resolution"))
+        self._raise_if_cancelled(stop_event, "read publication")
+        with self._kernel_lifecycle_lock:
+            self._check_kernel_bus_lease(verified)
+            if self._one_wire_sensor_ids_for_bus(bus) != [resolved_id]:
+                raise HardwareUnavailable("DS18B20 bus membership changed during conversion; reading discarded.")
+            if celsius < -55.0 or celsius > 125.0:
+                raise HardwareUnavailable(f"1-Wire sensor {resolved_id} returned implausible DS18B20 temperature {celsius:.3f} C.")
+            self._last_valid_kernel_celsius[int(bcm_pin)] = celsius
         fahrenheit = celsius * 9 / 5 + 32
         return OneWireTemperatureReading(
             bcm_pin=int(bcm_pin),
@@ -691,8 +827,8 @@ class TemperatureReader:
             celsius=celsius,
             fahrenheit=fahrenheit,
             crc_valid=crc_valid,
-            ext_power=self._read_optional_int(self._one_wire_sensor_file(bus, resolved_id, "ext_power")),
-            resolution=self._read_optional_int(self._one_wire_sensor_file(bus, resolved_id, "resolution")),
+            ext_power=ext_power,
+            resolution=resolution,
             power_up_default_suspect=power_up_default_suspect,
         )
 
@@ -774,30 +910,51 @@ class TemperatureReader:
         master = self.one_wire_root / master_name
         if not master.is_dir():
             return None
+        if sum(name == master_name for name in self._runtime_kernel_bus_names.values()) != 1:
+            return None
+        direct = self._kernel_bus_from_master(master)
+        if direct is not None and direct.gpio_bcm != int(bcm_pin):
+            LOGGER.error("Captured 1-Wire mapping BCM %s -> %s conflicts with direct kernel GPIO %s.", bcm_pin, master_name, direct.gpio_bcm)
+            return None
         platform = self._verified_w1_gpio_platform_for_gpio(int(bcm_pin))
         if platform is None:
             return None
         evidence = (f"captured_bus_master={master_name}", f"platform={platform.name}", *platform.evidence)
         return KernelOneWireBus(master, int(bcm_pin), tuple(dict.fromkeys(evidence)))
 
-    def _sync_runtime_overlay_status(self, *, stop_event: threading.Event | None = None) -> None:
+    def _sync_runtime_overlay_status(self, *, stop_event: threading.Event | None = None, required: bool = False) -> None:
         self._raise_if_cancelled(stop_event, "status sync")
         try:
             result = self._overlay_client.status()
         except Exception as exc:
+            self._runtime_kernel_bus_names.clear()
+            if required:
+                raise HardwareUnavailable(f"Could not reverify runtime 1-Wire overlay ownership: {exc}") from exc
             LOGGER.debug("Could not sync runtime 1-Wire overlay status: %s", exc)
             return
         self._raise_if_cancelled(stop_event, "status sync")
         self._record_runtime_bus_from_overlay_result(None, result)
 
     def _record_runtime_bus_from_overlay_result(self, bcm_pin: int | None, result: OneWireOverlayResult) -> None:
+        if result.action == "status":
+            self._runtime_kernel_bus_names.clear()
         for gpio in result.affected_gpios:
             self._runtime_kernel_bus_names.pop(int(gpio), None)
         for gpio, bus_master in result.owned_bus_masters.items():
-            if bus_master:
+            if isinstance(self._overlay_client, HelperOneWireOverlayClient) and not any(item.gpio == int(gpio) for item in result.overlays):
+                continue
+            if bus_master and (int(gpio), bus_master) not in self._rejected_runtime_masters:
                 self._runtime_kernel_bus_names[int(gpio)] = bus_master
+                try:
+                    self._runtime_master_instances[int(gpio)] = self._kernel_object_identity(self.one_wire_root / bus_master)
+                except OSError:
+                    self._runtime_kernel_bus_names.pop(int(gpio), None)
         if bcm_pin is not None and result.bus_master:
+            if not result.created and (int(bcm_pin), result.bus_master) in self._rejected_runtime_masters:
+                raise HardwareUnavailable("Captured kernel bus instance was replaced; explicit SensePort reinitialization is required.")
+            self._rejected_runtime_masters.discard((int(bcm_pin), result.bus_master))
             self._runtime_kernel_bus_names[int(bcm_pin)] = result.bus_master
+            self._runtime_master_instances[int(bcm_pin)] = self._kernel_object_identity(self.one_wire_root / result.bus_master)
 
     def _capture_runtime_bus_after_activation(
         self,
@@ -812,6 +969,7 @@ class TemperatureReader:
             created = sorted(self._one_wire_bus_master_names() - before_masters)
             if len(created) == 1:
                 self._runtime_kernel_bus_names[int(bcm_pin)] = created[0]
+                self._runtime_master_instances[int(bcm_pin)] = self._kernel_object_identity(self.one_wire_root / created[0])
                 return
             if len(created) > 1:
                 LOGGER.warning(

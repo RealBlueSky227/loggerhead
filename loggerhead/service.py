@@ -663,6 +663,7 @@ class LoggerheadService:
                 message = f"Kernel 1-Wire backend is not ready on BCM {bcm_pin}: {exc}"
                 LOGGER.warning(message)
                 self._mark_sensor_transition_pins({bcm_pin}, message, configs=(self.config,))
+        self.temperature_reader.complete_kernel_one_wire_configuration()
         configured_ids = {sensor["id"] for sensor in self._configured_sensor_catalog()}
         self._sensor_next_due = {key: value for key, value in self._sensor_next_due.items() if key in configured_ids}
         self._sensor_last_applied_attempt = {
@@ -1384,10 +1385,8 @@ class LoggerheadService:
             if sensor.sense_port is not None:
                 port = SENSE_PORTS[sensor.sense_port]
                 if stop_event is None:
-                    self.temperature_reader.configure_kernel_one_wire(port.digital_bcm)
                     reading = self.temperature_reader.read_one_wire_gpio_detailed(port.digital_bcm)
                 else:
-                    self.temperature_reader.configure_kernel_one_wire(port.digital_bcm, stop_event=stop_event)
                     reading = self.temperature_reader.read_one_wire_gpio_detailed(port.digital_bcm, stop_event=stop_event)
                 metadata = reading.metadata()
                 metadata["sense_port"] = sensor.sense_port

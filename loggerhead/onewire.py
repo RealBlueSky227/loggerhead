@@ -183,6 +183,10 @@ class HelperOneWireOverlayClient:
                 self._status_expires = time.monotonic() + self._status_cache_seconds
             return result
 
+    def verification_token(self) -> tuple | None:
+        """Unprivileged evidence, not a helper call or a time-based lease."""
+        return self._status_fingerprint()
+
     def _status_fingerprint(self) -> tuple | None:
         def stamp(path: Path) -> tuple:
             stat = path.stat()
@@ -206,10 +210,10 @@ class HelperOneWireOverlayClient:
             masters = sorted(path for path in self._masters_path.iterdir() if path.name.startswith("w1_bus_master"))
             return (
                 stamp(self._state_path),
-                stamp(self._overlays_path),
-                stamp(self._masters_path),
                 tuple(overlay_evidence(path) for path in overlays),
-                tuple(stamp(path) for path in masters),
+                # Slave attachment changes master directory timestamps without
+                # changing bus ownership. Detect object replacement, not reads.
+                tuple((str(path), str(path.resolve()), path.stat().st_dev, path.stat().st_ino) for path in masters),
             )
         except OSError:
             # Missing/inaccessible evidence disables caching, never ownership checks.

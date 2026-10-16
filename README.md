@@ -51,6 +51,11 @@ Sensor acquisition runs through persistent per-sensor workers supervised by the 
 
 Hardware note: kernel 1-Wire is the production DS18B20 backend on a Pi because the kernel owns the strict timing. Loggerhead treats DS18B20 probes as sense-port devices: users select the sense port/GPIO only, never a ROM ID. The reader verifies the device-tree-backed `w1-gpio` bus owned by that BCM GPIO and reads the sole DS18B20 on that bus; it never falls back to the global DS18B20 list or borrows a probe from another port. On Raspberry Pi OS Trixie layouts where `w1_bus_master*` nodes are detached from `onewire@...` platform devices, Loggerhead uses the bus master captured at runtime overlay activation and verifies GPIO ownership with the `w1-gpio` platform device. It deliberately fails closed for preexisting boot-time overlays that cannot be physically correlated. Runtime setup uses a root-owned `loggerhead-onewire-helper` with restricted sudoers access for only approved SensePort GPIOs. Loggerhead itself must run as the unprivileged `reef` user. The helper records overlays it created and refuses to remove boot-time or externally owned overlays. Raspberry Pi runtime overlays are stack-managed, so removing an earlier runtime overlay may temporarily remove/reapply later overlays; Loggerhead serializes those operations and marks affected sensors stale for revalidation. HYDROS triple-optical sensors are read asynchronously as rising-edge PWM periods on the sense-port GPIO; the dry state is expected around `40000-60000 us`, including the measured `50394 us` period. Mocked tests cover worker isolation, DS18B20 bus ownership, and classification, but multiport overlay removal and post-removal GPIO electrical state still require validation on the Raspberry Pi.
 
+The kernel backend uses event-driven overlay configuration and retains verified
+runtime mappings. Normal temperature polling performs unprivileged evidence/CRC
+checks, not privileged helper calls. See [1-Wire Lifecycle](docs/ONEWIRE_LIFECYCLE.md)
+for recovery behavior and the read-only CPU/helper benchmark.
+
 ## Hardware Map
 
 Loggerhead enforces only BCM GPIO names and fixed I2C addresses:

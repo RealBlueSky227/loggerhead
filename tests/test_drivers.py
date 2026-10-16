@@ -507,9 +507,11 @@ def test_kernel_one_wire_maps_captured_runtime_bus_on_trixie_detached_topology(t
         one_wire_root=root,
         platform_root=platform_root,
         gpioinfo_command="gpioinfo",
+        overlay_client=FakeOverlayClient(),
         subprocess_run=fake_run,
     )
     reader._runtime_kernel_bus_names[17] = "w1_bus_master10"
+    reader._runtime_master_instances[17] = reader._kernel_object_identity(root / "w1_bus_master10")
 
     reading = reader.read_one_wire_gpio_detailed(17)
 
@@ -646,7 +648,7 @@ def test_kernel_one_wire_does_not_duplicate_loaded_overlay(tmp_path) -> None:
         overlay_client=FakeOverlayClient(),
         subprocess_run=fake_run,
     )
-    reader._wait_for_kernel_one_wire = lambda _pin, **_kwargs: None  # type: ignore[method-assign]
+    reader._wait_for_kernel_one_wire = lambda pin, **_kwargs: write_w1_bus(root, "w1_bus_master1", pin)  # type: ignore[method-assign]
     reader.configure_kernel_one_wire(4)
 
     assert calls == [["dtoverlay", "-l"]]

@@ -421,7 +421,7 @@ def test_worker_exception_does_not_stop_other_sensor_workers(tmp_path, monkeypat
     assert service.state.sensor_health["sense_port_2_analog"].status == "online"
 
 
-def test_kernel_one_wire_worker_recovers_after_setup_failure(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_kernel_one_wire_worker_recovers_after_read_failure_without_reconfiguring(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = make_service(tmp_path)
     port = service.config.sense_ports[0]
     port.device = SensePortDevice.DS18B20
@@ -430,23 +430,23 @@ def test_kernel_one_wire_worker_recovers_after_setup_failure(tmp_path, monkeypat
     attempts = 0
 
     def configure(_bcm_pin: int, **_kwargs) -> None:
+        raise AssertionError("Normal polling must not configure 1-Wire overlays")
+
+    def read(_bcm_pin: int, **_kwargs):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            raise HardwareUnavailable("one-wire helper activation failed")
+            raise HardwareUnavailable("one-wire CRC failed")
+        return OneWireTemperatureReading(
+            bcm_pin=4, sensor_id="28-000000000001", bus_master="w1_bus_master1",
+            celsius=25.889, fahrenheit=78.6, crc_valid=True,
+        )
 
     monkeypatch.setattr(service.temperature_reader, "configure_kernel_one_wire", configure)
     monkeypatch.setattr(
         service.temperature_reader,
         "read_one_wire_gpio_detailed",
-        lambda _bcm_pin, **_kwargs: OneWireTemperatureReading(
-            bcm_pin=4,
-            sensor_id="28-000000000001",
-            bus_master="w1_bus_master1",
-            celsius=25.889,
-            fahrenheit=78.6,
-            crc_valid=True,
-        ),
+        read,
     )
     service._start_sensor_workers()
     try:
@@ -460,7 +460,7 @@ def test_kernel_one_wire_worker_recovers_after_setup_failure(tmp_path, monkeypat
     assert service.state.readings["sense_port_1_temperature"].value == 78.6
 
 
-def test_kernel_one_wire_worker_stop_cancels_blocking_setup(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_kernel_one_wire_worker_stop_cancels_blocking_read_recovery(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = make_service(tmp_path)
     port = service.config.sense_ports[0]
     port.device = SensePortDevice.DS18B20
@@ -477,7 +477,7 @@ def test_kernel_one_wire_worker_stop_cancels_blocking_setup(tmp_path, monkeypatc
             raise HardwareUnavailable("setup cancelled")
         raise AssertionError("test setup did not receive worker cancellation")
 
-    monkeypatch.setattr(service.temperature_reader, "configure_kernel_one_wire", configure)
+    monkeypatch.setattr(service.temperature_reader, "read_one_wire_gpio_detailed", configure)
 
     service._start_sensor_workers()
     assert setup_started.wait(1.0)
