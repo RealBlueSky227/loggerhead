@@ -21,6 +21,7 @@ STATIC_ROOT = Path(__file__).with_name("static")
 STATIC_ASSETS = {
     "/static/plots.mjs": ("plots.mjs", "text/javascript; charset=utf-8"),
     "/static/dosing.mjs": ("dosing.mjs", "text/javascript; charset=utf-8"),
+    "/static/ato.mjs": ("ato.mjs", "text/javascript; charset=utf-8"),
     "/static/vendor/plotly-basic-4.1.2.min.js": ("vendor/plotly-basic-4.1.2.min.js", "text/javascript; charset=utf-8"),
 }
 
@@ -264,6 +265,13 @@ INDEX_HTML = r"""<!doctype html>
     .message.error { color: var(--hot); }
     .message.ok { color: var(--ok); }
     .status-line { color: var(--muted); font-size: 12px; margin-top: 8px; }
+    .ato-profile { border-top: 1px solid var(--line); padding: 16px 0; }
+    .ato-profile .toolbar { margin-top: 12px; }
+    .ato-profile input:not([type="checkbox"]), .ato-profile select { width: 100%; }
+    .ato-table { overflow: auto; max-width: 100%; }
+    .ato-table table { border-collapse: collapse; font-size: 12px; width: 100%; }
+    .ato-table th, .ato-table td { padding: 8px; text-align: left; border-bottom: 1px solid var(--line); }
+    #atoOverview .value { font-size: 20px; }
     .value.warn { color: var(--warn); }
     @media (max-width: 640px) { header { align-items: flex-start; flex-direction: column; gap: 12px; } .clock { font-size: 24px; } main { padding: 12px; } .grid { grid-template-columns: minmax(0, 1fr); } main > section { min-width: 0; } }
   </style>
@@ -296,6 +304,9 @@ INDEX_HTML = r"""<!doctype html>
       <span id="pumpMessage" class="message" role="status"></span>
       <div id="pumps" class="grid"></div>
       <div id="dosingOverview" class="grid"></div>
+      <h2>Automatic Top Off</h2>
+      <span id="atoMessage" class="message" role="status"></span>
+      <div id="atoOverview" class="grid"></div>
       <h2>Alarms</h2>
       <div id="alarms" class="grid"></div>
     </section>
@@ -333,6 +344,12 @@ INDEX_HTML = r"""<!doctype html>
       <div id="dosingSchedules"></div>
       <h3>Dosing History</h3>
       <div id="dosingHistory"></div>
+      <h2>Automatic Top Off</h2>
+      <div class="toolbar"><button id="addATO">Add ATO</button><span id="atoConfigMessage" class="message" role="status"></span></div>
+      <p class="status-line">SensePort Desired state controls alerts only. ATO uses its own start and stop thresholds.</p>
+      <div id="atoConfig"></div>
+      <h3>Refill History</h3>
+      <div id="atoHistory"></div>
       <h2>Sense Ports</h2>
       <div class="toolbar">
         <button id="cancelSensePorts" class="hollow">Cancel</button>
@@ -394,6 +411,7 @@ INDEX_HTML = r"""<!doctype html>
         let payload = rawConfigDirty ? JSON.parse($("configText").value) : clone(status.config);
         if (sensorEditorDirty) payload.sense_ports = sensorDrafts.map(portForSave);
         if (window.loggerheadDosing) payload = window.loggerheadDosing.mergeConfig(payload);
+        if (window.loggerheadATO) payload = window.loggerheadATO.mergeConfig(payload);
         const result = await apiPost("/api/config", payload);
         status.config = result.config;
         status.sense_ports = result.config.sense_ports;
@@ -512,12 +530,14 @@ INDEX_HTML = r"""<!doctype html>
       $("readings").innerHTML = status.sensor_catalog.filter(s => s.main).map(readingFor).join("");
       $("equipment").innerHTML = Object.values(status.equipment).map(e => {
         const klass = e.on ? "filled" : "hollow";
-        return `<div class="card"><div class="label">${e.id}</div><button class="${klass}" onclick="toggleEquipment('${e.id}', ${!e.on})">${e.on ? "ON" : "OFF"}</button></div>`;
+        const reserved = status.config.ato?.some(p => p.assigned_actuator === e.id && (p.enabled || status.ato?.[p.id]?.faulted));
+        return `<div class="card"><div class="label">${e.id}</div><button class="${klass}" ${reserved && !e.on ? 'disabled title="Reserved by Automatic Top Off"' : ""} onclick="toggleEquipment('${e.id}', ${!e.on})">${e.on ? "ON" : "OFF"}</button></div>`;
       }).join("");
       $("pumps").innerHTML = status.steppers.map(p => {
         const on = !!status.manual_priming[p.id] || status.stepper_active === p.id;
         const occupied = status.stepper_active && !on;
-        return `<div class="card"><div class="label">${esc(p.name)}</div><button class="${on ? "filled" : "hollow"}" ${occupied ? "disabled" : ""} onclick="togglePrime('${esc(p.id)}', ${!on})">${on ? "STOP" : "PRIME"}</button></div>`;
+        const reserved = !on && status.config.ato?.some(a => a.assigned_actuator === p.id && (a.enabled || status.ato?.[a.id]?.faulted));
+        return `<div class="card"><div class="label">${esc(p.name)}</div><button class="${on ? "filled" : "hollow"}" ${occupied || reserved ? "disabled" : ""} onclick="togglePrime('${esc(p.id)}', ${!on})">${on ? "STOP" : "PRIME"}</button></div>`;
       }).join("");
       $("dosingOverview").innerHTML = (status.config.dosing || []).filter(p => p.enabled).map(profile => {
         const runtime = status.dosing?.schedules.find(s => s.id === profile.id) || {};
@@ -648,6 +668,7 @@ INDEX_HTML = r"""<!doctype html>
   </script>
   <script type="module" src="/static/plots.mjs"></script>
   <script type="module" src="/static/dosing.mjs"></script>
+  <script type="module" src="/static/ato.mjs"></script>
 </body>
 </html>
 """

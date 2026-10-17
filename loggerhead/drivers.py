@@ -1961,6 +1961,8 @@ class StepperPulseEngine:
         direction_high: bool = True,
         max_seconds: float = 60.0,
         max_steps: int = 300_000,
+        pulse_window_seconds: float | None = None,
+        progress: Callable[[int, int], None] | None = None,
     ) -> StepperRunResult:
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("A stepper motor is already active.")
@@ -2006,6 +2008,8 @@ class StepperPulseEngine:
                     break
                 remaining_time_steps = max(1, int((max_seconds - elapsed) * max(1, steps_per_second)))
                 chunk = min(remaining_steps, remaining_time_steps)
+                if pulse_window_seconds is not None:
+                    chunk = min(chunk, max(1, int(steps_per_second * pulse_window_seconds)))
                 requested_steps += chunk
                 result = self._pulse_windowed(
                     assignment,
@@ -2022,12 +2026,16 @@ class StepperPulseEngine:
                 completed_batches += result.completed_batches
                 interrupted_batch = interrupted_batch or result.interrupted_batch
                 max_inter_batch_gap_seconds = max(max_inter_batch_gap_seconds, result.max_inter_batch_gap_seconds)
+                if progress is not None:
+                    progress(steps_sent, possible_steps)
                 if result.reason:
                     reason = result.reason
                 if result.confirmed_steps < chunk:
                     if not result.reason:
                         reason = "stopped"
                     break
+            if steps_sent >= max_steps and not interrupted_batch:
+                reason = "max_steps"
             if self._shutdown.is_set():
                 reason = "shutdown"
             elapsed = time.monotonic() - started

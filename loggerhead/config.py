@@ -222,6 +222,10 @@ class ATOProfile:
     assigned_actuator: str
     max_run_time: float = 60.0
     enabled: bool = True
+    start_level: LevelState = LevelState.DRY
+    stop_level: LevelState | None = None  # Legacy: first non-dry state stops.
+    max_refill_ml: float = 0.0
+    max_daily_ml: float = 0.0
 
 
 @dataclass
@@ -323,6 +327,13 @@ def load_config(path: Path) -> AppConfig:
 
 def _migrate_raw_config(raw: dict[str, Any]) -> None:
     """Move legacy fields before dataclass coercion can drop them."""
+    for ato in raw.get("ato", []):
+        if isinstance(ato, dict) and ato.get("actuator_device_type") == "stepper" and (
+            "max_refill_ml" not in ato or "max_daily_ml" not in ato
+        ):
+            # Old stepper ATO settings were accepted but never actuated. Do
+            # not turn them into live pumps merely by upgrading the software.
+            ato["enabled"] = False
     for port in raw.get("sense_ports", []):
         if isinstance(port, dict):
             port.pop("one_wire_mode", None)
@@ -542,13 +553,70 @@ def validate_config(config: AppConfig) -> None:
                 raise DiagnosticHalt("Scheduled dose is smaller than one calibrated step.")
             if steps / pump.dose_speed_steps_per_second + 2 > item.max_run_seconds:
                 raise DiagnosticHalt("Scheduled dose cannot finish within its runtime limit (including startup margin).")
+    if len({item.id for item in config.ato}) != len(config.ato):
+        raise DiagnosticHalt("ATO profile IDs must be unique.")
+    ato_devices: set[str] = set()
+    water_by_id = {sensor.id: sensor for sensor in materialized_water}
+    if config.ato and len(water_by_id) != len(materialized_water):
+        raise DiagnosticHalt("ATO sensor references require unique water sensor IDs.")
     for item in config.ato:
+        if not item.id or not item.name.strip() or type(item.enabled) is not bool:
+            raise DiagnosticHalt("ATO requires a name, stable ID, and boolean enabled setting.")
         if item.primary_level_sensor not in water_ids:
             raise DiagnosticHalt(f"ATO {item.id} references unknown primary sensor {item.primary_level_sensor}.")
         if item.backup_failsafe_sensor not in water_ids:
             raise DiagnosticHalt(f"ATO {item.id} references unknown backup sensor {item.backup_failsafe_sensor}.")
         if item.assigned_actuator not in equipment_ids and item.assigned_actuator not in stepper_ids:
             raise DiagnosticHalt(f"ATO {item.id} references unknown actuator {item.assigned_actuator}.")
+        primary, backup = water_by_id[item.primary_level_sensor], water_by_id[item.backup_failsafe_sensor]
+        if primary.sense_port == backup.sense_port:
+            raise DiagnosticHalt("ATO primary and backup must use different physical SensePorts.")
+        if item.actuator_device_type in {"mcp_relay", "mcp23017_relay", "kasa_hs300"}:
+            item.actuator_device_type = "relay"
+        if item.actuator_device_type not in {"relay", "stepper"}:
+            raise DiagnosticHalt("ATO refill type must be relay or stepper.")
+        if item.assigned_actuator not in (stepper_ids if item.actuator_device_type == "stepper" else equipment_ids):
+            raise DiagnosticHalt("ATO refill device does not match its selected type.")
+        levels = ato_levels(primary)
+        stop = item.stop_level or levels[1]
+        if item.start_level not in levels or stop not in levels or levels.index(item.start_level) >= levels.index(stop):
+            raise DiagnosticHalt("ATO start level must be below its stop level and supported by the primary sensor.")
+        for key in ("max_run_time", "max_refill_ml", "max_daily_ml"):
+            value = getattr(item, key)
+            if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
+                raise DiagnosticHalt(f"ATO {key} must be a finite nonnegative number.")
+        if not 0 < item.max_run_time <= 3600:
+            raise DiagnosticHalt("ATO runtime must be positive and no greater than 3600 seconds.")
+        if item.actuator_device_type == "stepper":
+            pump = next(p for p in config.steppers if p.id == item.assigned_actuator)
+            legacy_disabled = not item.enabled and item.max_refill_ml == item.max_daily_ml == 0
+            if not legacy_disabled and (item.max_refill_ml <= 0 or item.max_daily_ml < item.max_refill_ml):
+                raise DiagnosticHalt("Stepper ATO requires positive refill/daily volume limits; daily must be at least refill.")
+            if not legacy_disabled and math.floor(item.max_refill_ml * pump.steps_per_ml) < 1:
+                raise DiagnosticHalt("ATO refill volume must permit at least one calibrated step.")
+            if item.enabled and item.assigned_actuator in enabled_pumps:
+                raise DiagnosticHalt("An enabled ATO and chemical dosing schedule cannot share a pump.")
+            device_key = f"stepper:{pump.assignment}"
+        else:
+            equipment = next(p for p in config.equipment if p.id == item.assigned_actuator)
+            if item.max_refill_ml or item.max_daily_ml:
+                raise DiagnosticHalt("Relay ATO cannot enforce volume limits without calibrated step feedback.")
+            device_key = f"{equipment.driver}:{equipment.kasa_host}:{equipment.pin_or_outlet}"
+            if any(other.id != equipment.id and (other.driver, other.kasa_host, other.pin_or_outlet) ==
+                   (equipment.driver, equipment.kasa_host, equipment.pin_or_outlet) for other in config.equipment):
+                raise DiagnosticHalt("ATO relay must not have another equipment ID aliasing its physical output.")
+            if item.enabled and any(p.assigned_equipment == equipment.id for p in materialized_temperature):
+                raise DiagnosticHalt("ATO cannot share temperature-controlled equipment.")
+        if item.enabled:
+            if device_key in ato_devices:
+                raise DiagnosticHalt("Enabled ATO profiles cannot share an actuator.")
+            ato_devices.add(device_key)
+
+
+def ato_levels(sensor: WaterLevelSensorProfile) -> tuple[LevelState, ...]:
+    if sensor.driver == WaterLevelDriver.BINARY:
+        return (LevelState.DRY, LevelState.SUBMERGED)
+    return (LevelState.DRY, LevelState.LOW, LevelState.NORMAL, LevelState.HIGH)
 
 
 def _validate_positive_frequency(value: float, name: str) -> None:

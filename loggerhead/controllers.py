@@ -113,25 +113,30 @@ class ATOController:
 
     @staticmethod
     def evaluate(profile: ATOProfile, state: RuntimeState, now: float | None = None) -> tuple[bool, ATOState, AlarmState | None]:
-        now = now or time.time()
+        now = time.time() if now is None else now
         ato_state = state.ato.setdefault(profile.id, ATOState(profile.id))
         if not profile.enabled or ato_state.faulted:
+            ato_state.running = False
             return False, ato_state, None
 
         primary = state.water_levels.get(profile.primary_level_sensor, LevelState.UNKNOWN)
         backup = state.water_levels.get(profile.backup_failsafe_sensor, LevelState.UNKNOWN)
         if primary in {LevelState.UNKNOWN, LevelState.INACTIVE} or backup in {LevelState.UNKNOWN, LevelState.INACTIVE}:
+            was_running = ato_state.running
             ato_state.running = False
-            ato_state.started_at = None
+            if was_running:
+                return ATOController.fault(profile, ato_state, "Required water-level sensor is invalid or stale.", now)
             return False, ato_state, None
         backup_wet = backup in {LevelState.WET, LevelState.SUBMERGED, LevelState.NORMAL, LevelState.HIGH}
 
         if backup_wet:
-            ato_state.running = False
-            ato_state.started_at = None
-            return False, ato_state, None
+            return ATOController.fault(profile, ato_state, "Backup high-water failsafe is active.", now)
 
-        should_run = primary == LevelState.DRY
+        rank = {LevelState.DRY: 0, LevelState.LOW: 1, LevelState.NORMAL: 2, LevelState.HIGH: 3,
+                LevelState.SUBMERGED: 1, LevelState.WET: 1}
+        start = rank[profile.start_level]
+        stop = rank[profile.stop_level] if profile.stop_level else 1
+        should_run = rank[primary] < stop if ato_state.running else rank[primary] <= start
         if should_run and not ato_state.running:
             ato_state.running = True
             ato_state.started_at = now
@@ -140,16 +145,15 @@ class ATOController:
             ato_state.started_at = None
 
         if ato_state.running and ato_state.started_at is not None and now - ato_state.started_at > profile.max_run_time:
-            ato_state.running = False
-            ato_state.faulted = True
-            alarm = AlarmState(
-                f"ato:{profile.id}",
-                f"ATO {profile.name} exceeded max run time and was locked out.",
-                AlarmPriority.HIGH,
-                first_seen=now,
-            )
-            return False, ato_state, alarm
+            return ATOController.fault(profile, ato_state, "Maximum refill runtime exceeded.", now)
         return ato_state.running, ato_state, None
+
+    @staticmethod
+    def fault(profile: ATOProfile, state: ATOState, reason: str, now: float) -> tuple[bool, ATOState, AlarmState]:
+        state.running = False
+        state.faulted = True
+        state.fault_reason = reason
+        return False, state, AlarmState(f"ato:{profile.id}", f"ATO {profile.name}: {reason}", AlarmPriority.HIGH, first_seen=now)
 
     @staticmethod
     def reset(profile: ATOProfile, state: RuntimeState) -> None:

@@ -68,6 +68,15 @@ class ATOState:
     running: bool = False
     faulted: bool = False
     started_at: float | None = None
+    fault_reason: str = ""
+    stop_reason: str = ""
+    waiting_reason: str = ""
+    run_id: int | None = None
+    confirmed_steps: int = 0
+    possible_steps: int = 0
+    dispensed_ml: float = 0.0
+    daily_volume_ml: float = 0.0
+    elapsed_seconds: float = 0.0
 
 
 @dataclass

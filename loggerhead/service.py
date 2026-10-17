@@ -12,6 +12,7 @@ from dataclasses import asdict, fields, replace
 from pathlib import Path
 from typing import Any
 
+from .ato import ATOManager
 from .config import (
     MAX_MANUAL_PRIME_STEPS_PER_SECOND,
     MIN_MANUAL_PRIME_STEPS_PER_SECOND,
@@ -114,6 +115,9 @@ class LoggerheadService:
         self._stop_lock = threading.RLock()
         self._stopped = False
         self._prime_lock = threading.RLock()
+        self._motion_owner: tuple[str, str] | None = None
+        self._equipment_io_lock = threading.RLock()
+        self._equipment_io_locks: dict[tuple[str, str, str], threading.RLock] = {}
         self._config_write_lock = threading.RLock()
         self._prime_results: dict[str, dict[str, Any]] = {}
         self._prime_pending: set[str] = set()
@@ -143,6 +147,8 @@ class LoggerheadService:
         self.buzzer.stop()
         self._restore_equipment_defaults()
         self.dosing = DosingManager(self)
+        self.ato = ATOManager(self)
+        self._save_state()
 
     def run(self, *, host: str = "0.0.0.0", port: int = 8080) -> None:
         LOGGER.info("Starting Loggerhead on %s:%s", host, port)
@@ -150,6 +156,7 @@ class LoggerheadService:
         server = DashboardServer(self, host=host, port=port)
         self._start_sensor_workers()
         self.dosing.start()
+        self.ato.start()
         self._threads = [
             threading.Thread(target=self._poll_loop, name="loggerhead-poll", daemon=True),
             threading.Thread(target=server.serve_forever, name="loggerhead-web", daemon=True),
@@ -188,6 +195,7 @@ class LoggerheadService:
             self.stepper_engine.request_stop()
             errors: list[Exception] = []
             for name, action in (
+                ("ATO actuators", self.ato.stop),
                 ("stepper engine", self.stepper_engine.shutdown),
                 ("stepper ENN disable", self.relay_board.disable_all_steppers),
                 ("dosing worker", self.dosing.stop),
@@ -220,6 +228,7 @@ class LoggerheadService:
     @measured("status")
     def status(self) -> dict[str, Any]:
         dosing = self.dosing.snapshot()
+        ato = self.ato.snapshot()
         with self._prime_lock:
             calibrations = copy.deepcopy({key: value for key, value in self._prime_results.items() if value["purpose"] == "calibration"})
         with self._state_lock:
@@ -235,6 +244,7 @@ class LoggerheadService:
                 "water_levels": {key: value.value for key, value in self.state.water_levels.items()},
                 "alarms": {key: asdict(value) for key, value in self.state.alarms.items()},
                 "ato": {key: asdict(value) for key, value in self.state.ato.items()},
+                "ato_runtime": ato,
                 "manual_priming": dict(self.state.manual_priming),
                 "stepper_active": self.state.stepper_active,
                 "calibrations": calibrations,
@@ -283,10 +293,23 @@ class LoggerheadService:
         apply_config_migrations(candidate)
         validate_config(candidate)
         previous = self.config
+        ato_changed = any(getattr(previous, key) != getattr(candidate, key) for key in (
+            "ato", "steppers", "equipment", "sense_ports", "water_level_sensors",
+        ))
         with self._prime_lock:
             removed = {item.id for item in previous.dosing} - {item.id for item in candidate.dosing}
             if any(self.state.dosing_faults.get(key) for key in removed):
                 raise RuntimeError("Reset the dosing fault before removing its schedule.")
+            removed_ato = {p.id for p in previous.ato} - {p.id for p in candidate.ato}
+            if any((self.state.ato.get(key) and (self.state.ato[key].faulted or self.state.ato[key].running)) or key in self.ato.jobs for key in removed_ato):
+                raise RuntimeError("Reset the ATO fault before removing its profile.")
+            for old in previous.ato:
+                new = next((p for p in candidate.ato if p.id == old.id), None)
+                state = self.state.ato.get(old.id)
+                if ((state and (state.faulted or state.running)) or old.id in self.ato.jobs) and new and any(getattr(old, key) != getattr(new, key) for key in (
+                    "primary_level_sensor", "backup_failsafe_sensor", "assigned_actuator", "actuator_device_type",
+                )):
+                    raise RuntimeError("Reset the ATO fault before changing its sensor or actuator assignments.")
             moving = self.dosing.active or any(thread.is_alive() for thread in self._prime_threads.values())
             if moving and (previous.steppers != candidate.steppers or previous.dosing != candidate.dosing):
                 raise RuntimeError("Stop the active pump before changing pump settings or dosing schedules.")
@@ -294,6 +317,12 @@ class LoggerheadService:
             "sense_ports", "temperature_sensors", "water_level_sensors", "analog_sensors", "ph_sensors",
         )) or self._ato_input_ids(previous) != self._ato_input_ids(candidate)
         try:
+            if ato_changed:
+                self.ato.quiesce("Configuration changed during refill; reset required.")
+                for profile in candidate.ato:
+                    if profile.actuator_device_type != "stepper":
+                        equipment = next(p for p in candidate.equipment if p.id == profile.assigned_actuator)
+                        self._write_equipment_output(equipment.id, False, source="ato_configuration", _profile=equipment)
             if sensor_changed:
                 self.config = candidate
                 self._rebuild_sensor_runtime(previous_config=previous)
@@ -304,6 +333,8 @@ class LoggerheadService:
             if sensor_changed:
                 self._restore_previous_sensor_runtime_after_failed_update()
             raise
+        finally:
+            self.ato.config_changed()
         self.dosing.config_changed(previous)
         self.store.log_event("config", "Configuration reloaded from UI.")
         return self.config
@@ -324,40 +355,73 @@ class LoggerheadService:
             setattr(port, key, value)
         apply_config_migrations(candidate)
         validate_config(candidate)
-        previous = self.config
-        self.config = candidate
-        try:
-            self._rebuild_sensor_runtime(previous_config=previous)
-        except Exception:
-            self.config = previous
-            self._restore_previous_sensor_runtime_after_failed_update()
-            raise
-        save_config(self.config_path, self.config)
-        self.config = load_config(self.config_path)
+        self._update_config(asdict(candidate))
         self.store.log_event("config", f"Sense Port {number} set to {port.device.value}.")
 
     def set_equipment(self, equipment_id: str, on: bool, *, source: str = "manual") -> None:
-        if self._stop.is_set():
+        with self._config_write_lock:
+            self._set_equipment_checked(equipment_id, on, source=source)
+
+    def _set_equipment_checked(self, equipment_id: str, on: bool, *, source: str) -> None:
+        if on and self._stop.is_set():
             raise RuntimeError("Loggerhead is stopping; equipment commands are blocked.")
+        for ato in self.config.ato:
+            if ato.actuator_device_type != "stepper" and ato.assigned_actuator == equipment_id and source != f"ato:{ato.id}" and source not in {"startup_sensor_lockout", "restore"}:
+                faulted = self.state.ato.get(ato.id) and self.state.ato[ato.id].faulted
+                if ato.enabled or faulted:
+                    if on:
+                        raise RuntimeError("This relay is reserved by ATO; disable and reset ATO before manual control.")
+                    self.ato._latch(ato.id, "Refill relay manually stopped; reset required.")
+                    job = self.ato.jobs.get(ato.id)
+                    if job:
+                        self.ato.cancel(job, "Refill relay manually stopped; reset required.", True)
+        self._set_equipment_output(equipment_id, on, source=source)
+
+    def _set_equipment_output(self, equipment_id: str, on: bool, *, source: str) -> None:
+        self._write_equipment_output(equipment_id, on, source=source)
         profile = self._equipment_profile(equipment_id)
-        if profile.driver == EquipmentDriver.MCP23017_RELAY:
-            relay = RELAYS[profile.pin_or_outlet]
-            active = MCP23017RelayBoard.software_to_physical(on, normally_on=profile.normally_on, relay=relay)
-            self.relay_board.set_pin(relay.mcp_pin, active)
-        elif profile.driver == EquipmentDriver.KASA_HS300:
-            KasaHS300Client(profile.kasa_host).set_outlet(int(profile.pin_or_outlet), on)
-        with self._state_lock:
-            self.state.equipment[equipment_id] = EquipmentState(equipment_id, on, source)
         self.store.log_event("equipment", f"{profile.name} turned {'ON' if on else 'OFF'} by {source}.", {"id": equipment_id})
         self.mqtt.publish(f"equipment/{equipment_id}", {"on": on, "source": source})
         self._save_state()
 
+    def _write_equipment_output(self, equipment_id: str, on: bool, *, source: str, _profile: EquipmentProfile | None = None) -> None:
+        """Hardware and state only: safety shutdown must not wait on logging."""
+        profile = _profile or self._equipment_profile(equipment_id)
+        with self._equipment_io_lock:
+            io_lock = self._equipment_io_locks.setdefault((profile.driver, profile.kasa_host, profile.pin_or_outlet), threading.RLock())
+        with io_lock:
+            if profile.driver == EquipmentDriver.MCP23017_RELAY:
+                relay = RELAYS[profile.pin_or_outlet]
+                active = MCP23017RelayBoard.software_to_physical(on, normally_on=profile.normally_on, relay=relay)
+                self.relay_board.set_pin(relay.mcp_pin, active)
+            elif profile.driver == EquipmentDriver.KASA_HS300:
+                KasaHS300Client(profile.kasa_host).set_outlet(int(profile.pin_or_outlet), on)
+            with self._state_lock:
+                self.state.equipment[equipment_id] = EquipmentState(equipment_id, on, source)
     def reset_ato(self, ato_id: str) -> None:
-        profile = next(item for item in self.config.ato if item.id == ato_id)
+        self.ato.reset(ato_id)
+
+    def _claim_motion(self, owner: str, pump_id: str) -> None:
+        # Callers hold _prime_lock from reservation through start publication.
+        if self._motion_owner:
+            raise RuntimeError(f"Motor subsystem is already active: {self._motion_owner[0]}.")
+        if self._stop.is_set() or self.stepper_engine._fault:
+            raise RuntimeError("Motor subsystem is stopping or has a latched safety fault.")
+        if hasattr(self, "ato") and self._stepper_profile(pump_id).assignment in self.ato.blocked_pumps:
+            raise RuntimeError("Reset the persisted ATO safety fault before using this pump.")
+        for profile in self.config.ato:
+            state = self.state.ato.get(profile.id)
+            if profile.assigned_actuator == pump_id and state and state.faulted:
+                raise RuntimeError("Reset the ATO safety fault before using this pump.")
+        self._motion_owner = owner, pump_id
         with self._state_lock:
-            ATOController.reset(profile, self.state)
-        self.store.log_event("ato", f"ATO {profile.name} reset from dashboard.")
-        self._save_state()
+            self.state.stepper_active = pump_id
+
+    def _release_motion(self, owner: str) -> None:
+        if self._motion_owner and self._motion_owner[0] == owner:
+            self._motion_owner = None
+            with self._state_lock:
+                self.state.stepper_active = None
 
     def silence_buzzer(self) -> dict[str, Any]:
         muted_until = time.time() + self.config.buzzer.rearm_seconds
@@ -421,6 +485,8 @@ class LoggerheadService:
                 profile = replace(profile, manual_max_steps=max_steps)
             if self.dosing.active:
                 raise RuntimeError("A scheduled dose is active; stop it before priming or calibrating.")
+            if any(p.enabled and p.assigned_actuator == stepper_id for p in self.config.ato):
+                raise RuntimeError("Disable ATO before manually priming or calibrating its refill pump.")
             for key, thread in list(self._prime_threads.items()):
                 if not thread.is_alive():
                     self._clear_prime_worker_locked(key)
@@ -433,6 +499,7 @@ class LoggerheadService:
                 manual_active = any(self.state.manual_priming.values())
             if manual_active:
                 raise RuntimeError("Only one pump may be manually primed at a time.")
+            self._claim_motion(f"prime:{stepper_id}", stepper_id)
             stop = threading.Event()
             thread = threading.Thread(
                 target=self._prime_loop,
@@ -460,6 +527,7 @@ class LoggerheadService:
             with self._prime_lock:
                 cancelled = stop.is_set() or self._stop.is_set()
                 if cancelled:
+                    self._release_motion(f"prime:{stepper_id}")
                     self._prime_results[stepper_id].update(state="cancelled", reason="cancelled_before_start", finished_at=time.time())
                     with self._state_lock:
                         self.state.manual_priming[stepper_id] = False
@@ -470,6 +538,7 @@ class LoggerheadService:
                     thread.start()
         except Exception as exc:
             with self._prime_lock:
+                self._release_motion(f"prime:{stepper_id}")
                 self._prime_results[stepper_id].update(state="failed", error=str(exc), finished_at=time.time())
                 with self._state_lock:
                     self.state.manual_priming[stepper_id] = False
@@ -488,6 +557,10 @@ class LoggerheadService:
 
     def _stop_manual_priming(self, stepper_id: str) -> dict[str, Any]:
         with self._prime_lock:
+            ato_job = next((job for job in self.ato.jobs.values() if job.pump and job.pump.id == stepper_id), None)
+            if ato_job:
+                self.ato.cancel(ato_job, "Refill manually stopped; reset required.", True)
+                return {"id": stepper_id, "priming": False, "state": "stopping"}
             profile = self._stepper_profile(stepper_id)
             schedule = self.dosing.active
             if schedule and schedule["pump_id"] == stepper_id:
@@ -581,6 +654,7 @@ class LoggerheadService:
                 except Exception:
                     LOGGER.exception("Could not report critical cleanup fault for %s.", profile.name)
             with self._prime_lock:
+                self._release_motion(f"prime:{profile.id}")
                 self._clear_prime_worker_locked(profile.id)
                 with self._state_lock:
                     self.state.manual_priming[profile.id] = False
@@ -597,6 +671,7 @@ class LoggerheadService:
 
     def _restore_equipment_defaults(self) -> None:
         startup_locked = self._temperature_controlled_equipment_ids()
+        startup_locked.update(p.assigned_actuator for p in self.config.ato if p.actuator_device_type != "stepper")
         for item in self.config.equipment:
             if item.id in startup_locked:
                 self.set_equipment(item.id, False, source="startup_sensor_lockout")
@@ -817,6 +892,9 @@ class LoggerheadService:
     def _build_sensor_worker_specs(self) -> list[SensorWorkerSpec]:
         specs: list[SensorWorkerSpec] = []
         ato_inputs = self._ato_input_ids(self.config)
+        ato_inputs.update(sensor_id for profile in self.config.ato
+                          if self.state.ato.get(profile.id) and (self.state.ato[profile.id].faulted or self.state.ato[profile.id].running)
+                          for sensor_id in (profile.primary_level_sensor, profile.backup_failsafe_sensor))
         for sensor in materialized_temperature_sensors(self.config):
             stale_after = self._stale_after(sensor.check_frequency)
 
@@ -881,6 +959,10 @@ class LoggerheadService:
             )
         for sensor in materialized_water_level_sensors(self.config):
             stale_after = self._stale_after(sensor.check_frequency, sensor.activity_timeout)
+            ato_input = sensor.id in ato_inputs
+            interval = min(sensor.check_frequency, self.ATO_LEVEL_MAX_POLL_SECONDS) if ato_input else sensor.check_frequency
+            if ato_input:
+                stale_after = min(stale_after, 2.0)
             if sensor.driver == WaterLevelDriver.BINARY:
 
                 def read_binary(_stop: threading.Event, sensor=sensor) -> SensorReadResult:
@@ -898,18 +980,13 @@ class LoggerheadService:
                     SensorWorkerSpec(
                         sensor.id,
                         "water",
-                        sensor.check_frequency,
+                        interval,
                         stale_after,
                         read_binary,
                         read_timeout_seconds=stale_after,
                     )
                 )
                 continue
-
-            ato_input = sensor.id in ato_inputs
-            interval = min(sensor.check_frequency, self.ATO_LEVEL_MAX_POLL_SECONDS) if ato_input else sensor.check_frequency
-            if ato_input:
-                stale_after = min(stale_after, 2.0)
 
             def read_hydros(stop: threading.Event, sensor=sensor, interval=interval, ato_input=ato_input) -> SensorReadResult:
                 reader = self._hydros_readers.get(sensor.id)
@@ -1180,7 +1257,6 @@ class LoggerheadService:
         value_logs: list[tuple[str, float | str, str, float]] = []
         events: list[tuple[str, str, dict[str, Any] | None]] = []
         alarms: list[Any] = []
-        ato_notifications: list[Any] = []
         health_values = self.health.snapshot()
         with self._state_lock:
             self._apply_sensor_worker_snapshots_locked(
@@ -1194,7 +1270,7 @@ class LoggerheadService:
             for key, value in health_values.items():
                 self.state.readings[f"health_{key}"] = SensorReading(f"health_{key}", round(value, 3), "", ts=now)
                 value_logs.append((f"health.{key}", value, "", now))
-            self._plan_ato_locked(now, equipment_commands=equipment_commands, alarms=alarms, notifications=ato_notifications)
+        self.ato.tick(now)
         for equipment_id, on, source in equipment_commands:
             try:
                 self.set_equipment(equipment_id, on, source=source)
@@ -1210,9 +1286,6 @@ class LoggerheadService:
             self.store.log_event(category, message, metadata)
         for alarm in alarms:
             self._register_alarm(alarm)
-        for alarm in ato_notifications:
-            self._notify("Loggerhead ATO", alarm.message)
-            self.store.log_event("ato", alarm.message)
         self._sound_buzzer_if_needed(now)
         self._publish_telemetry()
         if now - self._last_polled_log >= self.config.database_poll_seconds:
@@ -1549,24 +1622,7 @@ class LoggerheadService:
             self.store.log_value(f"health.{key}", value, ts=now)
 
     def _evaluate_ato(self, now: float) -> None:
-        for profile in self.config.ato:
-            should_run, ato_state, alarm = ATOController.evaluate(profile, self.state, now)
-            current = self.state.equipment.get(profile.assigned_actuator, EquipmentState(profile.assigned_actuator, False)).on
-            if profile.assigned_actuator in {item.id for item in self.config.equipment} and should_run != current:
-                try:
-                    self.set_equipment(profile.assigned_actuator, should_run, source="ato")
-                except Exception as exc:
-                    LOGGER.exception("ATO equipment command failed for %s: %s", profile.assigned_actuator, exc)
-                    self._activate_alarm(
-                        f"equipment:{profile.assigned_actuator}:ato",
-                        f"ATO could not command {profile.assigned_actuator}: {exc}",
-                        priority="high",
-                    )
-            if alarm:
-                self._register_alarm(alarm)
-                self._notify("Loggerhead ATO", alarm.message)
-                self.store.log_event("ato", alarm.message)
-            self.state.ato[profile.id] = ato_state
+        self.ato.tick(now)
 
     def _register_alarm(self, alarm) -> None:
         with self._state_lock:

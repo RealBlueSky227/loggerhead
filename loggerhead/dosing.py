@@ -79,7 +79,7 @@ class DosingManager:
         with service._config_write_lock, service._prime_lock:
             now_ts = time.time() if now_ts is None else now_ts
             now = dt.datetime.fromtimestamp(now_ts)
-            if service._stop.is_set() or self.active or any(t.is_alive() for t in service._prime_threads.values()):
+            if service._stop.is_set() or service._motion_owner or self.active or any(t.is_alive() for t in service._prime_threads.values()):
                 return
             selected = None
             for schedule in service.config.dosing:
@@ -102,6 +102,10 @@ class DosingManager:
                 if _live_batch and time.time() >= DosingScheduler.window(schedule, dt.date.fromisoformat(day))[1].timestamp():
                     continue
                 pump = copy.deepcopy(service._stepper_profile(schedule.actuator))
+                if service.stepper_engine._fault or pump.assignment in service.ato.blocked_pumps:
+                    continue
+                if any(p.assigned_actuator == pump.id and service.state.ato.get(p.id) and service.state.ato[p.id].faulted for p in service.config.ato):
+                    continue
                 volume = schedule.daily_volume_ml / schedule.doses_per_day
                 steps = math.floor(volume * pump.steps_per_ml)
                 run_id = service.store.claim_dose(
@@ -120,6 +124,7 @@ class DosingManager:
                     self._history = service.store.recent_doses()
                     continue
                 schedule = copy.deepcopy(schedule)
+                service._claim_motion(f"dosing:{schedule.id}", pump.id)
                 self.cancel.clear()
                 self.active = {"schedule_id": schedule.id, "pump_id": pump.id, "requested_ml": volume,
                                "requested_steps": steps, "started_at": time.time()}
@@ -168,6 +173,7 @@ class DosingManager:
                 history = self._history
                 status, error = "failed", f"Dose result could not be persisted: {exc}"
             with service._prime_lock:
+                service._release_motion(f"dosing:{schedule.id}")
                 with service._state_lock:
                     service.state.stepper_active = None
                     if status != "completed":

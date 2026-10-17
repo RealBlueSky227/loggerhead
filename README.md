@@ -92,3 +92,8 @@ The Config tab provides pump calibration, independent prime/dose speed settings,
 and daily dosing schedules with previews, pause/resume, fault recovery, and run
 history. See [Pump Configuration and Scheduled Dosing](docs/DOSING.md) before
 enabling automatic dosing. Existing schedules remain disabled on upgrade.
+
+The Config tab also provides relay/stepper Automatic Top Off profiles with
+independent backup protection, hysteresis, runtime/volume limits, and persistent
+fault recovery. Read [Automatic Top Off Safety and Configuration](docs/ATO.md)
+before enabling refills; software monitoring does not replace a hardware cutoff.
